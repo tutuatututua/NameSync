@@ -1,0 +1,46 @@
+{
+  "name": "api",
+  "version": "1.0.0",
+  "main": "dist/server.js",
+  "scripts": {
+    "start": "node dist/server.js",
+    "dev": "ts-node-dev --respawn --transpile-only src/server.ts | pino-pretty",
+    "build": "tsc",
+    "build-db": "cat migrate.sql | sqlite3 database.db",
+    "prebuild": "npm run clean",
+    "sync-db-types": "npx kysely-codegen --dialect sqlite --out-file src/db.types.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "Property Listing API",
+  "dependencies": {
+    "@extensions/sqldb": "^1.0.0",
+    "cors": "^2.8.5",
+    "csv-parse": "^6.2.1",
+    "dotenv": "^16.0.0",
+    "express": "^4.17.3",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^2.1.1",
+    "node-fetch": "^2.7.0",
+    "sqlite": "^5.0.1",
+    "sqlite3": "^5.0.2",
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.12",
+    "@types/express": "^4.17.13",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/multer": "^2.1.0",
+    "@types/node": "^17.0.21",
+    "@types/node-fetch": "^2.6.13",
+    "@types/ws": "^8.18.1",
+    "@typescript-eslint/eslint-plugin": "^5.15.0",
+    "@typescript-eslint/parser": "^5.15.0",
+    "eslint": "^8.11.0",
+    "kysely-codegen": "^0.10.0",
+    "pino-pretty": "^7.5.3",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^4.6.2"
+  }
+}

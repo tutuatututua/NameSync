@@ -1,0 +1,19 @@
+{
+  "name": "fx-generated",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "api",
+    "frontend",
+    "test",
+    "extensions/*"
+  ],
+  "scripts": {
+    "lint": "eslint api/src frontend/app test/tests"
+  },
+  "devDependencies": {
+    "eslint": "^8.11.0",
+    "tsx": "^4.21.0",
+    "typescript": "^4.6.2"
+  }
+}

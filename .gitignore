@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+.next/
+build/
+
+# Logs & test artifacts
+*.log
+test-results.json
+
+# Databases
+*.sqlite
+*.db
+
+# Environment files — never commit secrets. Commit .env.example instead.
+.env
+.env.*
+!.env.example
+
+# Runtime uploads
+code/api/uploads/*
+!code/api/uploads/.gitkeep
+
+# Test fixtures containing real personal data (PII) — keep local only
+test_data/
+
+# Local Claude config (personal, not shared)
+.claude/settings.local.json
+
+# Agent-written cross-session learnings
+MEMORY.md
+
+# OS files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,15 @@
+node_modules
+dist
+.next
+test-results.json
+*.sqlite
+*.db
+
+# Environment files — never commit secrets. Commit .env.example instead.
+.env
+.env.*
+!.env.example
+
+# Agent-written cross-session learnings (see code_gen/agents/project_memory.py).
+# Keep out of the app repo so the agent's memory doesn't pollute project history.
+MEMORY.md
