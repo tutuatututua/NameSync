@@ -1,7 +1,6 @@
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
-import { useRouter } from 'next/navigation';
 import {
   Navbar,
   PageContainer,
@@ -10,12 +9,15 @@ import {
   UploadDropzone,
   FileCard,
   Button,
-  Alert
+  Alert,
+  ConfirmModal
 } from '../components';
 import FacebookDataTable from './components/FacebookDataTable';
 import FacebookUploadHistory from './components/FacebookUploadHistory';
 import FacebookComparison from './components/FacebookComparison';
 import { API_BASE_URL, WS_BASE_URL } from '../utils/config';
+import { deleteAllFacebookData, fetchFacebookCount } from '../utils/facebookData';
+import { fetchCompanyCount } from '../utils/fileParser';
 
 interface UploadedFile {
   file: File;
@@ -52,7 +54,6 @@ type WorkflowStep = 'upload' | 'saving' | 'saved' | 'comparing' | 'completed' | 
 type WebSocketStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
 
 export default function FacebookDataPage() {
-  const router = useRouter();
   const [facebookFile, setFacebookFile] = useState<UploadedFile | null>(null);
   const [uploadPersonName, setUploadPersonName] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -63,13 +64,30 @@ export default function FacebookDataPage() {
   const [uploadHistory, setUploadHistory] = useState<UploadHistoryRecord[]>([]);
   const [totalFacebookRecords, setTotalFacebookRecords] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [showClearConfirm, setShowClearConfirm] = useState(false);
+  const [isClearing, setIsClearing] = useState(false);
+  // Bumped after a destructive action so the data table refetches.
+  const [reloadToken, setReloadToken] = useState(0);
+  // Row counts gate the "Run Comparison" button — enabled only when both have data.
+  const [companyCount, setCompanyCount] = useState(0);
+  const [facebookCount, setFacebookCount] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
 
-  // Fetch upload history on mount
+  // Fetch upload history and data counts on mount
   useEffect(() => {
     fetchUploadHistory();
+    refreshCounts();
   }, []);
+
+  const refreshCounts = async () => {
+    const [company, facebook] = await Promise.all([
+      fetchCompanyCount(),
+      fetchFacebookCount()
+    ]);
+    setCompanyCount(company);
+    setFacebookCount(facebook);
+  };
 
   // WebSocket connection for real-time updates. Keyed only on the session id so the
   // socket stays open across the whole workflow (saving -> saved -> comparing ->
@@ -281,6 +299,7 @@ export default function FacebookDataPage() {
           })
         });
         fetchUploadHistory();
+        refreshCounts();
       } else {
         setWorkflowStep('error');
         setError(data.message || 'Upload failed');
@@ -293,7 +312,7 @@ export default function FacebookDataPage() {
     }
   };
 
-  const handleClear = () => {
+  const resetForm = () => {
     setFacebookFile(null);
     setUploadPersonName('');
     setWorkflowStep('upload');
@@ -303,6 +322,23 @@ export default function FacebookDataPage() {
     setTotalFacebookRecords(0);
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
+    }
+  };
+
+  const handleConfirmClearAll = async () => {
+    setIsClearing(true);
+    setError(null);
+    try {
+      await deleteAllFacebookData();
+      resetForm();
+      setReloadToken((t) => t + 1);
+      fetchUploadHistory();
+      refreshCounts();
+      setShowClearConfirm(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to clear Facebook data');
+    } finally {
+      setIsClearing(false);
     }
   };
 
@@ -320,9 +356,9 @@ export default function FacebookDataPage() {
           title="Facebook Data"
           subtitle="Upload, manage, and compare Facebook data with existing records"
           actions={
-            <Button 
-              variant="secondary" 
-              onClick={handleClear}
+            <Button
+              variant="secondary"
+              onClick={() => setShowClearConfirm(true)}
               data-testid="clear-btn"
             >
               Clear All
@@ -385,9 +421,10 @@ export default function FacebookDataPage() {
                   <UploadDropzone
                     icon={facebookIcon}
                     title="Upload Facebook JSON"
-                    description="Click to browse for your Facebook JSON file"
+                    description="Click to browse or drag & drop your Facebook JSON file"
                     fileType="JSON"
                     onClick={handleDropzoneClick}
+                    onFileDrop={handleFileSelect}
                     data-testid="facebook-dropzone"
                   />
                 ) : (
@@ -444,24 +481,43 @@ export default function FacebookDataPage() {
           {/* Right Column - Data Table & Comparison */}
           <div className="lg:col-span-2 space-y-6">
             {/* Facebook Data Table */}
-            <FacebookDataTable 
+            <FacebookDataTable
               sessionId={uploadedSessionId}
               totalRecords={totalFacebookRecords}
+              reloadToken={reloadToken}
+              onDataChanged={refreshCounts}
             />
 
-            {/* Comparison Section */}
-            {(workflowStep === 'saved' || workflowStep === 'comparing' || workflowStep === 'completed') && uploadedSessionId && (
-              <FacebookComparison
-                sessionId={uploadedSessionId}
-                onComparisonComplete={() => {
-                  setWorkflowStep('completed');
-                  fetchUploadHistory();
-                }}
-              />
-            )}
+            {/* Comparison Section — always visible; the button is enabled only when
+                both the Facebook and Company databases have data. */}
+            <FacebookComparison
+              sessionId={uploadedSessionId}
+              canCompare={companyCount > 0 && facebookCount > 0}
+              companyCount={companyCount}
+              facebookCount={facebookCount}
+              onComparisonComplete={() => {
+                setWorkflowStep('completed');
+                fetchUploadHistory();
+              }}
+            />
           </div>
         </div>
       </MainContent>
+
+      <ConfirmModal
+        isOpen={showClearConfirm}
+        title="Clear all Facebook data"
+        message={
+          <>
+            This permanently removes <span className="font-medium text-slate-900">all Facebook data</span> and its
+            upload history from the database. This action cannot be undone.
+          </>
+        }
+        confirmLabel="Clear all Facebook data"
+        isProcessing={isClearing}
+        onClose={() => setShowClearConfirm(false)}
+        onConfirm={handleConfirmClearAll}
+      />
     </PageContainer>
   );
 }

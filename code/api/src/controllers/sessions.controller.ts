@@ -43,6 +43,29 @@ export class SessionsController {
   }
 
   /**
+   * GET /api/sessions/latest
+   * Return the most recent session eligible to (re)trigger a comparison, so the
+   * Compare button can run against existing data without a fresh upload.
+   */
+  static async getLatest(_req: Request, res: Response): Promise<void> {
+    try {
+      const session = await UploadSessionModel.findLatestCompareable();
+
+      res.status(200).json({
+        success: true,
+        data: session ? { id: session.id, status: session.status } : null
+      });
+    } catch (error) {
+      console.error('Error getting latest session:', error);
+      res.status(500).json({
+        success: false,
+        message: 'Internal server error',
+        error: (error as Error).message
+      });
+    }
+  }
+
+  /**
    * GET /api/sessions/:id
    * Get session details for preview
    */

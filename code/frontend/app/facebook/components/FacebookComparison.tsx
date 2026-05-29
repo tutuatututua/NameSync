@@ -1,15 +1,27 @@
 'use client';
 
 import { useState } from 'react';
-import { triggerComparison } from '../../utils/facebookData';
+import { triggerComparison, fetchLatestSessionId } from '../../utils/facebookData';
 import { Button } from '../../components';
 
 interface FacebookComparisonProps {
-  sessionId: string;
+  // The session uploaded this visit, if any. When null we fall back to the latest
+  // existing session so the comparison runs against data already in the database.
+  sessionId: string | null;
+  // Enabled only when both the Facebook and Company databases have data.
+  canCompare: boolean;
+  companyCount?: number;
+  facebookCount?: number;
   onComparisonComplete?: () => void;
 }
 
-export default function FacebookComparison({ sessionId, onComparisonComplete }: FacebookComparisonProps) {
+export default function FacebookComparison({
+  sessionId,
+  canCompare,
+  companyCount = 0,
+  facebookCount = 0,
+  onComparisonComplete
+}: FacebookComparisonProps) {
   const [isComparing, setIsComparing] = useState(false);
   const [comparisonStatus, setComparisonStatus] = useState<string>('');
   const [comparisonResult, setComparisonResult] = useState<{
@@ -23,7 +35,16 @@ export default function FacebookComparison({ sessionId, onComparisonComplete }: 
     setComparisonStatus('Sending comparison trigger...');
 
     try {
-      const result = await triggerComparison(sessionId);
+      // Prefer this visit's upload session; otherwise compare against the latest
+      // existing session ("always merge the existing one").
+      const targetSessionId = sessionId ?? (await fetchLatestSessionId());
+      if (!targetSessionId) {
+        setError('No data session available to compare. Upload data first.');
+        setComparisonStatus('');
+        return;
+      }
+
+      const result = await triggerComparison(targetSessionId);
 
       if (result.success && result.data) {
         setComparisonStatus('Comparison triggered successfully');
@@ -85,13 +106,24 @@ export default function FacebookComparison({ sessionId, onComparisonComplete }: 
         </div>
       )}
 
+      {!canCompare && (
+        <div className="mb-4 p-3 bg-amber-50 border border-amber-200 rounded-lg">
+          <p className="text-sm text-amber-800">
+            Add data to both sources to enable comparison
+            <span className="text-amber-700"> (Facebook: {facebookCount.toLocaleString()}, Company: {companyCount.toLocaleString()} rows).</span>
+          </p>
+        </div>
+      )}
+
       <div className="flex items-center justify-between">
         <div className="text-sm text-slate-500">
-          <p>Session ID: <span className="font-mono text-xs">{sessionId.substring(0, 8)}...</span></p>
+          {sessionId
+            ? <p>Session ID: <span className="font-mono text-xs">{sessionId.substring(0, 8)}...</span></p>
+            : <p>Compares the latest data in the database.</p>}
         </div>
         <Button
           onClick={handleCompare}
-          disabled={isComparing}
+          disabled={isComparing || !canCompare}
           isLoading={isComparing}
           data-testid="run-comparison-btn"
         >

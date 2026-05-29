@@ -85,6 +85,33 @@ export class CompanyDataModel extends DBModel {
     };
   }
 
+  /** Total number of company rows. */
+  static async count(): Promise<number> {
+    const db = await this.getKyselyDB();
+    const row = await db
+      .selectFrom("company_data")
+      .select(db.fn.count("uuid").as("count"))
+      .executeTakeFirst();
+    return Number(row?.count) || 0;
+  }
+
+  /** Delete every company row. Returns the number of rows removed. */
+  static async deleteAll(): Promise<number> {
+    const db = await this.getKyselyDB();
+    const result = await db.deleteFrom("company_data").executeTakeFirst();
+    return Number(result?.numDeletedRows ?? 0);
+  }
+
+  /** Delete a single company row by uuid. Returns the number of rows removed. */
+  static async deleteByUuid(uuid: string): Promise<number> {
+    const db = await this.getKyselyDB();
+    const result = await db
+      .deleteFrom("company_data")
+      .where("uuid", "=", uuid)
+      .executeTakeFirst();
+    return Number(result?.numDeletedRows ?? 0);
+  }
+
   static async findAllPaginated(
     page: number,
     limit: number

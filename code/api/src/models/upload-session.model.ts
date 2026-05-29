@@ -58,6 +58,20 @@ export class UploadSessionModel extends DBModel {
     return db.deleteFrom("upload_sessions").where("id", "=", id).execute();
   }
 
+  /**
+   * Most recent session eligible to (re)trigger a comparison. The compare endpoint
+   * accepts pending_webhook | processing | completed, so we pick the newest of those.
+   */
+  static async findLatestCompareable() {
+    const db = await this.getKyselyDB();
+    return db
+      .selectFrom("upload_sessions")
+      .selectAll()
+      .where("status", "in", ['pending_webhook', 'processing', 'completed'])
+      .orderBy("created_at", "desc")
+      .executeTakeFirst();
+  }
+
   static async findAvailableSessions() {
     const db = await this.getKyselyDB();
     return db

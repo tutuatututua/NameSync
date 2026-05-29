@@ -1,0 +1,31 @@
+# Dependencies (reinstalled fresh inside the image — local copies may hold
+# Windows-native binaries that won't run on Linux)
+**/node_modules
+
+# Build output (regenerated during the image build)
+**/dist
+**/.next
+**/out
+frontend/tsconfig.tsbuildinfo
+
+# Local databases, uploads and secrets (provided at runtime via volume/env)
+**/.env
+**/.env.*
+!**/.env.example
+**/*.sqlite
+**/*.db
+api/uploads
+data
+
+# Tooling / VCS / editor noise
+.git
+.gitignore
+**/.eslintcache
+**/coverage
+**/test-results
+**/playwright-report
+**/*.log
+Dockerfile
+**/Dockerfile
+docker-compose*.yml
+.dockerignore

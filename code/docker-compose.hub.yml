@@ -1,0 +1,34 @@
+# Run the published images from Docker Hub (no source code needed).
+#   docker compose -f docker-compose.hub.yml up
+# The repo tuadocker/namesync is PRIVATE, so first run: docker login
+services:
+  api:
+    image: tuadocker/namesync:api-1.0
+    environment:
+      ENVIRONMENT: TEST            # file-backed SQLite
+      DATABASE_FILE: /data/database.sqlite
+      UPLOAD_DIR: /data/uploads
+      CORS_ORIGIN: http://localhost:3000
+    ports:
+      - "8080:8080"
+    volumes:
+      - api-data:/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  frontend:
+    image: tuadocker/namesync:frontend-1.0
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  api-data:

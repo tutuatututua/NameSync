@@ -5,6 +5,9 @@ test-results.json
 *.sqlite
 *.db
 
+# Docker image export artifacts — large binaries, rebuild instead of committing.
+*.tar
+
 # Environment files — never commit secrets. Commit .env.example instead.
 .env
 .env.*

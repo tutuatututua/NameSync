@@ -120,6 +120,53 @@ export async function fetchFacebookUploadHistory(
 }
 
 /**
+ * Total number of Facebook rows in the database.
+ */
+export async function fetchFacebookCount(): Promise<number> {
+  const response = await fetch(
+    `${API_BASE_URL}/comparisons/facebook-data/all?page=1&limit=1`
+  );
+  if (!response.ok) return 0;
+  const data = await response.json();
+  return data?.pagination?.total ?? 0;
+}
+
+/**
+ * Delete every Facebook row (and its upload history). "Clear all Facebook data".
+ */
+export async function deleteAllFacebookData(): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/comparisons/facebook-data/all`, {
+    method: 'DELETE'
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to clear Facebook data: ${response.statusText}`);
+  }
+}
+
+/**
+ * Delete a single Facebook row by uuid.
+ */
+export async function deleteFacebookRecord(uuid: string): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/comparisons/facebook-data/${uuid}`, {
+    method: 'DELETE'
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to delete record: ${response.statusText}`);
+  }
+}
+
+/**
+ * Id of the most recent session eligible to (re)trigger a comparison, or null if
+ * none exists. Used to run "Compare" against existing data without a fresh upload.
+ */
+export async function fetchLatestSessionId(): Promise<string | null> {
+  const response = await fetch(`${API_BASE_URL}/sessions/latest`);
+  if (!response.ok) return null;
+  const data = await response.json();
+  return data?.data?.id ?? null;
+}
+
+/**
  * Trigger comparison for a session
  * @param sessionId - The upload session ID
  * @returns Promise with comparison result

@@ -17,4 +17,5 @@ export type { ResultRow } from './ResultsTable';
 export { default as EmptyState } from './EmptyState';
 export { default as SaveSessionModal } from './SaveSessionModal';
 export { default as DeleteConfirmModal } from './DeleteConfirmModal';
+export { default as ConfirmModal } from './ConfirmModal';
 export { default as PageHeader } from './PageHeader';

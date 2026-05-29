@@ -179,17 +179,17 @@ export class ComparisonsController {
       // Automatically forward the merged data to the ingestion webhook. Each page
       // uploads a single real file (the other side is an empty placeholder), so this
       // routes Facebook uploads to FACEBOOK_WEBHOOK_URL and Company uploads to
-      // COMPANY_WEBHOOK_URL — never POSTing an empty body. Company sends the full table;
-      // Facebook sends only unprocessed (status IS NULL) rows.
+      // COMPANY_WEBHOOK_URL — never POSTing an empty body. Both sides forward the FULL
+      // table (no "already sent / compared" filtering).
       const isCompanyUpload = companyRecords.length > 0;
       const isFacebookUpload = facebookRecords.length > 0;
 
-      const unsentFacebook = isFacebookUpload ? await FacebookDataModel.findUnsent() : [];
+      const allFacebook = isFacebookUpload ? await FacebookDataModel.findAll() : [];
       const allCompany = isCompanyUpload ? await CompanyDataModel.findAll() : [];
 
       const [companyWebhookOk, facebookWebhookOk] = await Promise.all([
         WebhookService.sendCompanyData(allCompany as CompanyDataRecord[]),
-        WebhookService.sendFacebookData(unsentFacebook as FacebookDataRecord[])
+        WebhookService.sendFacebookData(allFacebook as FacebookDataRecord[])
       ]);
 
       if (!companyWebhookOk || !facebookWebhookOk) {
@@ -212,9 +212,6 @@ export class ComparisonsController {
         });
         return;
       }
-
-      // Forwarded successfully — mark those Facebook rows so re-uploads don't resend them.
-      await FacebookDataModel.markSent(unsentFacebook.map((r) => r.uuid));
 
       // Uploaded and pushed to the ingestion webhook; ready for the Compare trigger.
       await UploadSessionModel.updateStatus(sessionId, 'pending_webhook');
@@ -443,14 +440,15 @@ export class ComparisonsController {
         message: 'Sending data to external processing service'
       });
 
-      // Get all records for this session
-      const companyRecords = await CompanyDataModel.findBySessionId(id);
-      const facebookRecords = await FacebookDataModel.findBySessionId(id);
+      // Forward the FULL tables (no per-session or "already sent" filtering), matching
+      // the automatic forwarding done at upload time.
+      const companyRecords = await CompanyDataModel.findAll();
+      const facebookRecords = await FacebookDataModel.findAll();
 
       if (companyRecords.length === 0 && facebookRecords.length === 0) {
         res.status(400).json({
           success: false,
-          message: 'No records found for this session'
+          message: 'No records found to send'
         });
         return;
       }

@@ -39,4 +39,17 @@ router.get('/facebook-data/all', FacebookDataController.getAllFacebookData);
 // GET /api/comparisons/company-data/all - Get all company data across sessions
 router.get('/company-data/all', CompanyDataController.getAllCompanyData);
 
+// DELETE /api/comparisons/company-data/all - Wipe all company data ("Clear all Company data")
+// (the literal "/all" routes must precede the "/:uuid" routes below)
+router.delete('/company-data/all', CompanyDataController.deleteAllCompanyData);
+
+// DELETE /api/comparisons/company-data/:uuid - Delete a single company row
+router.delete('/company-data/:uuid', CompanyDataController.deleteCompanyRecord);
+
+// DELETE /api/comparisons/facebook-data/all - Wipe all facebook data ("Clear all Facebook data")
+router.delete('/facebook-data/all', FacebookDataController.deleteAllFacebookData);
+
+// DELETE /api/comparisons/facebook-data/:uuid - Delete a single facebook row
+router.delete('/facebook-data/:uuid', FacebookDataController.deleteFacebookRecord);
+
 export default router;

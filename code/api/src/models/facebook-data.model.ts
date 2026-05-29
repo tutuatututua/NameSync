@@ -31,6 +31,12 @@ export class FacebookDataModel extends DBModel {
     return db.selectFrom("facebook_data").selectAll().where("session_id", "=", sessionId).execute();
   }
 
+  /** Every Facebook row across all sessions — the full set forwarded to the facebook webhook. */
+  static async findAll(): Promise<FacebookData[]> {
+    const db = await this.getKyselyDB();
+    return db.selectFrom("facebook_data").selectAll().execute() as Promise<FacebookData[]>;
+  }
+
   /** Distinct, non-null fb_name values already stored — used to skip duplicates on merge. */
   static async getExistingFbNames(): Promise<string[]> {
     const db = await this.getKyselyDB();
@@ -41,27 +47,6 @@ export class FacebookDataModel extends DBModel {
       .distinct()
       .execute();
     return rows.map((r) => r.fb_name as string);
-  }
-
-  /** Rows not yet pushed to the ingestion webhook (status IS NULL). */
-  static async findUnsent(): Promise<FacebookData[]> {
-    const db = await this.getKyselyDB();
-    return db
-      .selectFrom("facebook_data")
-      .selectAll()
-      .where("status", "is", null)
-      .execute() as Promise<FacebookData[]>;
-  }
-
-  /** Mark rows as sent so they aren't re-forwarded on the next upload. */
-  static async markSent(uuids: string[]) {
-    if (uuids.length === 0) return;
-    const db = await this.getKyselyDB();
-    return db
-      .updateTable("facebook_data")
-      .set({ status: "sent" })
-      .where("uuid", "in", uuids)
-      .execute();
   }
 
   static async findBySessionIdPaginated(
@@ -100,6 +85,33 @@ export class FacebookDataModel extends DBModel {
         totalPages
       }
     };
+  }
+
+  /** Total number of Facebook rows. */
+  static async count(): Promise<number> {
+    const db = await this.getKyselyDB();
+    const row = await db
+      .selectFrom("facebook_data")
+      .select(db.fn.count("uuid").as("count"))
+      .executeTakeFirst();
+    return Number(row?.count) || 0;
+  }
+
+  /** Delete every Facebook row. Returns the number of rows removed. */
+  static async deleteAll(): Promise<number> {
+    const db = await this.getKyselyDB();
+    const result = await db.deleteFrom("facebook_data").executeTakeFirst();
+    return Number(result?.numDeletedRows ?? 0);
+  }
+
+  /** Delete a single Facebook row by uuid. Returns the number of rows removed. */
+  static async deleteByUuid(uuid: string): Promise<number> {
+    const db = await this.getKyselyDB();
+    const result = await db
+      .deleteFrom("facebook_data")
+      .where("uuid", "=", uuid)
+      .executeTakeFirst();
+    return Number(result?.numDeletedRows ?? 0);
   }
 
   static async findAllPaginated(

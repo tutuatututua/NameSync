@@ -1,0 +1,51 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    environment:
+      NODE_ENV: production
+      ENVIRONMENT: TEST            # TEST => file-backed SQLite (see DBModel.createPool)
+      PORT: "8080"
+      DATABASE_FILE: /data/database.sqlite
+      UPLOAD_DIR: /data/uploads
+      CORS_ORIGIN: ${CORS_ORIGIN:-}   # empty => allow any origin (LAN visitors by IP)
+      JWT_SECRET: ${JWT_SECRET:-change-me}
+      JWT_EXPIRES_IN: 8h
+      REFRESH_TOKEN_EXPIRES_IN: 7d
+      RATE_LIMIT_WINDOW: "1"
+      RATE_LIMIT_MAX_REQUESTS: "500"
+      COMPANY_WEBHOOK_URL: ${COMPANY_WEBHOOK_URL:-}
+      FACEBOOK_WEBHOOK_URL: ${FACEBOOK_WEBHOOK_URL:-}
+      COMPARE_WEBHOOK_URL: ${COMPARE_WEBHOOK_URL:-}
+      WEBHOOK_CALLBACK_URL_BASE: ${WEBHOOK_CALLBACK_URL_BASE:-}
+    ports:
+      - "8080:8080"
+    volumes:
+      - api-data:/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        # Empty => frontend derives the API host from window.location at runtime,
+        # so LAN visitors reaching the site by IP also reach the API by that IP.
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-}
+        NEXT_PUBLIC_WS_BASE_URL: ${NEXT_PUBLIC_WS_BASE_URL:-}
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  api-data:

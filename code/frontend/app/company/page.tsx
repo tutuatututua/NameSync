@@ -9,11 +9,13 @@ import {
   UploadDropzone,
   FileCard,
   Button,
-  Alert
+  Alert,
+  ConfirmModal
 } from '../components';
 import CompanyUploadHistory from './components/CompanyUploadHistory';
 import CompanyDataTable from './components/CompanyDataTable';
 import { API_BASE_URL } from '../utils/config';
+import { deleteAllCompanyData } from '../utils/fileParser';
 
 interface UploadedFile {
   file: File;
@@ -46,6 +48,10 @@ export default function CompanyDataPage() {
   const [uploadedSessionId, setUploadedSessionId] = useState<string | null>(null);
   const [uploadHistory, setUploadHistory] = useState<UploadHistoryRecord[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [showClearConfirm, setShowClearConfirm] = useState(false);
+  const [isClearing, setIsClearing] = useState(false);
+  // Bumped after a destructive action so the data table refetches.
+  const [reloadToken, setReloadToken] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Fetch upload history on mount
@@ -181,7 +187,7 @@ export default function CompanyDataPage() {
     }
   };
 
-  const handleClear = () => {
+  const resetForm = () => {
     setCompanyFile(null);
     setUploadPersonName('');
     setWorkflowStep('upload');
@@ -190,6 +196,22 @@ export default function CompanyDataPage() {
     setError(null);
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
+    }
+  };
+
+  const handleConfirmClearAll = async () => {
+    setIsClearing(true);
+    setError(null);
+    try {
+      await deleteAllCompanyData();
+      resetForm();
+      setReloadToken((t) => t + 1);
+      fetchUploadHistory();
+      setShowClearConfirm(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to clear company data');
+    } finally {
+      setIsClearing(false);
     }
   };
 
@@ -207,9 +229,9 @@ export default function CompanyDataPage() {
           title="Company Data"
           subtitle="Upload and manage Company data records"
           actions={
-            <Button 
-              variant="secondary" 
-              onClick={handleClear}
+            <Button
+              variant="secondary"
+              onClick={() => setShowClearConfirm(true)}
               data-testid="clear-btn"
             >
               Clear All
@@ -272,9 +294,10 @@ export default function CompanyDataPage() {
                   <UploadDropzone
                     icon={companyIcon}
                     title="Upload Company CSV"
-                    description="Click to browse for your Company CSV file"
+                    description="Click to browse or drag & drop your Company CSV file"
                     fileType="CSV"
                     onClick={handleDropzoneClick}
+                    onFileDrop={handleFileSelect}
                     data-testid="company-dropzone"
                   />
                 ) : (
@@ -327,10 +350,25 @@ export default function CompanyDataPage() {
 
           {/* Right Column - Data Table */}
           <div className="lg:col-span-2">
-            <CompanyDataTable sessionId={uploadedSessionId} />
+            <CompanyDataTable sessionId={uploadedSessionId} reloadToken={reloadToken} />
           </div>
         </div>
       </MainContent>
+
+      <ConfirmModal
+        isOpen={showClearConfirm}
+        title="Clear all Company data"
+        message={
+          <>
+            This permanently removes <span className="font-medium text-slate-900">all Company data</span> and its
+            upload history from the database. This action cannot be undone.
+          </>
+        }
+        confirmLabel="Clear all Company data"
+        isProcessing={isClearing}
+        onClose={() => setShowClearConfirm(false)}
+        onConfirm={handleConfirmClearAll}
+      />
     </PageContainer>
   );
 }
