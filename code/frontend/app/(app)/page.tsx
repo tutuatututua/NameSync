@@ -57,8 +57,8 @@ export default function DashboardPage() {
             Upload your company and Facebook data and get confidence-scored name matches in seconds.
           </p>
           <Button asChild variant="secondary" className="mt-5">
-            <Link href="/compare">
-              <GitCompareArrows className="h-4 w-4" /> New Comparison <ArrowRight className="h-4 w-4" />
+            <Link href="/compare?run=both">
+              <GitCompareArrows className="h-4 w-4" /> Compare Both Tables <ArrowRight className="h-4 w-4" />
             </Link>
           </Button>
         </div>

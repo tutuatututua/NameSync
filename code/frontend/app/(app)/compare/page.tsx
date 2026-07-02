@@ -21,7 +21,9 @@ type Mode = "choose" | "running" | "done";
 
 function ComparePageInner() {
   const router = useRouter();
-  const preset = useSearchParams().get("add"); // "company" | "facebook" | null
+  const searchParams = useSearchParams();
+  const preset = searchParams.get("add"); // "company" | "facebook" | null
+  const autoRun = searchParams.get("run"); // "both" => auto-start Compare Both
 
   const [mode, setMode] = React.useState<Mode>("choose");
   const [name, setName] = React.useState("");
@@ -31,6 +33,7 @@ function ComparePageInner() {
   const [companyFile, setCompanyFile] = React.useState<File | null>(null);
   const [facebookFile, setFacebookFile] = React.useState<File | null>(null);
   const [uploader, setUploader] = React.useState("");
+  const autoRan = React.useRef(false);
 
   const companyCount = useCompanyCount();
   const facebookCount = useFacebookCount();
@@ -99,6 +102,16 @@ function ComparePageInner() {
   }
 
   const canCompareBoth = (companyCount.data ?? 0) > 0 && (facebookCount.data ?? 0) > 0;
+
+  // Auto-start "Compare Both" once when arriving via /compare?run=both and both
+  // tables have data (runs a single time; no-op when there's nothing to compare).
+  React.useEffect(() => {
+    if (autoRun === "both" && !autoRan.current && mode === "choose" && canCompareBoth) {
+      autoRan.current = true;
+      compareBoth();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoRun, canCompareBoth, mode]);
 
   return (
     <div className="mx-auto max-w-4xl">
