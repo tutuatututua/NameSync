@@ -3,19 +3,68 @@
 @tailwind utilities;
 
 @layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 224 20% 12%;
+    --card: 0 0% 100%;
+    --card-foreground: 224 20% 12%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 224 20% 12%;
+    --primary: 256 90% 58%; /* electric indigo/violet */
+    --primary-foreground: 0 0% 100%;
+    --secondary: 240 12% 96%;
+    --secondary-foreground: 224 20% 20%;
+    --accent: 190 95% 45%; /* cyan */
+    --accent-foreground: 224 30% 10%;
+    --muted: 240 12% 96%;
+    --muted-foreground: 224 12% 45%;
+    --destructive: 356 78% 52%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 240 10% 90%;
+    --input: 240 10% 90%;
+    --ring: 256 90% 58%;
+    --radius: 0.75rem;
+
+    --confidence-high: 152 70% 42%;
+    --confidence-good: 84 65% 45%;
+    --confidence-medium: 38 92% 55%;
+    --confidence-low: 356 78% 52%;
+  }
+
+  .dark {
+    --background: 250 30% 7%; /* deep near-black indigo */
+    --foreground: 240 15% 92%;
+    --card: 250 25% 10%;
+    --card-foreground: 240 15% 92%;
+    --popover: 250 25% 10%;
+    --popover-foreground: 240 15% 92%;
+    --primary: 256 95% 68%;
+    --primary-foreground: 250 30% 7%;
+    --secondary: 250 20% 16%;
+    --secondary-foreground: 240 15% 92%;
+    --accent: 190 95% 55%;
+    --accent-foreground: 250 30% 7%;
+    --muted: 250 20% 16%;
+    --muted-foreground: 240 10% 65%;
+    --destructive: 356 80% 60%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 250 20% 18%;
+    --input: 250 20% 18%;
+    --ring: 256 95% 68%;
+
+    --confidence-high: 152 65% 50%;
+    --confidence-good: 84 60% 55%;
+    --confidence-medium: 38 92% 60%;
+    --confidence-low: 356 80% 62%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
   body {
-    @apply bg-white text-gray-900;
-    font-family: Arial, Helvetica, sans-serif;
-  }
-  
-  input,
-  textarea,
-  select {
-    @apply bg-white text-gray-900 border-gray-300;
-  }
-  
-  input::placeholder,
-  textarea::placeholder {
-    @apply text-gray-400;
+    @apply bg-background text-foreground;
+    font-feature-settings: "rlig" 1, "calt" 1;
   }
 }
