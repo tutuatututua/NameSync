@@ -9,11 +9,16 @@
     "extensions/*"
   ],
   "scripts": {
-    "lint": "eslint api/src frontend/app test/tests"
+    "lint": "npm --prefix frontend run lint"
   },
   "devDependencies": {
-    "eslint": "^8.11.0",
+    "eslint": "^9.15.0",
     "tsx": "^4.21.0",
     "typescript": "^4.6.2"
+  },
+  "overrides": {
+    "eslint": "^9.15.0",
+    "@typescript-eslint/parser": "^8.18.0",
+    "@typescript-eslint/eslint-plugin": "^8.18.0"
   }
 }

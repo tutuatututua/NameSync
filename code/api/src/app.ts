@@ -12,7 +12,7 @@ import {
   hasZodFastifySchemaValidationErrors,
 } from "fastify-type-provider-zod";
 import { DBModel } from "@extensions/sqldb";
-import { corsOrigins, isProduction } from "./config/env";
+import { corsOrigins, isProduction, isTest } from "./config/env";
 import { AppError } from "./lib/errors";
 import healthRoutes from "./routes/health.route";
 import comparisonsRoutes from "./routes/comparisons.route";
@@ -29,14 +29,16 @@ import wsRoutes from "./routes/ws.route";
  */
 export async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify({
-    logger: isProduction
-      ? true
-      : {
-          transport: {
-            target: "pino-pretty",
-            options: { translateTime: "HH:MM:ss", ignore: "pid,hostname" },
+    logger: isTest
+      ? false
+      : isProduction
+        ? true
+        : {
+            transport: {
+              target: "pino-pretty",
+              options: { translateTime: "HH:MM:ss", ignore: "pid,hostname" },
+            },
           },
-        },
     requestIdHeader: "x-request-id",
     bodyLimit: 50 * 1024 * 1024,
   });

@@ -5,6 +5,10 @@ services:
       POSTGRES_USER: namesync
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-namesync}
       POSTGRES_DB: namesync
+    # Published on 55432 (not 5432) to avoid clashing with a local Postgres. Used
+    # by non-docker local dev and the test suite; the api container uses postgres:5432.
+    ports:
+      - "55432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:

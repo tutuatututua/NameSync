@@ -63,7 +63,12 @@ export abstract class DBModel {
       DBModel.poolPromise = (async () => {
         const pool = DBModel.createPool()
         const db = await pool.connect()
-        await DBModel.migrate(db)
+        // Allow skipping the on-boot migration (e.g. under a test runner whose ESM
+        // loader can't dynamic-import migration files by absolute path; those runs
+        // migrate out-of-band). Migrations are otherwise applied here as a safety net.
+        if (process.env.DB_SKIP_MIGRATE !== '1') {
+          await DBModel.migrate(db)
+        }
         DBModel._pool = pool
         return pool
       })().catch((err) => {

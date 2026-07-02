@@ -32,6 +32,10 @@ test_data/
 # Agent-written cross-session learnings
 MEMORY.md
 
+# Playwright MCP / verification artifacts (repo root)
+/.playwright-mcp/
+/*.png
+
 # OS files
 .DS_Store
 Thumbs.db
