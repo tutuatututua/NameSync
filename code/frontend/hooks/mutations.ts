@@ -17,6 +17,16 @@ export function useUploadComparison() {
   });
 }
 
+/** Merge an optional company/facebook file (or neither), then run a comparison. */
+export function useRunComparison() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (form: FormData) => api.comparisons.run(form),
+    onSuccess: () => qc.invalidateQueries(),
+    onError: (e) => toast.error(errMsg(e, "Failed to add data")),
+  });
+}
+
 export function useMergeComparison() {
   const qc = useQueryClient();
   return useMutation({

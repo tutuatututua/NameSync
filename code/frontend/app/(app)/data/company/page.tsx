@@ -1,9 +1,11 @@
 "use client";
 
 import * as React from "react";
-import { Trash2 } from "lucide-react";
+import Link from "next/link";
+import { Trash2, Plus } from "lucide-react";
 import type { CompanyDataRow } from "@extensions/contract";
 import { DataManager, type Column } from "@/components/data-table/DataManager";
+import { Button } from "@/components/ui/button";
 import { ConfirmButton } from "@/components/confirm-button";
 import { useAllCompanyData } from "@/hooks/queries";
 import { useDeleteCompanyRecord, useClearData } from "@/hooks/mutations";
@@ -27,16 +29,23 @@ export default function CompanyDataPage() {
           <h1 className="font-display text-2xl font-bold">Company Data</h1>
           <p className="text-muted-foreground">All company records across comparisons.</p>
         </div>
-        <ConfirmButton
-          variant="outline"
-          title="Clear all company data?"
-          description="This permanently deletes every company record and its upload history."
-          confirmLabel="Clear all"
-          isLoading={clear.isPending}
-          onConfirm={() => clear.mutateAsync()}
-        >
-          <Trash2 className="h-4 w-4" /> Clear all
-        </ConfirmButton>
+        <div className="flex items-center gap-2">
+          <Button asChild variant="gradient">
+            <Link href="/compare?add=company">
+              <Plus className="h-4 w-4" /> Add &amp; Compare
+            </Link>
+          </Button>
+          <ConfirmButton
+            variant="outline"
+            title="Clear all company data?"
+            description="This permanently deletes every company record and its upload history."
+            confirmLabel="Clear all"
+            isLoading={clear.isPending}
+            onConfirm={() => clear.mutateAsync()}
+          >
+            <Trash2 className="h-4 w-4" /> Clear all
+          </ConfirmButton>
+        </div>
       </div>
       <DataManager<CompanyDataRow>
         rows={q.data?.data ?? []}

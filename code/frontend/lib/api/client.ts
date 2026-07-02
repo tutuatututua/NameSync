@@ -1,6 +1,7 @@
 import { API_BASE_URL } from "@/app/utils/config";
 import type {
   CreateComparisonData,
+  RunComparisonData,
   ResultsData,
   CompanyDataRow,
   FacebookDataRow,
@@ -88,6 +89,8 @@ const qs = (params: Record<string, string | number | undefined>) => {
 
 export const api = {
   comparisons: {
+    run: (form: FormData) =>
+      request<Envelope<RunComparisonData>>("/comparisons/run", { method: "POST", body: form }).then((r) => r.data),
     create: (form: FormData) =>
       request<Envelope<CreateComparisonData>>("/comparisons", { method: "POST", body: form }).then((r) => r.data),
     merge: (id: string, form: FormData) =>

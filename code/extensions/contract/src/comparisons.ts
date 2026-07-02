@@ -56,6 +56,22 @@ export const CreateComparisonDataSchema = z.object({
 });
 export type CreateComparisonData = z.infer<typeof CreateComparisonDataSchema>;
 
+/**
+ * POST /api/comparisons/run — flexible entry point: attach a company file, a
+ * facebook file, both, or neither. Whatever is attached is merged (deduped) into
+ * its cumulative table; then the caller runs a comparison of the full tables.
+ */
+export const RunComparisonDataSchema = z.object({
+  sessionId: z.string(),
+  name: z.string(),
+  status: z.string(),
+  companyAdded: z.number(),
+  companyDuplicates: z.number(),
+  facebookAdded: z.number(),
+  facebookDuplicates: z.number(),
+});
+export type RunComparisonData = z.infer<typeof RunComparisonDataSchema>;
+
 export const SendWebhookDataSchema = z.object({
   sessionId: z.string(),
   status: z.string(),

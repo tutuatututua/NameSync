@@ -1,11 +1,11 @@
 "use client";
 
 import * as React from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { AnimatePresence, motion } from "framer-motion";
-import { Check, ArrowRight, ArrowLeft, Sparkles, Building2, Users, ClipboardCheck, Rocket, Loader2 } from "lucide-react";
+import { Building2, Users, GitCompareArrows, Sparkles, Loader2, RotateCcw } from "lucide-react";
 import { toast } from "sonner";
-import { Card, CardContent } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Button } from "@/components/ui/button";
@@ -13,292 +13,259 @@ import { LoadingButton } from "@/components/loading-button";
 import { Progress } from "@/components/ui/progress";
 import { UploadPanel } from "@/components/upload/UploadPanel";
 import { ResultsView } from "@/components/results/ResultsView";
-import { cn } from "@/lib/utils";
 import { useComparisonSocket } from "@/hooks/useComparisonSocket";
-import { useUploadComparison, useSendWebhook, useTriggerComparison, useSaveToHistory } from "@/hooks/mutations";
-import { useResults } from "@/hooks/queries";
+import { useRunComparison, useSendWebhook, useTriggerComparison, useSaveToHistory } from "@/hooks/mutations";
+import { useResults, useCompanyCount, useFacebookCount } from "@/hooks/queries";
 
-const STEPS = [
-  { key: "company", label: "Company", icon: Building2 },
-  { key: "facebook", label: "Facebook", icon: Users },
-  { key: "review", label: "Review", icon: ClipboardCheck },
-  { key: "run", label: "Run", icon: Rocket },
-  { key: "progress", label: "Progress", icon: Loader2 },
-  { key: "results", label: "Results", icon: Sparkles },
-] as const;
+type Mode = "choose" | "running" | "done";
 
-type StepIndex = 0 | 1 | 2 | 3 | 4 | 5;
-
-function StepRail({ current }: { current: number }) {
-  return (
-    <ol className="mb-8 flex items-center gap-2">
-      {STEPS.map((s, i) => {
-        const done = i < current;
-        const active = i === current;
-        return (
-          <React.Fragment key={s.key}>
-            <li className="flex items-center gap-2" aria-current={active ? "step" : undefined}>
-              <span
-                className={cn(
-                  "flex h-8 w-8 items-center justify-center rounded-full border text-sm font-semibold transition-colors",
-                  done && "border-primary bg-primary text-primary-foreground",
-                  active && "border-primary bg-primary/10 text-primary",
-                  !done && !active && "border-input text-muted-foreground"
-                )}
-              >
-                {done ? <Check className="h-4 w-4" /> : i + 1}
-              </span>
-              <span className={cn("hidden text-sm font-medium sm:inline", active ? "text-foreground" : "text-muted-foreground")}>
-                {s.label}
-              </span>
-            </li>
-            {i < STEPS.length - 1 && <span className="h-px flex-1 bg-border" />}
-          </React.Fragment>
-        );
-      })}
-    </ol>
-  );
-}
-
-const variants = {
-  enter: { opacity: 0, x: 40 },
-  center: { opacity: 1, x: 0 },
-  exit: { opacity: 0, x: -40 },
-};
-
-export default function ComparePage() {
+function ComparePageInner() {
   const router = useRouter();
-  const [step, setStep] = React.useState<StepIndex>(0);
-  const [companyFile, setCompanyFile] = React.useState<File | null>(null);
-  const [facebookFile, setFacebookFile] = React.useState<File | null>(null);
-  const [uploadPersonName, setUploadPersonName] = React.useState("");
-  const [name, setName] = React.useState(`Comparison ${new Date().toLocaleDateString()}`);
+  const preset = useSearchParams().get("add"); // "company" | "facebook" | null
+
+  const [mode, setMode] = React.useState<Mode>("choose");
+  const [name, setName] = React.useState("");
   const [sessionId, setSessionId] = React.useState<string | null>(null);
   const [progress, setProgress] = React.useState(0);
 
-  const uploadMut = useUploadComparison();
+  const [companyFile, setCompanyFile] = React.useState<File | null>(null);
+  const [facebookFile, setFacebookFile] = React.useState<File | null>(null);
+  const [uploader, setUploader] = React.useState("");
+
+  const companyCount = useCompanyCount();
+  const facebookCount = useFacebookCount();
+
+  const runMut = useRunComparison();
   const sendMut = useSendWebhook();
   const triggerMut = useTriggerComparison();
   const saveMut = useSaveToHistory();
-  const results = useResults(step === 5 && sessionId ? sessionId : "");
+  const results = useResults(mode === "done" && sessionId ? sessionId : "");
 
-  useComparisonSocket(step === 4 ? sessionId : null, {
+  useComparisonSocket(mode === "running" ? sessionId : null, {
     onMessage: (m) => {
       if (m.type === "batch_received" && typeof m.progress === "number") setProgress(m.progress);
     },
     onComplete: () => {
       setProgress(100);
-      setStep(5);
+      setMode("done");
     },
     onFailed: (m) => toast.error(("message" in m && m.message) || "Comparison failed"),
   });
 
-  const go = (next: StepIndex) => setStep(next);
+  const busy = runMut.isPending || sendMut.isPending;
 
-  const runComparison = async () => {
+  async function run(form: FormData, label: string) {
     try {
-      const fd = new FormData();
-      fd.append("name", name.trim() || "Comparison");
-      fd.append("mode", "fresh");
-      if (uploadPersonName.trim()) fd.append("uploadPersonName", uploadPersonName.trim());
-      if (companyFile) fd.append("companyFile", companyFile);
-      if (facebookFile) fd.append("facebookFile", facebookFile);
-
-      const created = await uploadMut.mutateAsync(fd);
-      setSessionId(created.sessionId);
-      toast.success(`Saved ${created.companyRecordsCount + created.facebookRecordsCount} records`);
-
-      await sendMut.mutateAsync(created.sessionId);
-      setStep(4);
-      // Trigger is best-effort: if the matcher isn't configured we still wait for
-      // results to arrive at the callback (surfaced via the socket / polling).
-      triggerMut.mutate(created.sessionId);
+      form.set("name", label);
+      const data = await runMut.mutateAsync(form);
+      setSessionId(data.sessionId);
+      setName(label);
+      const added = data.companyAdded + data.facebookAdded;
+      if (added > 0) toast.success(`Merged ${added.toLocaleString()} new row${added === 1 ? "" : "s"}`);
+      await sendMut.mutateAsync(data.sessionId);
+      setProgress(0);
+      setMode("running");
+      triggerMut.mutate(data.sessionId); // best-effort; results still arrive via the callback
     } catch {
-      /* errors already surfaced as toasts by the mutations */
+      /* mutations surface errors as toasts */
     }
-  };
+  }
+
+  const today = new Date().toLocaleDateString();
+
+  function addCompany() {
+    if (!companyFile) return;
+    const form = new FormData();
+    form.append("companyFile", companyFile);
+    void run(form, `Company update · ${today}`);
+  }
+  function addFacebook() {
+    if (!facebookFile) return;
+    const form = new FormData();
+    form.append("facebookFile", facebookFile);
+    if (uploader.trim()) form.append("uploadPersonName", uploader.trim());
+    void run(form, `Facebook update · ${today}`);
+  }
+  function compareBoth() {
+    void run(new FormData(), `Full comparison · ${today}`);
+  }
+
+  function reset() {
+    setMode("choose");
+    setSessionId(null);
+    setProgress(0);
+    setCompanyFile(null);
+    setFacebookFile(null);
+  }
+
+  const canCompareBoth = (companyCount.data ?? 0) > 0 && (facebookCount.data ?? 0) > 0;
 
   return (
-    <div className="mx-auto max-w-3xl">
-      <div className="mb-2 flex items-center gap-2">
+    <div className="mx-auto max-w-4xl">
+      <div className="mb-1 flex items-center gap-2">
         <Sparkles className="h-5 w-5 text-primary" />
-        <h1 className="font-display text-2xl font-bold">New Comparison</h1>
+        <h1 className="text-2xl font-bold">Run a comparison</h1>
       </div>
-      <p className="mb-6 text-muted-foreground">Upload both files, then run the confidence-scored name match.</p>
-
-      <StepRail current={step} />
+      <p className="mb-6 text-muted-foreground">
+        Add data to either table (it merges on top of what&apos;s there and compares against the
+        whole other table), or compare both tables as they stand.
+      </p>
 
       <AnimatePresence mode="wait" initial={false}>
-        <motion.div
-          key={step}
-          variants={variants}
-          initial="enter"
-          animate="center"
-          exit="exit"
-          transition={{ duration: 0.25, ease: "easeOut" }}
-        >
-          {step === 0 && (
-            <StepShell title="Upload Company data" subtitle="A CSV with columns “Company Name” and “Thai Name”.">
-              <UploadPanel accept={[".csv"]} file={companyFile} onChange={setCompanyFile} title="Drop your Company CSV here" hint="or click to browse" />
-              <Nav onNext={() => go(1)} nextDisabled={!companyFile} />
-            </StepShell>
-          )}
+        {mode === "choose" && (
+          <motion.div
+            key="choose"
+            initial={{ opacity: 0, y: 12 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -12 }}
+            transition={{ duration: 0.2 }}
+            className="grid gap-4 md:grid-cols-3"
+          >
+            {/* Add company */}
+            <Card className={preset === "company" ? "ring-2 ring-primary" : undefined}>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <Building2 className="h-4 w-4 text-primary" /> Add Company Data
+                </CardTitle>
+                <CardDescription>Merge a CSV into the company table, then compare vs all Facebook.</CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <UploadPanel accept={[".csv"]} file={companyFile} onChange={setCompanyFile} title="Drop CSV" hint="or browse" />
+                <LoadingButton className="w-full" isLoading={busy} disabled={!companyFile} onClick={addCompany}>
+                  Add &amp; Compare
+                </LoadingButton>
+              </CardContent>
+            </Card>
 
-          {step === 1 && (
-            <StepShell title="Upload Facebook data" subtitle="Your Facebook friends export (friends_v2 JSON).">
-              <UploadPanel accept={[".json"]} file={facebookFile} onChange={setFacebookFile} title="Drop your Facebook JSON here" hint="or click to browse" />
-              <div className="mt-4 space-y-1.5">
-                <Label htmlFor="uploader">Whose friends list is this? (optional)</Label>
-                <Input id="uploader" value={uploadPersonName} onChange={(e) => setUploadPersonName(e.target.value)} placeholder="e.g. Alex" />
-              </div>
-              <Nav onBack={() => go(0)} onNext={() => go(2)} nextDisabled={!facebookFile} />
-            </StepShell>
-          )}
-
-          {step === 2 && (
-            <StepShell title="Review" subtitle="Name this comparison, then continue.">
-              <div className="space-y-4">
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <SummaryCard icon={Building2} label="Company file" value={companyFile?.name ?? "—"} />
-                  <SummaryCard icon={Users} label="Facebook file" value={facebookFile?.name ?? "—"} />
-                </div>
+            {/* Add facebook */}
+            <Card className={preset === "facebook" ? "ring-2 ring-primary" : undefined}>
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <Users className="h-4 w-4 text-primary" /> Add Facebook Data
+                </CardTitle>
+                <CardDescription>Merge a JSON into the Facebook table, then compare vs all Company.</CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <UploadPanel accept={[".json"]} file={facebookFile} onChange={setFacebookFile} title="Drop JSON" hint="or browse" />
                 <div className="space-y-1.5">
-                  <Label htmlFor="name">Comparison name</Label>
-                  <Input id="name" value={name} onChange={(e) => setName(e.target.value)} />
+                  <Label htmlFor="uploader" className="text-xs">
+                    Whose friends? (optional)
+                  </Label>
+                  <Input id="uploader" value={uploader} onChange={(e) => setUploader(e.target.value)} placeholder="e.g. Alex" />
                 </div>
-              </div>
-              <Nav onBack={() => go(1)} onNext={() => go(3)} nextDisabled={!name.trim()} />
-            </StepShell>
-          )}
+                <LoadingButton className="w-full" isLoading={busy} disabled={!facebookFile} onClick={addFacebook}>
+                  Add &amp; Compare
+                </LoadingButton>
+              </CardContent>
+            </Card>
 
-          {step === 3 && (
-            <StepShell title="Ready to run" subtitle="We'll save your data and start the match.">
-              <Card>
-                <CardContent className="flex flex-col items-center gap-4 p-8 text-center">
-                  <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-brand text-primary-foreground shadow-lg">
-                    <Rocket className="h-6 w-6" />
+            {/* Compare both */}
+            <Card className="border-primary/30 bg-primary/5">
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <GitCompareArrows className="h-4 w-4 text-primary" /> Compare Both Tables
+                </CardTitle>
+                <CardDescription>Re-run the full comparison across everything you&apos;ve added.</CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <div className="rounded-lg border bg-card p-3 text-sm text-muted-foreground">
+                  <div className="flex justify-between">
+                    <span>Company rows</span>
+                    <span className="font-medium text-foreground tabular-nums">{(companyCount.data ?? 0).toLocaleString()}</span>
                   </div>
-                  <p className="text-muted-foreground">
-                    Comparing <span className="font-medium text-foreground">{companyFile?.name}</span> against{" "}
-                    <span className="font-medium text-foreground">{facebookFile?.name}</span>.
-                  </p>
-                  <LoadingButton
-                    size="lg"
-                    variant="gradient"
-                    isLoading={uploadMut.isPending || sendMut.isPending}
-                    onClick={runComparison}
+                  <div className="mt-1 flex justify-between">
+                    <span>Facebook rows</span>
+                    <span className="font-medium text-foreground tabular-nums">{(facebookCount.data ?? 0).toLocaleString()}</span>
+                  </div>
+                </div>
+                <LoadingButton
+                  variant="gradient"
+                  className="w-full"
+                  isLoading={busy}
+                  disabled={!canCompareBoth}
+                  onClick={compareBoth}
+                >
+                  <GitCompareArrows className="h-4 w-4" /> Compare Now
+                </LoadingButton>
+                {!canCompareBoth && (
+                  <p className="text-center text-xs text-muted-foreground">Add data to both tables first.</p>
+                )}
+              </CardContent>
+            </Card>
+          </motion.div>
+        )}
+
+        {mode === "running" && (
+          <motion.div key="running" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+            <Card>
+              <CardContent className="space-y-4 p-8">
+                <div className="flex items-center justify-center">
+                  <motion.div
+                    animate={{ rotate: 360 }}
+                    transition={{ repeat: Infinity, duration: 1.4, ease: "linear" }}
+                    className="text-primary"
                   >
-                    <Sparkles className="h-4 w-4" /> Run Comparison
+                    <Loader2 className="h-8 w-8" />
+                  </motion.div>
+                </div>
+                <p className="text-center font-medium">Matching names…</p>
+                <Progress value={progress} />
+                <p className="text-center text-sm tabular-nums text-muted-foreground">{progress}% complete</p>
+              </CardContent>
+            </Card>
+          </motion.div>
+        )}
+
+        {mode === "done" && (
+          <motion.div key="done" initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }}>
+            {results.isLoading ? (
+              <p className="text-muted-foreground">Loading results…</p>
+            ) : results.data ? (
+              <>
+                <ResultsView results={results.data.results} meanConfidence={results.data.meanConfidence} />
+                <div className="mt-6 flex justify-end gap-2">
+                  <Button variant="outline" onClick={reset}>
+                    <RotateCcw className="h-4 w-4" /> Run another
+                  </Button>
+                  <LoadingButton
+                    variant="gradient"
+                    isLoading={saveMut.isPending}
+                    onClick={async () => {
+                      if (!sessionId || !results.data) return;
+                      const saved = await saveMut.mutateAsync({
+                        name,
+                        comparison_id: sessionId,
+                        row_count: results.data.rowCount,
+                        mean_confidence: results.data.meanConfidence,
+                        results: JSON.stringify(
+                          results.data.results.map((r) => ({
+                            fbName: r.fb_name,
+                            companyName: r.person_name_en,
+                            confidence: r.matching_score,
+                          }))
+                        ),
+                      });
+                      if (saved?.id) router.push(`/comparisons/${saved.id}?saved=1`);
+                    }}
+                  >
+                    Save to History
                   </LoadingButton>
-                </CardContent>
-              </Card>
-              <Nav onBack={() => go(2)} />
-            </StepShell>
-          )}
-
-          {step === 4 && (
-            <StepShell title="Matching names…" subtitle="Live progress — this stays connected until it completes.">
-              <Card>
-                <CardContent className="space-y-4 p-8">
-                  <div className="flex items-center justify-center">
-                    <motion.div
-                      animate={{ rotate: 360 }}
-                      transition={{ repeat: Infinity, duration: 1.4, ease: "linear" }}
-                      className="text-primary"
-                    >
-                      <Loader2 className="h-8 w-8" />
-                    </motion.div>
-                  </div>
-                  <Progress value={progress} />
-                  <p className="text-center text-sm tabular-nums text-muted-foreground">{progress}% complete</p>
-                </CardContent>
-              </Card>
-            </StepShell>
-          )}
-
-          {step === 5 && (
-            <StepShell title="Results" subtitle="Confidence-scored name matches.">
-              {results.isLoading ? (
-                <p className="text-muted-foreground">Loading results…</p>
-              ) : results.data ? (
-                <>
-                  <ResultsView results={results.data.results} meanConfidence={results.data.meanConfidence} />
-                  <div className="mt-6 flex justify-end">
-                    <LoadingButton
-                      variant="gradient"
-                      isLoading={saveMut.isPending}
-                      onClick={async () => {
-                        if (!sessionId || !results.data) return;
-                        const saved = await saveMut.mutateAsync({
-                          name,
-                          comparison_id: sessionId,
-                          row_count: results.data.rowCount,
-                          mean_confidence: results.data.meanConfidence,
-                          results: JSON.stringify(
-                            results.data.results.map((r) => ({
-                              fbName: r.fb_name,
-                              companyName: r.person_name_en,
-                              confidence: r.matching_score,
-                            }))
-                          ),
-                        });
-                        if (saved?.id) router.push(`/comparisons/${saved.id}?saved=1`);
-                      }}
-                    >
-                      Save to History
-                    </LoadingButton>
-                  </div>
-                </>
-              ) : (
-                <p className="text-muted-foreground">No results found.</p>
-              )}
-            </StepShell>
-          )}
-        </motion.div>
+                </div>
+              </>
+            ) : (
+              <p className="text-muted-foreground">No results found.</p>
+            )}
+          </motion.div>
+        )}
       </AnimatePresence>
     </div>
   );
 }
 
-function StepShell({ title, subtitle, children }: { title: string; subtitle: string; children: React.ReactNode }) {
+export default function ComparePage() {
   return (
-    <div>
-      <h2 className="font-display text-xl font-semibold">{title}</h2>
-      <p className="mb-5 text-sm text-muted-foreground">{subtitle}</p>
-      {children}
-    </div>
-  );
-}
-
-function Nav({ onBack, onNext, nextDisabled }: { onBack?: () => void; onNext?: () => void; nextDisabled?: boolean }) {
-  return (
-    <div className="mt-6 flex items-center justify-between">
-      {onBack ? (
-        <Button variant="ghost" onClick={onBack}>
-          <ArrowLeft className="h-4 w-4" /> Back
-        </Button>
-      ) : (
-        <span />
-      )}
-      {onNext && (
-        <Button onClick={onNext} disabled={nextDisabled}>
-          Next <ArrowRight className="h-4 w-4" />
-        </Button>
-      )}
-    </div>
-  );
-}
-
-function SummaryCard({ icon: Icon, label, value }: { icon: typeof Building2; label: string; value: string }) {
-  return (
-    <div className="flex items-center gap-3 rounded-xl border bg-card p-4">
-      <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary/10 text-primary">
-        <Icon className="h-5 w-5" />
-      </div>
-      <div className="min-w-0">
-        <p className="text-xs text-muted-foreground">{label}</p>
-        <p className="truncate font-medium">{value}</p>
-      </div>
-    </div>
+    <React.Suspense fallback={null}>
+      <ComparePageInner />
+    </React.Suspense>
   );
 }

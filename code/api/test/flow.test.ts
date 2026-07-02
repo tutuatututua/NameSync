@@ -83,6 +83,42 @@ describe("core flow", () => {
   });
 });
 
+describe("run endpoint (table-centric flow)", () => {
+  it("merges a company file, a facebook file, or neither", async () => {
+    const FormData = (await import("form-data")).default;
+
+    const f1 = new FormData();
+    f1.append("name", "co");
+    f1.append("companyFile", Buffer.from("Company Name,Thai Name\nA,ก\nB,ข\n"), {
+      filename: "c.csv",
+      contentType: "text/csv",
+    });
+    const r1 = await app.inject({ method: "POST", url: "/api/comparisons/run", payload: f1, headers: f1.getHeaders() });
+    expect(r1.statusCode).toBe(200);
+    expect(r1.json().data.companyAdded).toBe(2);
+    expect(r1.json().data.facebookAdded).toBe(0);
+    expect(r1.json().data.status).toBe("pending_webhook");
+
+    const f2 = new FormData();
+    f2.append("name", "fb");
+    f2.append("facebookFile", Buffer.from(JSON.stringify({ friends_v2: [{ name: "X", timestamp: 1 }] })), {
+      filename: "f.json",
+      contentType: "application/json",
+    });
+    const r2 = await app.inject({ method: "POST", url: "/api/comparisons/run", payload: f2, headers: f2.getHeaders() });
+    expect(r2.json().data.facebookAdded).toBe(1);
+    expect(r2.json().data.companyAdded).toBe(0);
+
+    const f3 = new FormData();
+    f3.append("name", "both");
+    const r3 = await app.inject({ method: "POST", url: "/api/comparisons/run", payload: f3, headers: f3.getHeaders() });
+    expect(r3.statusCode).toBe(200);
+    expect(r3.json().data.companyAdded).toBe(0);
+    expect(r3.json().data.facebookAdded).toBe(0);
+    expect(r3.json().data.status).toBe("pending_webhook");
+  });
+});
+
 describe("callback behavior", () => {
   it("is idempotent — a re-posted batch stores nothing new", async () => {
     const id = (await uploadComparison(app)).json().data.sessionId;

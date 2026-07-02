@@ -13,6 +13,7 @@ import {
   PaginationQuerySchema,
   CreateComparisonBodySchema,
   CreateComparisonDataSchema,
+  RunComparisonDataSchema,
   SendWebhookDataSchema,
   ResultsDataSchema,
   TriggerCompareDataSchema,
@@ -99,6 +100,85 @@ async function parseUpload(req: FastifyRequest): Promise<ParsedUpload> {
 
 export default async function comparisonsRoutes(fastify: FastifyInstance): Promise<void> {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
+
+  // POST /api/comparisons/run — flexible: merge an optional company file and/or an
+  // optional facebook file into their cumulative tables (deduped), or neither. The
+  // caller then runs a comparison (send-webhook + compare) against the full tables.
+  app.post(
+    "/run",
+    { schema: { response: { 200: apiSuccess(RunComparisonDataSchema) } } },
+    async (req) => {
+      const { companyPath, facebookPath, fields } = await parseUpload(req);
+      const name =
+        (fields.name && fields.name.trim()) || `Comparison ${new Date().toISOString().slice(0, 10)}`;
+      const sessionId = crypto.randomUUID();
+
+      try {
+        await UploadSessionModel.create({
+          id: sessionId,
+          name,
+          facebook_file_path: null,
+          mode: "fresh",
+          parent_session_id: null,
+          status: "processing",
+        });
+        WebSocketService.broadcast(sessionId, {
+          type: "processing_started",
+          sessionId,
+          message: "Merging data",
+        });
+
+        let companyAdded = 0;
+        let companyDuplicates = 0;
+        let facebookAdded = 0;
+        let facebookDuplicates = 0;
+
+        if (companyPath) {
+          const recs = await FileParserService.parseCompanyCSV(companyPath, sessionId);
+          const fresh = await dedupeCompany(recs);
+          companyAdded = fresh.length;
+          companyDuplicates = recs.length - fresh.length;
+          await CompanyDataModel.createMany(fresh);
+        }
+        if (facebookPath) {
+          const recs = await FileParserService.parseFacebookJSON(
+            facebookPath,
+            sessionId,
+            fields.uploadPersonName
+          );
+          const fresh = await dedupeFacebook(recs);
+          facebookAdded = fresh.length;
+          facebookDuplicates = recs.length - fresh.length;
+          await FacebookDataModel.createMany(fresh);
+        }
+
+        unlinkQuiet(companyPath, facebookPath);
+        await UploadSessionModel.updateStatus(sessionId, "pending_webhook");
+        WebSocketService.broadcast(sessionId, {
+          type: "saved_to_database",
+          sessionId,
+          message: "Data merged. Ready to compare.",
+        });
+
+        return ok(
+          {
+            sessionId,
+            name,
+            status: "pending_webhook",
+            companyAdded,
+            companyDuplicates,
+            facebookAdded,
+            facebookDuplicates,
+          },
+          "Ready to compare"
+        );
+      } catch (err) {
+        unlinkQuiet(companyPath, facebookPath);
+        await UploadSessionModel.updateStatus(sessionId, "failed").catch(() => undefined);
+        throw err;
+      }
+    }
+  );
 
   // POST /api/comparisons — upload, parse, dedupe, save (fresh)
   app.post(
