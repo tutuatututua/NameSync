@@ -16,9 +16,10 @@ const config: Config = {
     },
     extend: {
       fontFamily: {
-        sans: ["var(--font-geist-sans)", "var(--font-thai)", "system-ui", "sans-serif"],
-        mono: ["var(--font-geist-mono)", "monospace"],
-        display: ["var(--font-display)", "var(--font-geist-sans)", "sans-serif"],
+        sans: ["var(--font-sans)", "var(--font-thai)", "system-ui", "sans-serif"],
+        mono: ["var(--font-mono)", "monospace"],
+        // Headings share the body face (Inter) for readability, just heavier/tighter.
+        display: ["var(--font-sans)", "var(--font-thai)", "system-ui", "sans-serif"],
       },
       colors: {
         border: "hsl(var(--border))",
