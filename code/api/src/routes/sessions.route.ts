@@ -1,16 +1,67 @@
-import { Router } from 'express';
-import { SessionsController } from '../controllers/sessions.controller';
+import { FastifyInstance } from "fastify";
+import { ZodTypeProvider } from "fastify-type-provider-zod";
+import { z } from "zod";
+import {
+  apiSuccess,
+  IdParamSchema,
+  SessionSummarySchema,
+  SessionDetailSchema,
+  LatestSessionSchema,
+} from "@extensions/contract";
+import { UploadSessionModel } from "../models/upload-session.model";
+import { NotFound } from "../lib/errors";
+import { ok } from "../lib/http";
 
-const router = Router();
+const fmtDate = (iso: string | null): string =>
+  iso
+    ? new Date(iso).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })
+    : "Unknown date";
 
-// GET /api/sessions - List available sessions for "continue from existing"
-router.get('/', SessionsController.list);
+export default async function sessionsRoutes(fastify: FastifyInstance): Promise<void> {
+  const app = fastify.withTypeProvider<ZodTypeProvider>();
 
-// GET /api/sessions/latest - Most recent session eligible to (re)trigger comparison
-// (must be registered before "/:id" so "latest" isn't captured as an id)
-router.get('/latest', SessionsController.getLatest);
+  app.get(
+    "/",
+    { schema: { response: { 200: apiSuccess(z.array(SessionSummarySchema)) } } },
+    async () => {
+      const sessions = await UploadSessionModel.findAvailableSessions();
+      const data = sessions
+        .filter((s) => s.status === "completed" && s.name)
+        .map((s) => ({
+          id: s.id,
+          title: s.name || "Untitled Session",
+          date: fmtDate(s.created_at),
+          rowCount: 0,
+          averageConfidence: 0,
+        }));
+      return ok(data);
+    }
+  );
 
-// GET /api/sessions/:id - Get session details for preview
-router.get('/:id', SessionsController.getById);
+  app.get(
+    "/latest",
+    { schema: { response: { 200: apiSuccess(LatestSessionSchema) } } },
+    async () => {
+      const s = await UploadSessionModel.findLatestCompareable();
+      return ok(s ? { id: s.id, status: s.status ?? "" } : null);
+    }
+  );
 
-export default router;
+  app.get(
+    "/:id",
+    { schema: { params: IdParamSchema, response: { 200: apiSuccess(SessionDetailSchema) } } },
+    async (req) => {
+      const s = await UploadSessionModel.findById(req.params.id);
+      if (!s) throw new NotFound("Session not found");
+      return ok({
+        id: s.id,
+        title: s.name || "Untitled Session",
+        date: fmtDate(s.created_at),
+        rowCount: 0,
+        averageConfidence: 0,
+        mode: s.mode,
+        status: s.status,
+      });
+    }
+  );
+}

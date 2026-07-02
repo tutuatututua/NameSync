@@ -23,8 +23,19 @@ export abstract class DBModel {
   }
 
   private static createPool(): ConnectionPool {
+    // Explicit override — used by the API (DB_ENGINE=postgres) and integration tests.
+    switch (process.env.DB_ENGINE) {
+      case 'postgres': return new PostgresPool()
+      case 'sqlite-file': return new SqliteFilePool()
+      case 'sqlite-mem': return new SqliteMemoryPool()
+    }
+    // Legacy ENVIRONMENT selector — kept so this extension's own tests are unchanged.
     if (process.env.ENVIRONMENT === 'PROD') return new PostgresPool()
     if (process.env.ENVIRONMENT === 'TEST') return new SqliteFilePool()
+    // Convenience: a Postgres connection string implies Postgres.
+    if (process.env.DATABASE_URL && /^postgres(ql)?:\/\//i.test(process.env.DATABASE_URL)) {
+      return new PostgresPool()
+    }
     return new SqliteMemoryPool()
   }
 

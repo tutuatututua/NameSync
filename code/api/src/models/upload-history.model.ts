@@ -1,4 +1,5 @@
 import { DBModel } from "@extensions/sqldb";
+import type { PaginatedResult } from "@extensions/contract";
 import type { UploadHistory } from "../db.types";
 import crypto from "crypto";
 
@@ -13,16 +14,6 @@ export interface UploadHistoryInput {
   duplicate_rows: number;
   session_id?: string | null;
   created_at?: string;
-}
-
-export interface PaginatedResult<T> {
-  data: T[];
-  pagination: {
-    page: number;
-    limit: number;
-    total: number;
-    totalPages: number;
-  };
 }
 
 export class UploadHistoryModel extends DBModel {

@@ -13,6 +13,7 @@ export interface UploadSessions {
   mode: string | null;
   parent_session_id: string | null;
   status: string | null;
+  expected_batches: number | null;
   created_at: string | null;
   updated_at: string | null;
 }

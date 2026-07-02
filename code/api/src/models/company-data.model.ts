@@ -1,4 +1,5 @@
 import { DBModel } from "@extensions/sqldb";
+import type { PaginatedResult } from "@extensions/contract";
 import type { CompanyData } from "../db.types";
 
 export interface CompanyDataInput {
@@ -8,16 +9,6 @@ export interface CompanyDataInput {
   person_name_en: string | null;
   status: string | null;
   session_id: string;
-}
-
-export interface PaginatedResult<T> {
-  data: T[];
-  pagination: {
-    page: number;
-    limit: number;
-    total: number;
-    totalPages: number;
-  };
 }
 
 export class CompanyDataModel extends DBModel {

@@ -1,4 +1,5 @@
 import { DBModel } from "@extensions/sqldb";
+import type { PaginatedResult } from "@extensions/contract";
 import type { FacebookData } from "../db.types";
 
 export interface FacebookDataInput {
@@ -7,16 +8,6 @@ export interface FacebookDataInput {
   timestamp: string | null;
   upload_person_name: string | null;
   session_id: string;
-}
-
-export interface PaginatedResult<T> {
-  data: T[];
-  pagination: {
-    page: number;
-    limit: number;
-    total: number;
-    totalPages: number;
-  };
 }
 
 export class FacebookDataModel extends DBModel {
