@@ -14,7 +14,7 @@ import { formatDate } from "@/lib/format";
 const LIMIT = 20;
 const columns: Column<FacebookDataRow>[] = [
   { key: "fb_name", header: "Facebook name", render: (r) => r.fb_name ?? "—" },
-  { key: "upload_person_name", header: "Friends of", render: (r) => r.upload_person_name ?? "—" },
+  { key: "upload_person_name", header: "Uploaded by", render: (r) => r.upload_person_name ?? "—" },
   { key: "timestamp", header: "Added", render: (r) => (r.timestamp ? formatDate(r.timestamp) : "—") },
 ];
 

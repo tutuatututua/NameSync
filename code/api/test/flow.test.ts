@@ -89,6 +89,7 @@ describe("run endpoint (table-centric flow)", () => {
 
     const f1 = new FormData();
     f1.append("name", "co");
+    f1.append("uploadPersonName", "Alex");
     f1.append("companyFile", Buffer.from("Company Name,Thai Name\nA,ก\nB,ข\n"), {
       filename: "c.csv",
       contentType: "text/csv",
@@ -98,6 +99,10 @@ describe("run endpoint (table-centric flow)", () => {
     expect(r1.json().data.companyAdded).toBe(2);
     expect(r1.json().data.facebookAdded).toBe(0);
     expect(r1.json().data.status).toBe("pending_webhook");
+
+    // The upload user is recorded on company rows (mirrors facebook.upload_person_name).
+    const co = await app.inject({ method: "GET", url: "/api/comparisons/company-data/all?page=1&limit=50" });
+    expect(co.json().data.every((r: { upload_person_name: string | null }) => r.upload_person_name === "Alex")).toBe(true);
 
     const f2 = new FormData();
     f2.append("name", "fb");

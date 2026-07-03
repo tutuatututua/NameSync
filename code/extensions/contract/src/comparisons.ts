@@ -8,6 +8,7 @@ export const CompanyDataRowSchema = z.object({
   person_name_th: z.string().nullable(),
   person_name_en: z.string().nullable(),
   status: z.string().nullable(),
+  upload_person_name: z.string().nullable(),
   session_id: z.string().nullable(),
 });
 export type CompanyDataRow = z.infer<typeof CompanyDataRowSchema>;

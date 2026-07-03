@@ -134,7 +134,7 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
         let facebookDuplicates = 0;
 
         if (companyPath) {
-          const recs = await FileParserService.parseCompanyCSV(companyPath, sessionId);
+          const recs = await FileParserService.parseCompanyCSV(companyPath, sessionId, fields.uploadPersonName);
           const fresh = await dedupeCompany(recs);
           companyAdded = fresh.length;
           companyDuplicates = recs.length - fresh.length;
@@ -218,7 +218,7 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
           message: "File upload complete, starting processing",
         });
 
-        const companyRecords = await FileParserService.parseCompanyCSV(companyPath, sessionId);
+        const companyRecords = await FileParserService.parseCompanyCSV(companyPath, sessionId, uploadPersonName);
         const facebookRecords = await FileParserService.parseFacebookJSON(facebookPath, sessionId, uploadPersonName);
 
         const newCompany = await dedupeCompany(companyRecords);
@@ -302,7 +302,7 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
           message: "Merge upload complete, starting processing",
         });
 
-        const companyRecords = await FileParserService.parseCompanyCSV(companyPath, sessionId);
+        const companyRecords = await FileParserService.parseCompanyCSV(companyPath, sessionId, uploadPersonName);
         const facebookRecords = await FileParserService.parseFacebookJSON(facebookPath, sessionId, uploadPersonName);
 
         const newCompany = await dedupeCompany(companyRecords);

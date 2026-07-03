@@ -32,7 +32,8 @@ function ComparePageInner() {
 
   const [companyFile, setCompanyFile] = React.useState<File | null>(null);
   const [facebookFile, setFacebookFile] = React.useState<File | null>(null);
-  const [uploader, setUploader] = React.useState("");
+  const [companyUploader, setCompanyUploader] = React.useState("");
+  const [facebookUploader, setFacebookUploader] = React.useState("");
   const autoRan = React.useRef(false);
 
   const companyCount = useCompanyCount();
@@ -80,13 +81,14 @@ function ComparePageInner() {
     if (!companyFile) return;
     const form = new FormData();
     form.append("companyFile", companyFile);
+    if (companyUploader.trim()) form.append("uploadPersonName", companyUploader.trim());
     void run(form, `Company update · ${today}`);
   }
   function addFacebook() {
     if (!facebookFile) return;
     const form = new FormData();
     form.append("facebookFile", facebookFile);
-    if (uploader.trim()) form.append("uploadPersonName", uploader.trim());
+    if (facebookUploader.trim()) form.append("uploadPersonName", facebookUploader.trim());
     void run(form, `Facebook update · ${today}`);
   }
   function compareBoth() {
@@ -144,6 +146,12 @@ function ComparePageInner() {
               </CardHeader>
               <CardContent className="space-y-3">
                 <UploadPanel accept={[".csv"]} file={companyFile} onChange={setCompanyFile} title="Drop CSV" hint="or browse" />
+                <div className="space-y-1.5">
+                  <Label htmlFor="co-uploader" className="text-xs">
+                    Upload user (optional)
+                  </Label>
+                  <Input id="co-uploader" value={companyUploader} onChange={(e) => setCompanyUploader(e.target.value)} placeholder="e.g. Alex" />
+                </div>
                 <LoadingButton className="w-full" isLoading={busy} disabled={!companyFile} onClick={addCompany}>
                   Add &amp; Compare
                 </LoadingButton>
@@ -161,10 +169,10 @@ function ComparePageInner() {
               <CardContent className="space-y-3">
                 <UploadPanel accept={[".json"]} file={facebookFile} onChange={setFacebookFile} title="Drop JSON" hint="or browse" />
                 <div className="space-y-1.5">
-                  <Label htmlFor="uploader" className="text-xs">
-                    Whose friends? (optional)
+                  <Label htmlFor="fb-uploader" className="text-xs">
+                    Upload user (optional)
                   </Label>
-                  <Input id="uploader" value={uploader} onChange={(e) => setUploader(e.target.value)} placeholder="e.g. Alex" />
+                  <Input id="fb-uploader" value={facebookUploader} onChange={(e) => setFacebookUploader(e.target.value)} placeholder="e.g. Alex" />
                 </div>
                 <LoadingButton className="w-full" isLoading={busy} disabled={!facebookFile} onClick={addFacebook}>
                   Add &amp; Compare

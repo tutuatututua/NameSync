@@ -8,6 +8,7 @@ export interface CompanyDataInput {
   person_name_th: string | null;
   person_name_en: string | null;
   status: string | null;
+  upload_person_name?: string | null;
   session_id: string;
 }
 

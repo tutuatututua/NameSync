@@ -14,6 +14,7 @@ const LIMIT = 20;
 const columns: Column<CompanyDataRow>[] = [
   { key: "company_name", header: "Company", render: (r) => r.company_name ?? "—" },
   { key: "person_name_th", header: "Thai name", render: (r) => r.person_name_th ?? "—" },
+  { key: "upload_person_name", header: "Uploaded by", render: (r) => r.upload_person_name ?? "—" },
 ];
 
 export default function CompanyDataPage() {

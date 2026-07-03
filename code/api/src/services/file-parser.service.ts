@@ -8,6 +8,7 @@ export interface CompanyDataRecord {
   person_name_th: string | null;
   person_name_en: string | null;
   status: string | null;
+  upload_person_name: string | null;
   session_id: string;
 }
 
@@ -33,7 +34,11 @@ export class FileParserService {
    * Parse CSV file containing company data.
    * Expected columns: "Company Name", "Thai Name".
    */
-  static async parseCompanyCSV(filePath: string, sessionId: string): Promise<CompanyDataRecord[]> {
+  static async parseCompanyCSV(
+    filePath: string,
+    sessionId: string,
+    uploadPersonName?: string
+  ): Promise<CompanyDataRecord[]> {
     // Async read so a large upload (up to the 500MB multer limit) doesn't block the event loop.
     const content = await fs.promises.readFile(filePath, 'utf-8');
     // Remove BOM if present
@@ -51,6 +56,7 @@ export class FileParserService {
       person_name_th: record['Thai Name'] || null,
       person_name_en: null, // Not provided in source data
       status: null, // Not provided in source data
+      upload_person_name: uploadPersonName || null,
       session_id: sessionId
     }));
   }
