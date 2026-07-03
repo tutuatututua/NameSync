@@ -172,7 +172,7 @@ function ComparePageInner() {
                   <Input id="co-uploader" value={companyUploader} onChange={(e) => setCompanyUploader(e.target.value)} placeholder="e.g. Alex" />
                 </div>
                 <LoadingButton className="w-full" isLoading={busy} disabled={!companyFile} onClick={addCompany}>
-                  Add &amp; Compare
+                  Sync
                 </LoadingButton>
               </CardContent>
             </Card>
@@ -194,7 +194,7 @@ function ComparePageInner() {
                   <Input id="fb-uploader" value={facebookUploader} onChange={(e) => setFacebookUploader(e.target.value)} placeholder="e.g. Alex" />
                 </div>
                 <LoadingButton className="w-full" isLoading={busy} disabled={!facebookFile} onClick={addFacebook}>
-                  Add &amp; Compare
+                  Sync
                 </LoadingButton>
               </CardContent>
             </Card>

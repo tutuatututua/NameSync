@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { Trash2, Plus } from "lucide-react";
+import { Trash2, RefreshCw } from "lucide-react";
 import type { CompanyDataRow } from "@extensions/contract";
 import { DataManager, type Column } from "@/components/data-table/DataManager";
 import { Button } from "@/components/ui/button";
@@ -33,7 +33,7 @@ export default function CompanyDataPage() {
         <div className="flex items-center gap-2">
           <Button asChild variant="gradient">
             <Link href="/compare?add=company">
-              <Plus className="h-4 w-4" /> Add &amp; Compare
+              <RefreshCw className="h-4 w-4" /> Sync
             </Link>
           </Button>
           <ConfirmButton
