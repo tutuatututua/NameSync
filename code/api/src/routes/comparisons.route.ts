@@ -368,11 +368,13 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
         message: "Sending data to external processing service",
       });
 
-      const companyRecords = await CompanyDataModel.findAll();
-      const facebookRecords = await FacebookDataModel.findAll();
-      if (companyRecords.length === 0 && facebookRecords.length === 0) {
-        throw new BadRequest("No records found to send");
-      }
+      // Forward only the rows added in THIS run (tagged with this session_id), so the
+      // workflow merges just the new data. The trigger's session_id then tells the
+      // workflow which side is new (company-only => new company vs full Facebook;
+      // facebook-only => full Company vs new Facebook). A Compare-Both run has no new
+      // rows, so nothing is sent and the workflow compares the full tables.
+      const companyRecords = await CompanyDataModel.findBySessionId(id);
+      const facebookRecords = await FacebookDataModel.findBySessionId(id);
 
       const [companyOk, facebookOk] = await Promise.all([
         WebhookService.sendCompanyData(companyRecords as CompanyDataRecord[]),

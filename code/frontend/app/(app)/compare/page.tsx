@@ -58,7 +58,11 @@ function ComparePageInner() {
 
   const busy = runMut.isPending || sendMut.isPending;
 
-  async function run(form: FormData, label: string) {
+  async function run(
+    form: FormData,
+    label: string,
+    opts: { canCompare: boolean; blockedMessage?: string }
+  ) {
     try {
       form.set("name", label);
       const data = await runMut.mutateAsync(form);
@@ -66,10 +70,19 @@ function ComparePageInner() {
       setName(label);
       const added = data.companyAdded + data.facebookAdded;
       if (added > 0) toast.success(`Merged ${added.toLocaleString()} new row${added === 1 ? "" : "s"}`);
+
+      // Always push the new rows to the workflow (merge into its DB)…
       await sendMut.mutateAsync(data.sessionId);
-      setProgress(0);
-      setMode("running");
-      triggerMut.mutate(data.sessionId); // best-effort; results still arrive via the callback
+
+      if (opts.canCompare) {
+        // …then run the comparison (the session_id tells the workflow the scope).
+        setProgress(0);
+        setMode("running");
+        triggerMut.mutate(data.sessionId); // best-effort; results still arrive via the callback
+      } else {
+        toast.info(opts.blockedMessage ?? "Merged. Add the other table's data to compare.");
+        reset();
+      }
     } catch {
       /* mutations surface errors as toasts */
     }
@@ -82,17 +95,23 @@ function ComparePageInner() {
     const form = new FormData();
     form.append("companyFile", companyFile);
     if (companyUploader.trim()) form.append("uploadPersonName", companyUploader.trim());
-    void run(form, `Company update · ${today}`);
+    void run(form, `Company update · ${today}`, {
+      canCompare: (facebookCount.data ?? 0) > 0,
+      blockedMessage: "Company data merged. Add Facebook data to run a comparison.",
+    });
   }
   function addFacebook() {
     if (!facebookFile) return;
     const form = new FormData();
     form.append("facebookFile", facebookFile);
     if (facebookUploader.trim()) form.append("uploadPersonName", facebookUploader.trim());
-    void run(form, `Facebook update · ${today}`);
+    void run(form, `Facebook update · ${today}`, {
+      canCompare: (companyCount.data ?? 0) > 0,
+      blockedMessage: "Facebook data merged. Add Company data to run a comparison.",
+    });
   }
   function compareBoth() {
-    void run(new FormData(), `Full comparison · ${today}`);
+    void run(new FormData(), `Full comparison · ${today}`, { canCompare: true });
   }
 
   function reset() {

@@ -124,6 +124,38 @@ describe("run endpoint (table-centric flow)", () => {
   });
 });
 
+describe("send-webhook scoping (send only this run's rows)", () => {
+  it("forwards only the rows added in this run", async () => {
+    const FormData = (await import("form-data")).default;
+    const form = new FormData();
+    form.append("name", "co");
+    form.append("companyFile", Buffer.from("Company Name,Thai Name\nA,ก\n"), {
+      filename: "c.csv",
+      contentType: "text/csv",
+    });
+    const r = await app.inject({ method: "POST", url: "/api/comparisons/run", payload: form, headers: form.getHeaders() });
+    const sid = r.json().data.sessionId;
+
+    const sent = await app.inject({ method: "POST", url: `/api/comparisons/${sid}/send-webhook` });
+    expect(sent.statusCode).toBe(200);
+    expect(mock.state.company).toHaveLength(1); // new company forwarded
+    expect(mock.state.facebook).toHaveLength(0); // nothing new on the facebook side
+  });
+
+  it("Compare Both (no new rows) sends nothing and still succeeds", async () => {
+    const FormData = (await import("form-data")).default;
+    const form = new FormData();
+    form.append("name", "both");
+    const r = await app.inject({ method: "POST", url: "/api/comparisons/run", payload: form, headers: form.getHeaders() });
+    const sid = r.json().data.sessionId;
+
+    const sent = await app.inject({ method: "POST", url: `/api/comparisons/${sid}/send-webhook` });
+    expect(sent.statusCode).toBe(200);
+    expect(mock.state.company).toHaveLength(0);
+    expect(mock.state.facebook).toHaveLength(0);
+  });
+});
+
 describe("callback behavior", () => {
   it("is idempotent — a re-posted batch stores nothing new", async () => {
     const id = (await uploadComparison(app)).json().data.sessionId;
