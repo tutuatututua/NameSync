@@ -3,6 +3,8 @@ import { ZodTypeProvider } from "fastify-type-provider-zod";
 import { apiSuccess, CallbackPayloadSchema, CallbackAckDataSchema } from "@extensions/contract";
 import { ComparisonResultsModel } from "../models/comparison-results.model";
 import { UploadSessionModel } from "../models/upload-session.model";
+import { CompanyDataModel } from "../models/company-data.model";
+import { FacebookDataModel } from "../models/facebook-data.model";
 import { WebSocketService } from "../services/websocket.service";
 import { NotFound } from "../lib/errors";
 import { ok } from "../lib/http";
@@ -68,6 +70,9 @@ export default async function callbacksRoutes(fastify: FastifyInstance): Promise
 
       if (allBatchesComplete || payload.is_complete) {
         await UploadSessionModel.updateStatus(payload.session_id, "completed");
+        // The comparison ran against the full tables, so everything currently loaded
+        // is now "old"; rows added afterward count as "new" until the next completion.
+        await Promise.all([CompanyDataModel.markAllFetched(), FacebookDataModel.markAllFetched()]);
         WebSocketService.broadcast(payload.session_id, {
           type: "comparison_complete",
           sessionId: payload.session_id,

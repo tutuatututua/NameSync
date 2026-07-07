@@ -13,6 +13,7 @@
 
 import 'dotenv/config';
 import dns from 'node:dns/promises';
+import FormData from 'form-data';
 
 const TARGETS = {
   compare: {
@@ -26,7 +27,10 @@ const TARGETS = {
   },
   company: {
     url: process.env.COMPANY_WEBHOOK_URL,
-    contentType: 'text/csv',
+    multipart: {
+      filename: 'company-diag-test-session.csv',
+      contentType: 'text/csv',
+    },
     sessionId: 'diag-test-session',
     body: [
       'uuid,company_name,person_name_th,person_name_en,status,session_id',
@@ -35,7 +39,10 @@ const TARGETS = {
   },
   facebook: {
     url: process.env.FACEBOOK_WEBHOOK_URL,
-    contentType: 'text/csv',
+    multipart: {
+      filename: 'facebook-diag-test-session.csv',
+      contentType: 'text/csv',
+    },
     sessionId: 'diag-test-session',
     body: [
       'uuid,fb_name,timestamp,upload_person_name,session_id',
@@ -70,7 +77,11 @@ async function testWebhook(name, target) {
   }
 
   console.log(`  URL: ${target.url}`);
-  console.log(`  Content-Type: ${target.contentType}`);
+  if (target.multipart) {
+    console.log(`  Mode: multipart/form-data (field "file", filename "${target.multipart.filename}", contentType "${target.multipart.contentType}")`);
+  } else {
+    console.log(`  Content-Type: ${target.contentType}`);
+  }
   console.log(`  Body (${Buffer.byteLength(target.body)} bytes):`);
   console.log(
     target.body
@@ -86,13 +97,25 @@ async function testWebhook(name, target) {
   const start = Date.now();
 
   try {
+    let requestHeaders;
+    let requestBody;
+    if (target.multipart) {
+      const form = new FormData();
+      form.append('file', Buffer.from(target.body, 'utf8'), {
+        filename: target.multipart.filename,
+        contentType: target.multipart.contentType,
+      });
+      requestHeaders = { ...form.getHeaders(), 'X-Session-ID': target.sessionId };
+      requestBody = form;
+    } else {
+      requestHeaders = { 'Content-Type': target.contentType, 'X-Session-ID': target.sessionId };
+      requestBody = target.body;
+    }
+
     const response = await fetch(target.url, {
       method: 'POST',
-      headers: {
-        'Content-Type': target.contentType,
-        'X-Session-ID': target.sessionId,
-      },
-      body: target.body,
+      headers: requestHeaders,
+      body: requestBody,
       signal: controller.signal,
     });
 
@@ -117,11 +140,12 @@ async function testWebhook(name, target) {
     if (response.ok) {
       console.log(`  ✔ Webhook accepted the request.`);
     } else if (response.status === 415) {
+      const sentCt = target.multipart ? 'multipart/form-data' : target.contentType;
       console.log(
-        `  ⚠ 415 Unsupported Media Type — the webhook (Fastify) rejects the\n` +
-          `    Content-Type "${target.contentType}". It only parses application/json.\n` +
-          `    The API sends this same Content-Type, so response.ok is false and the\n` +
-          `    upload endpoint returns 502 Bad Gateway. FIX: send application/json.`
+        `  ⚠ 415 Unsupported Media Type — the webhook rejects the Content-Type\n` +
+          `    "${sentCt}". The API sends the same Content-Type, so response.ok is false\n` +
+          `    and the upload endpoint returns 502 Bad Gateway. FIX: confirm the receiver\n` +
+          `    accepts file uploads (multipart) on this endpoint.`
       );
     } else if (response.status === 404) {
       console.log(

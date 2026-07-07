@@ -3,7 +3,7 @@
 import * as React from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { AnimatePresence, motion } from "framer-motion";
-import { Building2, Users, GitCompareArrows, Sparkles, Loader2, RotateCcw } from "lucide-react";
+import { Building2, Users, GitCompareArrows, Sparkles, Loader2, RotateCcw, CheckCircle2 } from "lucide-react";
 import { toast } from "sonner";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -15,9 +15,20 @@ import { UploadPanel } from "@/components/upload/UploadPanel";
 import { ResultsView } from "@/components/results/ResultsView";
 import { useComparisonSocket } from "@/hooks/useComparisonSocket";
 import { useRunComparison, useSendWebhook, useTriggerComparison, useSaveToHistory } from "@/hooks/mutations";
-import { useResults, useCompanyCount, useFacebookCount } from "@/hooks/queries";
+import { useResults, useCompanyCount, useFacebookCount, useDataStats } from "@/hooks/queries";
+import { useQueryClient } from "@tanstack/react-query";
+import { qk } from "@/hooks/queryKeys";
 
-type Mode = "choose" | "running" | "done";
+type Mode = "choose" | "added" | "running" | "done";
+
+type SyncSummary = {
+  source: "company" | "facebook";
+  added: number;
+  duplicates: number;
+  uploadUser: string;
+  sessionId: string;
+  date: string;
+};
 
 function ComparePageInner() {
   const router = useRouter();
@@ -29,6 +40,7 @@ function ComparePageInner() {
   const [name, setName] = React.useState("");
   const [sessionId, setSessionId] = React.useState<string | null>(null);
   const [progress, setProgress] = React.useState(0);
+  const [summary, setSummary] = React.useState<SyncSummary | null>(null);
 
   const [companyFile, setCompanyFile] = React.useState<File | null>(null);
   const [facebookFile, setFacebookFile] = React.useState<File | null>(null);
@@ -38,6 +50,8 @@ function ComparePageInner() {
 
   const companyCount = useCompanyCount();
   const facebookCount = useFacebookCount();
+  const stats = useDataStats();
+  const qc = useQueryClient();
 
   const runMut = useRunComparison();
   const sendMut = useSendWebhook();
@@ -52,37 +66,26 @@ function ComparePageInner() {
     onComplete: () => {
       setProgress(100);
       setMode("done");
+      // The comparison just flipped every loaded row to "old" server-side; refresh
+      // the breakdown so a later "Run another" shows accurate old/new counts.
+      qc.invalidateQueries({ queryKey: qk.dataStats() });
     },
     onFailed: (m) => toast.error(("message" in m && m.message) || "Comparison failed"),
   });
 
   const busy = runMut.isPending || sendMut.isPending;
 
-  async function run(
-    form: FormData,
-    label: string,
-    opts: { canCompare: boolean; blockedMessage?: string }
-  ) {
+  // Compare Now: merge nothing new, then trigger the comparison over the full tables.
+  async function run(form: FormData, label: string) {
     try {
       form.set("name", label);
       const data = await runMut.mutateAsync(form);
       setSessionId(data.sessionId);
       setName(label);
-      const added = data.companyAdded + data.facebookAdded;
-      if (added > 0) toast.success(`Merged ${added.toLocaleString()} new row${added === 1 ? "" : "s"}`);
-
-      // Always push the new rows to the workflow (merge into its DB)…
-      await sendMut.mutateAsync(data.sessionId);
-
-      if (opts.canCompare) {
-        // …then run the comparison (the session_id tells the workflow the scope).
-        setProgress(0);
-        setMode("running");
-        triggerMut.mutate(data.sessionId); // best-effort; results still arrive via the callback
-      } else {
-        toast.info(opts.blockedMessage ?? "Merged. Add the other table's data to compare.");
-        reset();
-      }
+      await sendMut.mutateAsync(data.sessionId); // push any new rows to the workflow first
+      setProgress(0);
+      setMode("running");
+      triggerMut.mutate(data.sessionId); // best-effort; results arrive via the callback
     } catch {
       /* mutations surface errors as toasts */
     }
@@ -90,28 +93,40 @@ function ComparePageInner() {
 
   const today = new Date().toLocaleDateString();
 
-  function addCompany() {
-    if (!companyFile) return;
+  // Sync = add this one table's data: merge + push to the workflow, then show a
+  // summary. It does NOT run a comparison — that's the Compare Now button's job.
+  async function sync(source: "company" | "facebook", file: File, uploader: string) {
     const form = new FormData();
-    form.append("companyFile", companyFile);
-    if (companyUploader.trim()) form.append("uploadPersonName", companyUploader.trim());
-    void run(form, `Company update · ${today}`, {
-      canCompare: (facebookCount.data ?? 0) > 0,
-      blockedMessage: "Company data merged. Add Facebook data to run a comparison.",
-    });
+    form.append(source === "company" ? "companyFile" : "facebookFile", file);
+    form.append("uploadPersonName", uploader.trim());
+    form.set("name", `${source === "company" ? "Company" : "Facebook"} update · ${today}`);
+    try {
+      const data = await runMut.mutateAsync(form);
+      await sendMut.mutateAsync(data.sessionId); // push new rows to the workflow before summarizing
+      setSummary({
+        source,
+        added: source === "company" ? data.companyAdded : data.facebookAdded,
+        duplicates: source === "company" ? data.companyDuplicates : data.facebookDuplicates,
+        uploadUser: uploader.trim(),
+        sessionId: data.sessionId,
+        date: today,
+      });
+      setMode("added");
+    } catch {
+      /* mutations surface errors as toasts */
+    }
+  }
+
+  function addCompany() {
+    if (!companyFile || !companyUploader.trim()) return;
+    void sync("company", companyFile, companyUploader);
   }
   function addFacebook() {
-    if (!facebookFile) return;
-    const form = new FormData();
-    form.append("facebookFile", facebookFile);
-    if (facebookUploader.trim()) form.append("uploadPersonName", facebookUploader.trim());
-    void run(form, `Facebook update · ${today}`, {
-      canCompare: (companyCount.data ?? 0) > 0,
-      blockedMessage: "Facebook data merged. Add Company data to run a comparison.",
-    });
+    if (!facebookFile || !facebookUploader.trim()) return;
+    void sync("facebook", facebookFile, facebookUploader);
   }
   function compareBoth() {
-    void run(new FormData(), `Full comparison · ${today}`, { canCompare: true });
+    void run(new FormData(), `Full comparison · ${today}`);
   }
 
   function reset() {
@@ -120,6 +135,7 @@ function ComparePageInner() {
     setProgress(0);
     setCompanyFile(null);
     setFacebookFile(null);
+    setSummary(null);
   }
 
   const canCompareBoth = (companyCount.data ?? 0) > 0 && (facebookCount.data ?? 0) > 0;
@@ -167,11 +183,11 @@ function ComparePageInner() {
                 <UploadPanel accept={[".csv"]} file={companyFile} onChange={setCompanyFile} title="Drop CSV" hint="or browse" />
                 <div className="space-y-1.5">
                   <Label htmlFor="co-uploader" className="text-xs">
-                    Upload user (optional)
+                    Upload user <span className="text-destructive">*</span>
                   </Label>
-                  <Input id="co-uploader" value={companyUploader} onChange={(e) => setCompanyUploader(e.target.value)} placeholder="e.g. Alex" />
+                  <Input id="co-uploader" required value={companyUploader} onChange={(e) => setCompanyUploader(e.target.value)} placeholder="e.g. Alex" />
                 </div>
-                <LoadingButton className="w-full" isLoading={busy} disabled={!companyFile} onClick={addCompany}>
+                <LoadingButton className="w-full" isLoading={busy} disabled={!companyFile || !companyUploader.trim()} onClick={addCompany}>
                   Sync
                 </LoadingButton>
               </CardContent>
@@ -189,11 +205,11 @@ function ComparePageInner() {
                 <UploadPanel accept={[".json"]} file={facebookFile} onChange={setFacebookFile} title="Drop JSON" hint="or browse" />
                 <div className="space-y-1.5">
                   <Label htmlFor="fb-uploader" className="text-xs">
-                    Upload user (optional)
+                    Upload user <span className="text-destructive">*</span>
                   </Label>
-                  <Input id="fb-uploader" value={facebookUploader} onChange={(e) => setFacebookUploader(e.target.value)} placeholder="e.g. Alex" />
+                  <Input id="fb-uploader" required value={facebookUploader} onChange={(e) => setFacebookUploader(e.target.value)} placeholder="e.g. Alex" />
                 </div>
-                <LoadingButton className="w-full" isLoading={busy} disabled={!facebookFile} onClick={addFacebook}>
+                <LoadingButton className="w-full" isLoading={busy} disabled={!facebookFile || !facebookUploader.trim()} onClick={addFacebook}>
                   Sync
                 </LoadingButton>
               </CardContent>
@@ -208,15 +224,30 @@ function ComparePageInner() {
                 <CardDescription>Re-run the full comparison across everything you&apos;ve added.</CardDescription>
               </CardHeader>
               <CardContent className="space-y-3">
-                <div className="rounded-lg border bg-card p-3 text-sm text-muted-foreground">
-                  <div className="flex justify-between">
-                    <span>Company rows</span>
-                    <span className="font-medium text-foreground tabular-nums">{(companyCount.data ?? 0).toLocaleString()}</span>
-                  </div>
-                  <div className="mt-1 flex justify-between">
-                    <span>Facebook rows</span>
-                    <span className="font-medium text-foreground tabular-nums">{(facebookCount.data ?? 0).toLocaleString()}</span>
-                  </div>
+                <div className="space-y-2 rounded-lg border bg-card p-3 text-sm">
+                  {[
+                    { label: "Company", s: stats.data?.company },
+                    { label: "Facebook", s: stats.data?.facebook },
+                  ].map(({ label, s }) => {
+                    const total = s?.total ?? 0;
+                    const newRows = s?.newRows ?? 0;
+                    const oldRows = Math.max(0, total - newRows);
+                    return (
+                      <div key={label}>
+                        <div className="flex justify-between">
+                          <span className="text-muted-foreground">{label} rows</span>
+                          <span className="font-medium tabular-nums">{total.toLocaleString()}</span>
+                        </div>
+                        <div className="mt-0.5 flex justify-between text-xs text-muted-foreground">
+                          <span className="tabular-nums">{oldRows.toLocaleString()} old</span>
+                          <span className={`tabular-nums ${newRows > 0 ? "font-medium text-primary" : ""}`}>
+                            {newRows > 0 ? "+" : ""}
+                            {newRows.toLocaleString()} new
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
                 <LoadingButton
                   variant="gradient"
@@ -229,6 +260,73 @@ function ComparePageInner() {
                 </LoadingButton>
                 {!canCompareBoth && (
                   <p className="text-center text-xs text-muted-foreground">Add data to both tables first.</p>
+                )}
+              </CardContent>
+            </Card>
+          </motion.div>
+        )}
+
+        {mode === "added" && summary && (
+          <motion.div
+            key="added"
+            initial={{ opacity: 0, y: 12 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -12 }}
+            transition={{ duration: 0.2 }}
+          >
+            <Card className="mx-auto max-w-lg">
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2 text-base">
+                  <CheckCircle2 className="h-5 w-5 text-primary" />
+                  {summary.source === "company" ? "Company" : "Facebook"} data added
+                </CardTitle>
+                <CardDescription>
+                  Merged into the {summary.source} table. Nothing is compared yet — use Compare Now when
+                  you&apos;re ready.
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div className="grid grid-cols-2 gap-x-4 gap-y-3 rounded-lg border bg-card p-3 text-sm">
+                  <div>
+                    <div className="text-xs text-muted-foreground">New rows added</div>
+                    <div className="font-medium tabular-nums">{summary.added.toLocaleString()}</div>
+                  </div>
+                  <div>
+                    <div className="text-xs text-muted-foreground">Duplicates skipped</div>
+                    <div className="font-medium tabular-nums">{summary.duplicates.toLocaleString()}</div>
+                  </div>
+                  <div>
+                    <div className="text-xs text-muted-foreground">Upload user</div>
+                    <div className="font-medium">{summary.uploadUser}</div>
+                  </div>
+                  <div>
+                    <div className="text-xs text-muted-foreground">Date</div>
+                    <div className="font-medium">{summary.date}</div>
+                  </div>
+                  <div className="col-span-2">
+                    <div className="text-xs text-muted-foreground">Session</div>
+                    <div className="truncate font-mono text-xs" title={summary.sessionId}>
+                      {summary.sessionId}
+                    </div>
+                  </div>
+                </div>
+                <div className="flex justify-end gap-2">
+                  <Button variant="outline" onClick={reset}>
+                    <RotateCcw className="h-4 w-4" /> Add more data
+                  </Button>
+                  <LoadingButton
+                    variant="gradient"
+                    isLoading={busy}
+                    disabled={!canCompareBoth}
+                    onClick={compareBoth}
+                  >
+                    <GitCompareArrows className="h-4 w-4" /> Compare Now
+                  </LoadingButton>
+                </div>
+                {!canCompareBoth && (
+                  <p className="text-right text-xs text-muted-foreground">
+                    Add data to the other table before you can compare.
+                  </p>
                 )}
               </CardContent>
             </Card>

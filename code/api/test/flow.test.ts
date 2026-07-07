@@ -106,6 +106,7 @@ describe("run endpoint (table-centric flow)", () => {
 
     const f2 = new FormData();
     f2.append("name", "fb");
+    f2.append("uploadPersonName", "Alex");
     f2.append("facebookFile", Buffer.from(JSON.stringify({ friends_v2: [{ name: "X", timestamp: 1 }] })), {
       filename: "f.json",
       contentType: "application/json",
@@ -122,6 +123,42 @@ describe("run endpoint (table-centric flow)", () => {
     expect(r3.json().data.facebookAdded).toBe(0);
     expect(r3.json().data.status).toBe("pending_webhook");
   });
+
+  it("400s a file upload with no upload user", async () => {
+    const FormData = (await import("form-data")).default;
+    const form = new FormData();
+    form.append("name", "co");
+    form.append("companyFile", Buffer.from("Company Name,Thai Name\nA,ก\n"), {
+      filename: "c.csv",
+      contentType: "text/csv",
+    });
+    const res = await app.inject({ method: "POST", url: "/api/comparisons/run", payload: form, headers: form.getHeaders() });
+    expect(res.statusCode).toBe(400);
+  });
+});
+
+describe("data-stats (old vs new)", () => {
+  it("counts new rows until a comparison completes, then they become old", async () => {
+    const FormData = (await import("form-data")).default;
+    const form = new FormData();
+    form.append("name", "co");
+    form.append("uploadPersonName", "Alex");
+    form.append("companyFile", Buffer.from("Company Name,Thai Name\nA,ก\nB,ข\n"), {
+      filename: "c.csv",
+      contentType: "text/csv",
+    });
+    const up = await app.inject({ method: "POST", url: "/api/comparisons/run", payload: form, headers: form.getHeaders() });
+    const sid = up.json().data.sessionId;
+
+    // Freshly uploaded rows are "new" until they go through a completed comparison.
+    const before = await app.inject({ method: "GET", url: "/api/comparisons/data-stats" });
+    expect(before.json().data.company).toEqual({ total: 2, newRows: 2 });
+
+    await postCallback(app, { session_id: sid, batch_number: 1, total_batches: 1, is_complete: true, results: results(1) });
+
+    const after = await app.inject({ method: "GET", url: "/api/comparisons/data-stats" });
+    expect(after.json().data.company).toEqual({ total: 2, newRows: 0 });
+  });
 });
 
 describe("send-webhook scoping (send only this run's rows)", () => {
@@ -129,6 +166,7 @@ describe("send-webhook scoping (send only this run's rows)", () => {
     const FormData = (await import("form-data")).default;
     const form = new FormData();
     form.append("name", "co");
+    form.append("uploadPersonName", "Alex");
     form.append("companyFile", Buffer.from("Company Name,Thai Name\nA,ก\n"), {
       filename: "c.csv",
       contentType: "text/csv",

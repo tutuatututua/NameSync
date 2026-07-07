@@ -88,6 +88,26 @@ export class FacebookDataModel extends DBModel {
     return Number(row?.count) || 0;
   }
 
+  /** Row counts split into total and "new" (not yet through a completed comparison). */
+  static async stats(): Promise<{ total: number; newRows: number }> {
+    const db = await this.getKyselyDB();
+    const [totalRow, newRow] = await Promise.all([
+      db.selectFrom("facebook_data").select(db.fn.count("uuid").as("count")).executeTakeFirst(),
+      db
+        .selectFrom("facebook_data")
+        .select(db.fn.count("uuid").as("count"))
+        .where("fetched", "=", false)
+        .executeTakeFirst(),
+    ]);
+    return { total: Number(totalRow?.count) || 0, newRows: Number(newRow?.count) || 0 };
+  }
+
+  /** Mark every new Facebook row as fetched — called when a comparison completes. */
+  static async markAllFetched(): Promise<void> {
+    const db = await this.getKyselyDB();
+    await db.updateTable("facebook_data").set({ fetched: true }).where("fetched", "=", false).execute();
+  }
+
   /** Delete every Facebook row. Returns the number of rows removed. */
   static async deleteAll(): Promise<number> {
     const db = await this.getKyselyDB();

@@ -53,6 +53,11 @@ export function useFacebookCount() {
   });
 }
 
+/** Per-table totals split into old vs new (new = not yet through a completed comparison). */
+export function useDataStats() {
+  return useQuery({ queryKey: qk.dataStats(), queryFn: api.comparisons.dataStats });
+}
+
 export function useUploadHistory(source: SourceType) {
   return useQuery({
     queryKey: qk.uploadHistory(source),

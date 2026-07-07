@@ -10,6 +10,7 @@ export const qk = {
   allFacebook: (page: number, limit: number) => ["all-facebook", page, limit] as const,
   companyCount: () => ["company-count"] as const,
   facebookCount: () => ["facebook-count"] as const,
+  dataStats: () => ["data-stats"] as const,
   uploadHistory: (source: SourceType) => ["upload-history", source] as const,
   historyList: () => ["history"] as const,
   historyDetail: (id: string) => ["history", "detail", id] as const,

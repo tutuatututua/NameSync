@@ -40,7 +40,7 @@ export type ComparisonResultRow = z.infer<typeof ComparisonResultRowSchema>;
 export const CreateComparisonBodySchema = z.object({
   name: z.string().trim().min(1, 'Session name is required'),
   mode: ModeSchema.default('fresh'),
-  uploadPersonName: z.string().trim().optional(),
+  uploadPersonName: z.string().trim().min(1, 'Upload user is required'),
 });
 export type CreateComparisonBody = z.infer<typeof CreateComparisonBodySchema>;
 
@@ -72,6 +72,18 @@ export const RunComparisonDataSchema = z.object({
   facebookDuplicates: z.number(),
 });
 export type RunComparisonData = z.infer<typeof RunComparisonDataSchema>;
+
+/** GET /api/comparisons/data-stats — per-table totals split into old vs new
+ *  (new = rows not yet through a completed comparison). */
+export const TableStatsSchema = z.object({
+  total: z.number(),
+  newRows: z.number(),
+});
+export const DataStatsSchema = z.object({
+  company: TableStatsSchema,
+  facebook: TableStatsSchema,
+});
+export type DataStats = z.infer<typeof DataStatsSchema>;
 
 export const SendWebhookDataSchema = z.object({
   sessionId: z.string(),

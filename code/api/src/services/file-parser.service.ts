@@ -32,7 +32,7 @@ interface FacebookExport {
 export class FileParserService {
   /**
    * Parse CSV file containing company data.
-   * Expected columns: "Company Name", "Thai Name".
+   * Expected columns: "Company Name", "Thai Name", "English Name".
    */
   static async parseCompanyCSV(
     filePath: string,
@@ -50,15 +50,29 @@ export class FileParserService {
       trim: true
     }) as Record<string, string>[];
 
-    return records.map((record) => ({
-      uuid: crypto.randomUUID(),
-      company_name: record['Company Name'] || null,
-      person_name_th: record['Thai Name'] || null,
-      person_name_en: null, // Not provided in source data
-      status: null, // Not provided in source data
-      upload_person_name: uploadPersonName || null,
-      session_id: sessionId
-    }));
+    return records.map((record) => {
+      // Case-/spacing-insensitive header lookup, so "English Name", "english name",
+      // "ENGLISH NAME", etc. all resolve to the same value.
+      const cell = (...headers: string[]): string | null => {
+        for (const header of headers) {
+          const match = Object.keys(record).find(
+            (k) => k.trim().toLowerCase() === header.toLowerCase()
+          );
+          if (match && record[match]) return record[match];
+        }
+        return null;
+      };
+
+      return {
+        uuid: crypto.randomUUID(),
+        company_name: cell('Company Name'),
+        person_name_th: cell('Thai Name'),
+        person_name_en: cell('English Name', 'English'),
+        status: null, // Not provided in source data
+        upload_person_name: uploadPersonName || null,
+        session_id: sessionId
+      };
+    });
   }
 
   /**

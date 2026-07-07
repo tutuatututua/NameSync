@@ -18,6 +18,7 @@ import type {
   CreateUploadHistoryBody,
   TriggerCompareData,
   SendWebhookData,
+  DataStats,
   SourceType,
 } from "@extensions/contract";
 
@@ -109,6 +110,7 @@ export const api = {
       request<Paginated<CompanyDataRow>>(`/comparisons/company-data/all${qs({ page, limit })}`),
     allFacebookData: (page: number, limit: number) =>
       request<Paginated<FacebookDataRow>>(`/comparisons/facebook-data/all${qs({ page, limit })}`),
+    dataStats: () => request<Envelope<DataStats>>(`/comparisons/data-stats`).then((r) => r.data),
     deleteCompanyRecord: (uuid: string) =>
       request<Envelope<never>>(`/comparisons/company-data/${uuid}`, { method: "DELETE" }),
     deleteFacebookRecord: (uuid: string) =>

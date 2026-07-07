@@ -30,12 +30,13 @@ describe("FileParserService", () => {
   };
 
   it("parses company CSV, mapping columns and stripping the BOM", async () => {
-    const p = tmp("c.csv", "﻿Company Name,Thai Name\nAcme,สมชาย\n");
+    const p = tmp("c.csv", "﻿Company Name,Thai Name,English Name\nAcme,สมชาย,Somchai\n");
     const rows = await FileParserService.parseCompanyCSV(p, "sess1");
     fs.unlinkSync(p);
     expect(rows).toHaveLength(1);
     expect(rows[0].company_name).toBe("Acme");
     expect(rows[0].person_name_th).toBe("สมชาย");
+    expect(rows[0].person_name_en).toBe("Somchai");
     expect(rows[0].session_id).toBe("sess1");
   });
 

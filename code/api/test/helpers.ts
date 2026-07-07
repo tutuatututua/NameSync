@@ -11,7 +11,7 @@ export async function truncateAll(): Promise<void> {
   );
 }
 
-const DEFAULT_CSV = "Company Name,Thai Name\nAcme Co,สมชาย\nBeta Ltd,อนงค์\n";
+const DEFAULT_CSV = "Company Name,Thai Name,English Name\nAcme Co,สมชาย,Somchai\nBeta Ltd,อนงค์,Anong\n";
 const DEFAULT_JSON = JSON.stringify({
   friends_v2: [
     { name: "Somchai", timestamp: 1700000000 },
@@ -22,11 +22,12 @@ const DEFAULT_JSON = JSON.stringify({
 /** POST /api/comparisons with a company CSV + facebook JSON via multipart. */
 export function uploadComparison(
   app: FastifyInstance,
-  opts: { name?: string; csv?: string; json?: string } = {}
+  opts: { name?: string; csv?: string; json?: string; uploadPersonName?: string } = {}
 ) {
   const form = new FormData();
   form.append("name", opts.name ?? "Test Comparison");
   form.append("mode", "fresh");
+  form.append("uploadPersonName", opts.uploadPersonName ?? "Tester");
   form.append("companyFile", Buffer.from(opts.csv ?? DEFAULT_CSV), {
     filename: "company.csv",
     contentType: "text/csv",

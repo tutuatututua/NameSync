@@ -19,6 +19,7 @@ import {
   TriggerCompareDataSchema,
   CompanyDataRowSchema,
   FacebookDataRowSchema,
+  DataStatsSchema,
   paginated,
 } from "@extensions/contract";
 import { env } from "../config/env";
@@ -109,6 +110,13 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
     { schema: { response: { 200: apiSuccess(RunComparisonDataSchema) } } },
     async (req) => {
       const { companyPath, facebookPath, fields } = await parseUpload(req);
+      const uploadPersonName = fields.uploadPersonName?.trim();
+      // The upload user is required whenever a file is actually being added; a
+      // Compare-Both run attaches no file and needs no upload user.
+      if ((companyPath || facebookPath) && !uploadPersonName) {
+        unlinkQuiet(companyPath, facebookPath);
+        throw new BadRequest("Upload user is required");
+      }
       const name =
         (fields.name && fields.name.trim()) || `Comparison ${new Date().toISOString().slice(0, 10)}`;
       const sessionId = crypto.randomUUID();
@@ -134,7 +142,7 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
         let facebookDuplicates = 0;
 
         if (companyPath) {
-          const recs = await FileParserService.parseCompanyCSV(companyPath, sessionId, fields.uploadPersonName);
+          const recs = await FileParserService.parseCompanyCSV(companyPath, sessionId, uploadPersonName);
           const fresh = await dedupeCompany(recs);
           companyAdded = fresh.length;
           companyDuplicates = recs.length - fresh.length;
@@ -144,7 +152,7 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
           const recs = await FileParserService.parseFacebookJSON(
             facebookPath,
             sessionId,
-            fields.uploadPersonName
+            uploadPersonName
           );
           const fresh = await dedupeFacebook(recs);
           facebookAdded = fresh.length;
@@ -515,6 +523,16 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
         req.query.limit
       );
       return okList(data, pagination);
+    }
+  );
+
+  // GET /api/comparisons/data-stats — per-table totals split into old vs new
+  app.get(
+    "/data-stats",
+    { schema: { response: { 200: apiSuccess(DataStatsSchema) } } },
+    async () => {
+      const [company, facebook] = await Promise.all([CompanyDataModel.stats(), FacebookDataModel.stats()]);
+      return ok({ company, facebook });
     }
   );
 

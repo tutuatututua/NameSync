@@ -30,7 +30,7 @@ services:
       DB_ENGINE: postgres
       DATABASE_URL: postgres://namesync:${POSTGRES_PASSWORD:-namesync}@postgres:5432/namesync
       UPLOAD_DIR: /data/uploads
-      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3001}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3000}
       COMPANY_WEBHOOK_URL: ${COMPANY_WEBHOOK_URL:-}
       FACEBOOK_WEBHOOK_URL: ${FACEBOOK_WEBHOOK_URL:-}
       COMPARE_WEBHOOK_URL: ${COMPARE_WEBHOOK_URL:-}
@@ -54,7 +54,7 @@ services:
   frontend:
     image: tuadocker/namesync:frontend-2.0
     ports:
-      - "3001:3000"
+      - "3000:3000"
     depends_on:
       api:
         condition: service_healthy

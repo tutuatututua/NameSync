@@ -5,6 +5,7 @@ import Link from "next/link";
 import { Trash2, RefreshCw } from "lucide-react";
 import type { FacebookDataRow } from "@extensions/contract";
 import { DataManager, type Column } from "@/components/data-table/DataManager";
+import { IdCell } from "@/components/data-table/IdCell";
 import { Button } from "@/components/ui/button";
 import { ConfirmButton } from "@/components/confirm-button";
 import { useAllFacebookData } from "@/hooks/queries";
@@ -16,6 +17,8 @@ const columns: Column<FacebookDataRow>[] = [
   { key: "fb_name", header: "Facebook name", render: (r) => r.fb_name ?? "—" },
   { key: "upload_person_name", header: "Uploaded by", render: (r) => r.upload_person_name ?? "—" },
   { key: "timestamp", header: "Added", render: (r) => (r.timestamp ? formatDate(r.timestamp) : "—") },
+  { key: "session_id", header: "Session", render: (r) => <IdCell value={r.session_id} /> },
+  { key: "uuid", header: "UUID", render: (r) => <IdCell value={r.uuid} /> },
 ];
 
 export default function FacebookDataPage() {

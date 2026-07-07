@@ -26,6 +26,7 @@ export interface CompanyData {
   status: string | null;
   upload_person_name: string | null;
   session_id: string | null;
+  fetched: Generated<boolean>;
 }
 
 export interface FacebookData {
@@ -35,6 +36,7 @@ export interface FacebookData {
   upload_person_name: string | null;
   status: string | null;
   session_id: string | null;
+  fetched: Generated<boolean>;
 }
 
 export interface ComparisonResults {

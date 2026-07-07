@@ -5,6 +5,7 @@ import Link from "next/link";
 import { Trash2, RefreshCw } from "lucide-react";
 import type { CompanyDataRow } from "@extensions/contract";
 import { DataManager, type Column } from "@/components/data-table/DataManager";
+import { IdCell } from "@/components/data-table/IdCell";
 import { Button } from "@/components/ui/button";
 import { ConfirmButton } from "@/components/confirm-button";
 import { useAllCompanyData } from "@/hooks/queries";
@@ -13,8 +14,11 @@ import { useDeleteCompanyRecord, useClearData } from "@/hooks/mutations";
 const LIMIT = 20;
 const columns: Column<CompanyDataRow>[] = [
   { key: "company_name", header: "Company", render: (r) => r.company_name ?? "—" },
-  { key: "person_name_th", header: "Thai name", render: (r) => r.person_name_th ?? "—" },
+  { key: "thai_name", header: "Thai name", render: (r) => r.person_name_th ?? "—" },
+  { key: "eng_name", header: "English name", render: (r) => r.person_name_en ?? "—" },
   { key: "upload_person_name", header: "Uploaded by", render: (r) => r.upload_person_name ?? "—" },
+  { key: "session_id", header: "Session", render: (r) => <IdCell value={r.session_id} /> },
+  { key: "uuid", header: "UUID", render: (r) => <IdCell value={r.uuid} /> },
 ];
 
 export default function CompanyDataPage() {
