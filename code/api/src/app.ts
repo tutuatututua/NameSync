@@ -20,6 +20,7 @@ import callbacksRoutes from "./routes/callbacks.route";
 import sessionsRoutes from "./routes/sessions.route";
 import historyRoutes from "./routes/history.route";
 import uploadHistoryRoutes from "./routes/upload-history.route";
+import uploadSessionsRoutes from "./routes/upload-sessions.route";
 import wsRoutes from "./routes/ws.route";
 
 /**
@@ -89,6 +90,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(sessionsRoutes, { prefix: "/api/sessions" });
   await app.register(historyRoutes, { prefix: "/api/history" });
   await app.register(uploadHistoryRoutes, { prefix: "/api/upload-history" });
+  await app.register(uploadSessionsRoutes, { prefix: "/api/upload-sessions" });
   await app.register(wsRoutes);
 
   return app;

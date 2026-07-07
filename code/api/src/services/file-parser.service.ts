@@ -32,7 +32,9 @@ interface FacebookExport {
 export class FileParserService {
   /**
    * Parse CSV file containing company data.
-   * Expected columns: "Company Name", "Thai Name", "English Name".
+   * Accepts either spaced ("Company Name", "Thai Name", "English Name") or
+   * underscored ("company_name", "thai_name", "eng_name") headers — the real
+   * export uses the latter.
    */
   static async parseCompanyCSV(
     filePath: string,
@@ -50,14 +52,15 @@ export class FileParserService {
       trim: true
     }) as Record<string, string>[];
 
+    // Normalize a header by dropping spaces/underscores and lowercasing, so
+    // "Company Name", "company_name", "COMPANY_NAME", etc. all compare equal.
+    const norm = (s: string): string => s.replace(/[\s_]+/g, '').toLowerCase();
+
     return records.map((record) => {
-      // Case-/spacing-insensitive header lookup, so "English Name", "english name",
-      // "ENGLISH NAME", etc. all resolve to the same value.
       const cell = (...headers: string[]): string | null => {
         for (const header of headers) {
-          const match = Object.keys(record).find(
-            (k) => k.trim().toLowerCase() === header.toLowerCase()
-          );
+          const target = norm(header);
+          const match = Object.keys(record).find((k) => norm(k) === target);
           if (match && record[match]) return record[match];
         }
         return null;
@@ -65,9 +68,9 @@ export class FileParserService {
 
       return {
         uuid: crypto.randomUUID(),
-        company_name: cell('Company Name'),
-        person_name_th: cell('Thai Name'),
-        person_name_en: cell('English Name', 'English'),
+        company_name: cell('company_name', 'Company Name', 'company'),
+        person_name_th: cell('thai_name', 'Thai Name', 'thai'),
+        person_name_en: cell('eng_name', 'English Name', 'English', 'eng'),
         status: null, // Not provided in source data
         upload_person_name: uploadPersonName || null,
         session_id: sessionId

@@ -5,6 +5,7 @@ import {
   ApiMessageSchema,
   IdParamSchema,
   PaginationQuerySchema,
+  UploadListQuerySchema,
   UploadHistoryRowSchema,
   type UploadHistoryRow,
   CreateUploadHistoryBodySchema,
@@ -21,9 +22,9 @@ export default async function uploadHistoryRoutes(fastify: FastifyInstance): Pro
 
   app.get(
     "/",
-    { schema: { querystring: PaginationQuerySchema, response: { 200: paginated(UploadHistoryRowSchema) } } },
+    { schema: { querystring: UploadListQuerySchema, response: { 200: paginated(UploadHistoryRowSchema) } } },
     async (req) => {
-      const { data, pagination } = await UploadHistoryModel.findAllPaginated(req.query.page, req.query.limit);
+      const { data, pagination } = await UploadHistoryModel.findAllPaginated(req.query);
       return okList(data as UploadHistoryRow[], pagination);
     }
   );

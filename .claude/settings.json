@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm --prefix api run typecheck)",
+      "Bash(npm ci *)",
+      "Bash(echo \"EXIT_MARKER_$?\")",
+      "Bash(npm --prefix api run test)",
+      "Bash(npm --prefix frontend run lint)",
+      "Bash(npm --prefix frontend run build)",
+      "Bash(npm --prefix extensions/contract run typecheck)"
+    ]
+  }
+}

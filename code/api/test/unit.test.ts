@@ -40,6 +40,18 @@ describe("FileParserService", () => {
     expect(rows[0].session_id).toBe("sess1");
   });
 
+  it("maps the real underscored headers (company_name/thai_name/eng_name)", async () => {
+    // The actual export uses underscored headers; the old lookup mapped them all to null.
+    const p = tmp("c2.csv", "﻿company_name,thai_name,eng_name\nMCKINSEY,นพมาศ,Noppamas\n");
+    const rows = await FileParserService.parseCompanyCSV(p, "sess2", "Alex");
+    fs.unlinkSync(p);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].company_name).toBe("MCKINSEY");
+    expect(rows[0].person_name_th).toBe("นพมาศ");
+    expect(rows[0].person_name_en).toBe("Noppamas");
+    expect(rows[0].upload_person_name).toBe("Alex");
+  });
+
   it("parses facebook JSON, converting unix seconds to ISO", async () => {
     const p = tmp("f.json", JSON.stringify({ friends_v2: [{ name: "Nok", timestamp: 1700000000 }] }));
     const rows = await FileParserService.parseFacebookJSON(p, "sess1", "Alex");

@@ -1,13 +1,12 @@
 "use client";
 
 import * as React from "react";
-import Link from "next/link";
-import { Trash2, RefreshCw } from "lucide-react";
+import { Trash2 } from "lucide-react";
 import type { CompanyDataRow } from "@extensions/contract";
 import { DataManager, type Column } from "@/components/data-table/DataManager";
 import { IdCell } from "@/components/data-table/IdCell";
-import { Button } from "@/components/ui/button";
 import { ConfirmButton } from "@/components/confirm-button";
+import { ImportDialog } from "@/components/upload/ImportDialog";
 import { useAllCompanyData } from "@/hooks/queries";
 import { useDeleteCompanyRecord, useClearData } from "@/hooks/mutations";
 
@@ -35,11 +34,7 @@ export default function CompanyDataPage() {
           <p className="text-muted-foreground">All company records across comparisons.</p>
         </div>
         <div className="flex items-center gap-2">
-          <Button asChild variant="gradient">
-            <Link href="/compare?add=company">
-              <RefreshCw className="h-4 w-4" /> Sync
-            </Link>
-          </Button>
+          <ImportDialog source="company" />
           <ConfirmButton
             variant="outline"
             title="Clear all company data?"

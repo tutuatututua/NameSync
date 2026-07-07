@@ -270,6 +270,108 @@ describe("merge/dedupe", () => {
   });
 });
 
+/** Import one company CSV via /run (the new import path) and return its session id. */
+async function importCompany(csv: string, uploader = "Alex") {
+  const FormData = (await import("form-data")).default;
+  const form = new FormData();
+  form.append("name", "co import");
+  form.append("uploadPersonName", uploader);
+  form.append("companyFile", Buffer.from(csv), { filename: "c.csv", contentType: "text/csv" });
+  const res = await app.inject({ method: "POST", url: "/api/comparisons/run", payload: form, headers: form.getHeaders() });
+  return res.json().data.sessionId as string;
+}
+
+const CO_CSV = "company_name,thai_name,eng_name\nMCKINSEY,นพมาศ,Noppamas\nBLUEBIK,ธนา,Thana\n";
+
+describe("company-selection compare", () => {
+  it("lists distinct companies and triggers a compare with the selected company", async () => {
+    await importCompany(CO_CSV);
+
+    const companies = await app.inject({ method: "GET", url: "/api/comparisons/companies" });
+    expect(companies.statusCode).toBe(200);
+    expect(companies.json().data.companies).toEqual(["BLUEBIK", "MCKINSEY"]); // distinct, sorted
+
+    const compare = await app.inject({
+      method: "POST",
+      url: "/api/comparisons/compare",
+      payload: { company_name: "MCKINSEY" },
+    });
+    expect(compare.statusCode).toBe(200);
+    const sid = compare.json().data.sessionId;
+    expect(mock.state.compare).toHaveLength(1);
+    const body = JSON.parse(mock.state.compare[0].body);
+    expect(body.session_id).toBe(sid);
+    expect(body.company_name).toBe("MCKINSEY");
+
+    // Results expose the selected company + webhook-provided upload name and extras.
+    await app.inject({
+      method: "POST",
+      url: "/api/callbacks/comparison-results",
+      payload: {
+        session_id: sid,
+        batch_number: 1,
+        total_batches: 1,
+        is_complete: true,
+        results: [{ fb_name: "Nok", person_name_en: "Noppamas", person_name_th: "นพมาศ", matching_score: 0.9, upload_name: "Alex", region: "APAC" }],
+      },
+    });
+    const res = await app.inject({ method: "GET", url: `/api/comparisons/${sid}/results` });
+    expect(res.json().data.selectedCompany).toBe("MCKINSEY");
+    expect(res.json().data.results[0].upload_name).toBe("Alex");
+    expect(JSON.parse(res.json().data.results[0].extra)).toEqual({ region: "APAC" });
+  });
+
+  it("400s a compare with no company selected", async () => {
+    const res = await app.inject({ method: "POST", url: "/api/comparisons/compare", payload: { company_name: "" } });
+    expect(res.statusCode).toBe(400);
+  });
+});
+
+describe("upload sessions + rollback", () => {
+  it("records an import session + history row, then rolls back its rows", async () => {
+    const sid = await importCompany(CO_CSV);
+    await app.inject({ method: "POST", url: `/api/comparisons/${sid}/send-webhook` });
+
+    // The import shows up as a session with type + counts + a terminal status.
+    const sessions = await app.inject({ method: "GET", url: "/api/upload-sessions" });
+    expect(sessions.statusCode).toBe(200);
+    const row = sessions.json().data.find((s: { id: string }) => s.id === sid);
+    expect(row.upload_type).toBe("company");
+    expect(row.records_uploaded).toBe(2);
+    expect(row.uploaded_by).toBe("Alex");
+    expect(row.status).toBe("completed");
+
+    // upload-history logged a matching row, searchable by uploader.
+    const hist = await app.inject({ method: "GET", url: "/api/upload-history?search=Alex" });
+    expect(hist.json().data.length).toBeGreaterThan(0);
+    expect(hist.json().data[0].source_type).toBe("company");
+    // A non-matching search returns nothing.
+    const none = await app.inject({ method: "GET", url: "/api/upload-history?search=zzzznope" });
+    expect(none.json().data).toHaveLength(0);
+
+    // Rollback hard-deletes the imported rows and flips status.
+    const rb = await app.inject({ method: "POST", url: `/api/upload-sessions/${sid}/rollback` });
+    expect(rb.statusCode).toBe(200);
+    expect(rb.json().data.companyDeleted).toBe(2);
+    const after = await app.inject({ method: "GET", url: "/api/comparisons/company-data/all?page=1&limit=50" });
+    expect(after.json().pagination.total).toBe(0);
+    const sessions2 = await app.inject({ method: "GET", url: "/api/upload-sessions" });
+    expect(sessions2.json().data.find((s: { id: string }) => s.id === sid).status).toBe("rolled_back");
+
+    // Rolling back twice is rejected.
+    const rb2 = await app.inject({ method: "POST", url: `/api/upload-sessions/${sid}/rollback` });
+    expect(rb2.statusCode).toBe(400);
+  });
+
+  it("filters upload sessions by type", async () => {
+    await importCompany(CO_CSV);
+    const co = await app.inject({ method: "GET", url: "/api/upload-sessions?uploadType=company" });
+    expect(co.json().data.length).toBeGreaterThan(0);
+    const fb = await app.inject({ method: "GET", url: "/api/upload-sessions?uploadType=facebook" });
+    expect(fb.json().data).toHaveLength(0);
+  });
+});
+
 describe("validation", () => {
   it("404s results for an unknown session", async () => {
     const res = await app.inject({ method: "GET", url: "/api/comparisons/nope/results" });

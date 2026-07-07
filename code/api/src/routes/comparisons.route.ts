@@ -20,6 +20,8 @@ import {
   CompanyDataRowSchema,
   FacebookDataRowSchema,
   DataStatsSchema,
+  CompaniesDataSchema,
+  CompareByCompanyBodySchema,
   paginated,
 } from "@extensions/contract";
 import { env } from "../config/env";
@@ -99,6 +101,14 @@ async function parseUpload(req: FastifyRequest): Promise<ParsedUpload> {
   return { companyPath, facebookPath, fields };
 }
 
+/** Public URL the external matcher POSTs results back to (env override, else this host). */
+function buildCallbackUrl(req: FastifyRequest): string {
+  const base = env.WEBHOOK_CALLBACK_URL_BASE;
+  const isValidBase = !!base && /^https?:\/\//i.test(base);
+  const callbackBase = (isValidBase ? base! : `${req.protocol}://${req.headers.host}`).replace(/\/+$/, "");
+  return `${callbackBase}/api/callbacks/comparison-results`;
+}
+
 export default async function comparisonsRoutes(fastify: FastifyInstance): Promise<void> {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
 
@@ -120,6 +130,9 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
       const name =
         (fields.name && fields.name.trim()) || `Comparison ${new Date().toISOString().slice(0, 10)}`;
       const sessionId = crypto.randomUUID();
+      // An import carries exactly one file; that decides the session's upload type.
+      const uploadType: "company" | "facebook" | null =
+        companyPath && !facebookPath ? "company" : facebookPath && !companyPath ? "facebook" : null;
 
       try {
         await UploadSessionModel.create({
@@ -129,6 +142,8 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
           mode: "fresh",
           parent_session_id: null,
           status: "processing",
+          upload_type: uploadType,
+          uploaded_by: uploadPersonName || null,
         });
         WebSocketService.broadcast(sessionId, {
           type: "processing_started",
@@ -161,6 +176,35 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
         }
 
         unlinkQuiet(companyPath, facebookPath);
+
+        // Persist import counts on the session and log an upload-history row per
+        // source, so the session is a rollback-able record with a searchable history.
+        await UploadSessionModel.updateImportCounts(
+          sessionId,
+          companyAdded + facebookAdded,
+          companyDuplicates + facebookDuplicates
+        );
+        if (companyPath) {
+          await UploadHistoryModel.create({
+            source_type: "company",
+            user_upload: uploadPersonName || "",
+            timestamp: new Date().toISOString(),
+            rows_processed: companyAdded,
+            duplicate_rows: companyDuplicates,
+            session_id: sessionId,
+          });
+        }
+        if (facebookPath) {
+          await UploadHistoryModel.create({
+            source_type: "facebook",
+            user_upload: uploadPersonName || "",
+            timestamp: new Date().toISOString(),
+            rows_processed: facebookAdded,
+            duplicate_rows: facebookDuplicates,
+            session_id: sessionId,
+          });
+        }
+
         await UploadSessionModel.updateStatus(sessionId, "pending_webhook");
         WebSocketService.broadcast(sessionId, {
           type: "saved_to_database",
@@ -400,17 +444,23 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
       }
 
       WebSocketService.broadcast(id, { type: "webhook_success", sessionId: id, message: "Upload done" });
-      await UploadSessionModel.updateStatus(id, "processing");
+      // An import is finished once its rows are forwarded; only a legacy compare-flow
+      // session (no upload_type) keeps "processing" while it waits for results.
+      const finalStatus = session.upload_type ? "completed" : "processing";
+      await UploadSessionModel.updateStatus(id, finalStatus);
       WebSocketService.broadcast(id, {
         type: "waiting_for_results",
         sessionId: id,
-        message: "Data sent to external service, waiting for comparison results",
+        message:
+          finalStatus === "completed"
+            ? "Import complete"
+            : "Data sent to external service, waiting for comparison results",
       });
 
       return ok(
         {
           sessionId: id,
-          status: "processing",
+          status: finalStatus,
           companyRecordsCount: companyRecords.length,
           facebookRecordsCount: facebookRecords.length,
         },
@@ -437,10 +487,7 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
         message: "Starting comparison process",
       });
 
-      const base = env.WEBHOOK_CALLBACK_URL_BASE;
-      const isValidBase = !!base && /^https?:\/\//i.test(base);
-      const callbackBase = (isValidBase ? base! : `${req.protocol}://${req.headers.host}`).replace(/\/+$/, "");
-      const callbackUrl = `${callbackBase}/api/callbacks/comparison-results`;
+      const callbackUrl = buildCallbackUrl(req);
 
       if (!env.COMPARE_WEBHOOK_URL) {
         WebSocketService.broadcast(id, {
@@ -477,6 +524,71 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
     }
   );
 
+  // GET /api/comparisons/companies — distinct companies you can compare against
+  app.get(
+    "/companies",
+    { schema: { response: { 200: apiSuccess(CompaniesDataSchema) } } },
+    async () => {
+      const companies = await CompanyDataModel.distinctCompanies();
+      return ok({ companies });
+    }
+  );
+
+  // POST /api/comparisons/compare — start a comparison against ONE selected company.
+  // No file upload: the matcher finds which uploaders connect to that company's people.
+  app.post(
+    "/compare",
+    { schema: { body: CompareByCompanyBodySchema, response: { 200: apiSuccess(TriggerCompareDataSchema) } } },
+    async (req) => {
+      const companyName = req.body.company_name;
+      if (!env.COMPARE_WEBHOOK_URL) {
+        throw new ServiceUnavailable("Comparison service is not configured (COMPARE_WEBHOOK_URL missing)");
+      }
+
+      const sessionId = crypto.randomUUID();
+      const name = `Compare: ${companyName} · ${new Date().toISOString().slice(0, 10)}`;
+      await UploadSessionModel.create({
+        id: sessionId,
+        name,
+        facebook_file_path: null,
+        mode: "fresh",
+        parent_session_id: null,
+        status: "processing",
+        selected_company: companyName,
+      });
+
+      WebSocketService.broadcast(sessionId, {
+        type: "comparison_starting",
+        sessionId,
+        message: `Comparing against ${companyName}`,
+      });
+
+      const callbackUrl = buildCallbackUrl(req);
+      const response = await fetch(env.COMPARE_WEBHOOK_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Session-ID": sessionId },
+        body: JSON.stringify({ session_id: sessionId, callback_url: callbackUrl, company_name: companyName }),
+      });
+
+      if (!response.ok) {
+        await UploadSessionModel.updateStatus(sessionId, "failed");
+        WebSocketService.broadcast(sessionId, {
+          type: "comparison_failed",
+          sessionId,
+          message: "Failed to trigger comparison webhook",
+        });
+        throw new Upstream("Failed to trigger comparison webhook");
+      }
+
+      WebSocketService.broadcast(sessionId, {
+        type: "comparison_triggered",
+        sessionId,
+        message: "Comparison triggered successfully",
+      });
+      return ok({ sessionId, status: "processing" }, "Comparison triggered successfully");
+    }
+  );
+
   // GET /api/comparisons/:id/results — stored match scores
   app.get(
     "/:id/results",
@@ -490,7 +602,14 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
       const scores = results.map((r) => Number(r.matching_score)).filter((s) => Number.isFinite(s));
       const meanConfidence = scores.length ? scores.reduce((sum, s) => sum + s, 0) / scores.length : 0;
 
-      return ok({ sessionId: id, status: session.status, rowCount: results.length, meanConfidence, results });
+      return ok({
+        sessionId: id,
+        status: session.status,
+        rowCount: results.length,
+        meanConfidence,
+        selectedCompany: session.selected_company ?? null,
+        results,
+      });
     }
   );
 

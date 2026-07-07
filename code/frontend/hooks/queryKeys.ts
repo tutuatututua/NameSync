@@ -1,4 +1,5 @@
 import type { SourceType } from "@extensions/contract";
+import type { UploadListParams } from "@/lib/api/client";
 
 /** Central query-key factory so invalidation stays consistent. */
 export const qk = {
@@ -12,6 +13,9 @@ export const qk = {
   facebookCount: () => ["facebook-count"] as const,
   dataStats: () => ["data-stats"] as const,
   uploadHistory: (source: SourceType) => ["upload-history", source] as const,
+  uploadHistoryList: (params: UploadListParams) => ["upload-history-list", params] as const,
+  uploadSessions: (params: UploadListParams) => ["upload-sessions", params] as const,
+  companies: () => ["companies"] as const,
   historyList: () => ["history"] as const,
   historyDetail: (id: string) => ["history", "detail", id] as const,
   latestSession: () => ["latest-session"] as const,

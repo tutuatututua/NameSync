@@ -54,11 +54,11 @@ export default function DashboardPage() {
         <div className="relative z-10 max-w-xl">
           <h1 className="font-display text-3xl font-bold">Sync &amp; match names with confidence</h1>
           <p className="mt-2 text-primary-foreground/90">
-            Upload your company and Facebook data and get confidence-scored name matches in seconds.
+            Import your company and Facebook data, then pick a company to find connected uploaders.
           </p>
           <Button asChild variant="secondary" className="mt-5">
-            <Link href="/compare?run=both">
-              <GitCompareArrows className="h-4 w-4" /> Compare Both Tables <ArrowRight className="h-4 w-4" />
+            <Link href="/compare">
+              <GitCompareArrows className="h-4 w-4" /> Compare <ArrowRight className="h-4 w-4" />
             </Link>
           </Button>
         </div>

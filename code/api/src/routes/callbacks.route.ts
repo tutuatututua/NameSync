@@ -30,15 +30,35 @@ export default async function callbacksRoutes(fastify: FastifyInstance): Promise
       const alreadyReceived = await ComparisonResultsModel.batchExists(payload.session_id, payload.batch_number);
       let recordsStored = 0;
       if (!alreadyReceived && payload.results.length > 0) {
-        const records = payload.results.map((item) => ({
-          fb_name: item.fb_name,
-          person_name_en: item.person_name_en ?? null,
-          person_name_th: item.person_name_th ?? null,
-          matching_score: item.matching_score,
-          batch_number: payload.batch_number,
-          is_complete: payload.is_complete,
-          session_id: payload.session_id,
-        }));
+        // Standard fields we map to columns; anything else the matcher returns is
+        // preserved verbatim in `extra` so the results view can surface it.
+        const KNOWN = new Set([
+          "fb_name",
+          "person_name_en",
+          "person_name_th",
+          "matching_score",
+          "upload_name",
+          "upload_person_name",
+        ]);
+        const records = payload.results.map((item) => {
+          const rec = item as Record<string, unknown>;
+          const uploadName =
+            (typeof rec.upload_name === "string" && rec.upload_name) ||
+            (typeof rec.upload_person_name === "string" && rec.upload_person_name) ||
+            null;
+          const extraEntries = Object.entries(rec).filter(([k]) => !KNOWN.has(k));
+          return {
+            fb_name: item.fb_name,
+            person_name_en: item.person_name_en ?? null,
+            person_name_th: item.person_name_th ?? null,
+            matching_score: item.matching_score,
+            batch_number: payload.batch_number,
+            is_complete: payload.is_complete,
+            session_id: payload.session_id,
+            upload_name: uploadName,
+            extra: extraEntries.length ? JSON.stringify(Object.fromEntries(extraEntries)) : null,
+          };
+        });
         await ComparisonResultsModel.createMany(records);
         recordsStored = records.length;
       }

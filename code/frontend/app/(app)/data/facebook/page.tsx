@@ -1,13 +1,12 @@
 "use client";
 
 import * as React from "react";
-import Link from "next/link";
-import { Trash2, RefreshCw } from "lucide-react";
+import { Trash2 } from "lucide-react";
 import type { FacebookDataRow } from "@extensions/contract";
 import { DataManager, type Column } from "@/components/data-table/DataManager";
 import { IdCell } from "@/components/data-table/IdCell";
-import { Button } from "@/components/ui/button";
 import { ConfirmButton } from "@/components/confirm-button";
+import { ImportDialog } from "@/components/upload/ImportDialog";
 import { useAllFacebookData } from "@/hooks/queries";
 import { useDeleteFacebookRecord, useClearData } from "@/hooks/mutations";
 import { formatDate } from "@/lib/format";
@@ -35,11 +34,7 @@ export default function FacebookDataPage() {
           <p className="text-muted-foreground">All Facebook friends across comparisons.</p>
         </div>
         <div className="flex items-center gap-2">
-          <Button asChild variant="gradient">
-            <Link href="/compare?add=facebook">
-              <RefreshCw className="h-4 w-4" /> Sync
-            </Link>
-          </Button>
+          <ImportDialog source="facebook" />
           <ConfirmButton
             variant="outline"
             title="Clear all Facebook data?"

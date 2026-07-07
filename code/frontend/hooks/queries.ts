@@ -2,7 +2,7 @@
 
 import { useQuery, keepPreviousData } from "@tanstack/react-query";
 import type { SourceType } from "@extensions/contract";
-import { api } from "@/lib/api/client";
+import { api, type UploadListParams } from "@/lib/api/client";
 import { qk } from "./queryKeys";
 
 export function useCompanyData(sessionId: string | null, page: number, limit: number) {
@@ -62,6 +62,29 @@ export function useUploadHistory(source: SourceType) {
   return useQuery({
     queryKey: qk.uploadHistory(source),
     queryFn: () => api.uploadHistory.bySource(source, 1, 50),
+  });
+}
+
+/** Distinct companies you can compare against (populated as company data is imported). */
+export function useCompanies() {
+  return useQuery({ queryKey: qk.companies(), queryFn: () => api.comparisons.companies().then((d) => d.companies) });
+}
+
+/** Upload sessions (imports) with search/filter — the rollback-able history. */
+export function useUploadSessions(params: UploadListParams) {
+  return useQuery({
+    queryKey: qk.uploadSessions(params),
+    queryFn: () => api.uploadSessions.list(params),
+    placeholderData: keepPreviousData,
+  });
+}
+
+/** Upload-history log with search/filter. */
+export function useUploadHistoryList(params: UploadListParams) {
+  return useQuery({
+    queryKey: qk.uploadHistoryList(params),
+    queryFn: () => api.uploadHistory.list(params),
+    placeholderData: keepPreviousData,
   });
 }
 

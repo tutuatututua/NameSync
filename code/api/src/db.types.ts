@@ -14,6 +14,11 @@ export interface UploadSessions {
   parent_session_id: string | null;
   status: string | null;
   expected_batches: number | null;
+  upload_type: string | null;
+  uploaded_by: string | null;
+  records_uploaded: number | null;
+  duplicate_records: number | null;
+  selected_company: string | null;
   created_at: string | null;
   updated_at: string | null;
 }
@@ -48,6 +53,8 @@ export interface ComparisonResults {
   batch_number: number | null;
   is_complete: boolean;
   session_id: string | null;
+  upload_name: string | null;
+  extra: string | null;
 }
 
 export interface HistorySessions {

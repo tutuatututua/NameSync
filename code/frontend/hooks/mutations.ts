@@ -50,6 +50,27 @@ export function useTriggerComparison() {
   });
 }
 
+/** Start a comparison against one selected company (no file upload). */
+export function useCompareByCompany() {
+  return useMutation({
+    mutationFn: (companyName: string) => api.comparisons.compareByCompany(companyName),
+    onError: (e) => toast.error(errMsg(e, "Failed to start the comparison")),
+  });
+}
+
+/** Reverse an upload session — hard-deletes the rows it imported. */
+export function useRollbackSession() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => api.uploadSessions.rollback(id),
+    onSuccess: () => {
+      qc.invalidateQueries();
+      toast.success("Upload session rolled back");
+    },
+    onError: (e) => toast.error(errMsg(e, "Failed to roll back")),
+  });
+}
+
 export function useSaveToHistory() {
   const qc = useQueryClient();
   return useMutation({

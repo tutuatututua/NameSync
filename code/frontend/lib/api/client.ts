@@ -20,6 +20,10 @@ import type {
   SendWebhookData,
   DataStats,
   SourceType,
+  CompaniesData,
+  CompareByCompanyBody,
+  UploadSessionRow,
+  RollbackData,
 } from "@extensions/contract";
 
 /** Error carrying HTTP status + parsed body, thrown by every failed request. */
@@ -36,6 +40,19 @@ export class ApiError extends Error {
 
 type Envelope<T> = { success: true; message?: string; data: T };
 type Paginated<T> = { success: true; data: T[]; pagination: Pagination };
+
+/** Search/filter params for the upload-history and upload-session tables. */
+export type UploadListParams = {
+  page?: number;
+  limit?: number;
+  search?: string;
+  uploadType?: string;
+  sourceType?: string;
+  uploadedBy?: string;
+  status?: string;
+  dateFrom?: string;
+  dateTo?: string;
+};
 
 /**
  * The single choke point for every API call. Checks `response.ok` BEFORE parsing
@@ -100,6 +117,12 @@ export const api = {
       request<Envelope<SendWebhookData>>(`/comparisons/${id}/send-webhook`, { method: "POST" }).then((r) => r.data),
     trigger: (id: string) =>
       request<Envelope<TriggerCompareData>>(`/comparisons/${id}/compare`, { method: "POST" }).then((r) => r.data),
+    companies: () => request<Envelope<CompaniesData>>(`/comparisons/companies`).then((r) => r.data),
+    compareByCompany: (company_name: string) =>
+      request<Envelope<TriggerCompareData>>(`/comparisons/compare`, {
+        method: "POST",
+        body: JSON.stringify({ company_name } satisfies CompareByCompanyBody),
+      }).then((r) => r.data),
     results: (id: string) =>
       request<Envelope<ResultsData>>(`/comparisons/${id}/results`).then((r) => r.data),
     companyData: (id: string, page: number, limit: number) =>
@@ -137,9 +160,17 @@ export const api = {
   uploadHistory: {
     bySource: (source: SourceType, page: number, limit: number) =>
       request<Paginated<UploadHistoryRow>>(`/upload-history/by-source/${source}${qs({ page, limit })}`),
+    list: (params: UploadListParams) =>
+      request<Paginated<UploadHistoryRow>>(`/upload-history${qs(params)}`),
     create: (body: CreateUploadHistoryBody) =>
       request<Envelope<UploadHistoryRow>>("/upload-history", { method: "POST", body: JSON.stringify(body) }).then((r) => r.data),
     clearSource: (source: SourceType) =>
       request<Envelope<never>>(`/upload-history/by-source/${source}`, { method: "DELETE" }),
+  },
+  uploadSessions: {
+    list: (params: UploadListParams) =>
+      request<Paginated<UploadSessionRow>>(`/upload-sessions${qs(params)}`),
+    rollback: (id: string) =>
+      request<Envelope<RollbackData>>(`/upload-sessions/${id}/rollback`, { method: "POST" }).then((r) => r.data),
   },
 };

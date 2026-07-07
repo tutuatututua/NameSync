@@ -33,6 +33,10 @@ export const ComparisonResultRowSchema = z.object({
   batch_number: z.number().nullable(),
   is_complete: z.union([z.boolean(), z.number()]),
   session_id: z.string().nullable(),
+  // The uploader with a potential connection (webhook-provided or joined from
+  // facebook_data at read time). `extra` holds any additional matcher fields as JSON.
+  upload_name: z.string().nullable(),
+  extra: z.string().nullable(),
 });
 export type ComparisonResultRow = z.infer<typeof ComparisonResultRowSchema>;
 
@@ -99,6 +103,8 @@ export const ResultsDataSchema = z.object({
   status: z.string().nullable(),
   rowCount: z.number(),
   meanConfidence: z.number(),
+  /** The company this comparison was run against (null for legacy whole-table runs). */
+  selectedCompany: z.string().nullable(),
   results: z.array(ComparisonResultRowSchema),
 });
 export type ResultsData = z.infer<typeof ResultsDataSchema>;

@@ -12,6 +12,8 @@ import { ConfidenceChart } from "@/components/confidence/ConfidenceChart";
 
 const MAX_ROWS = 300;
 
+type EnrichedRow = ComparisonResultRow & { _extra: Record<string, unknown> };
+
 function Stat({ label, value, className }: { label: string; value: string; className?: string }) {
   return (
     <Card>
@@ -23,14 +25,38 @@ function Stat({ label, value, className }: { label: string; value: string; class
   );
 }
 
+const cell = (v: unknown): string => (v === null || v === undefined || v === "" ? "—" : String(v));
+
 export function ResultsView({
   results,
   meanConfidence,
+  selectedCompany,
 }: {
   results: ComparisonResultRow[];
   meanConfidence: number;
+  selectedCompany?: string | null;
 }) {
   const [q, setQ] = React.useState("");
+
+  // Parse each row's `extra` JSON once, and collect the union of extra keys so any
+  // additional fields the matcher returned become their own columns.
+  const { rows, extraKeys } = React.useMemo(() => {
+    const keys = new Set<string>();
+    const rows: EnrichedRow[] = results.map((r) => {
+      let extra: Record<string, unknown> = {};
+      if (r.extra) {
+        try {
+          const parsed = JSON.parse(r.extra);
+          if (parsed && typeof parsed === "object") extra = parsed as Record<string, unknown>;
+        } catch {
+          /* ignore malformed extra */
+        }
+      }
+      for (const k of Object.keys(extra)) keys.add(k);
+      return { ...r, _extra: extra };
+    });
+    return { rows, extraKeys: Array.from(keys).sort() };
+  }, [results]);
 
   const { min, max, histogram } = React.useMemo(() => {
     const bins = Array(10).fill(0) as number[];
@@ -48,65 +74,96 @@ export function ResultsView({
 
   const filtered = React.useMemo(() => {
     const needle = q.trim().toLowerCase();
-    if (!needle) return results;
-    return results.filter((r) =>
-      [r.fb_name, r.person_name_en, r.person_name_th].some((v) => (v ?? "").toLowerCase().includes(needle))
+    if (!needle) return rows;
+    return rows.filter((r) =>
+      [r.upload_name, r.fb_name, r.person_name_en, r.person_name_th, selectedCompany].some((v) =>
+        (v ?? "").toLowerCase().includes(needle)
+      )
     );
-  }, [results, q]);
+  }, [rows, q, selectedCompany]);
+
+  const colCount = 6 + extraKeys.length;
 
   return (
     <div className="space-y-6">
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
         <Stat label="Matches" value={results.length.toLocaleString()} />
-        <Stat label="Mean confidence" value={`${(meanConfidence * 100).toFixed(0)}%`} className="text-primary" />
+        <Stat label="Mean similarity" value={`${(meanConfidence * 100).toFixed(0)}%`} className="text-primary" />
         <Stat label="Lowest" value={`${(min * 100).toFixed(0)}%`} />
         <Stat label="Highest" value={`${(max * 100).toFixed(0)}%`} />
       </div>
 
+      {selectedCompany && (
+        <p className="text-sm text-muted-foreground">
+          Uploaders with a potential connection to people at{" "}
+          <span className="font-medium text-foreground">{selectedCompany}</span>.
+        </p>
+      )}
+
       <Card>
         <CardContent className="p-6">
-          <p className="mb-4 text-sm font-medium text-muted-foreground">Confidence distribution</p>
+          <p className="mb-4 text-sm font-medium text-muted-foreground">Similarity distribution</p>
           <ConfidenceChart data={histogram} />
         </CardContent>
       </Card>
 
       <div className="relative max-w-sm">
         <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-        <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search names…" className="pl-9" aria-label="Search results" />
+        <Input
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          placeholder="Search names…"
+          className="pl-9"
+          aria-label="Search results"
+        />
       </div>
 
       <div className="overflow-hidden rounded-xl border">
         <ScrollArea className="max-h-[28rem]">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Facebook name</TableHead>
-                <TableHead>Company name (EN)</TableHead>
-                <TableHead>Company name (TH)</TableHead>
-                <TableHead className="text-right">Confidence</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {filtered.length === 0 ? (
+          <div className="overflow-x-auto">
+            <Table>
+              <TableHeader>
                 <TableRow>
-                  <TableCell colSpan={4} className="h-24 text-center text-muted-foreground">
-                    No matches.
-                  </TableCell>
+                  <TableHead>Upload name</TableHead>
+                  <TableHead>Facebook match</TableHead>
+                  <TableHead>Company name</TableHead>
+                  <TableHead>English name</TableHead>
+                  <TableHead>Thai name</TableHead>
+                  {extraKeys.map((k) => (
+                    <TableHead key={k} className="capitalize">
+                      {k.replace(/_/g, " ")}
+                    </TableHead>
+                  ))}
+                  <TableHead className="text-right">Similarity</TableHead>
                 </TableRow>
-              ) : (
-                filtered.slice(0, MAX_ROWS).map((r) => (
-                  <TableRow key={r.uuid}>
-                    <TableCell className="font-medium">{r.fb_name ?? "—"}</TableCell>
-                    <TableCell>{r.person_name_en ?? "—"}</TableCell>
-                    <TableCell>{r.person_name_th ?? "—"}</TableCell>
-                    <TableCell className="text-right">
-                      <ConfidenceBadge score={Number(r.matching_score) || 0} />
+              </TableHeader>
+              <TableBody>
+                {filtered.length === 0 ? (
+                  <TableRow>
+                    <TableCell colSpan={colCount} className="h-24 text-center text-muted-foreground">
+                      No matches.
                     </TableCell>
                   </TableRow>
-                ))
-              )}
-            </TableBody>
-          </Table>
+                ) : (
+                  filtered.slice(0, MAX_ROWS).map((r) => (
+                    <TableRow key={r.uuid}>
+                      <TableCell className="font-medium">{cell(r.upload_name)}</TableCell>
+                      <TableCell>{cell(r.fb_name)}</TableCell>
+                      <TableCell>{cell(selectedCompany)}</TableCell>
+                      <TableCell>{cell(r.person_name_en)}</TableCell>
+                      <TableCell>{cell(r.person_name_th)}</TableCell>
+                      {extraKeys.map((k) => (
+                        <TableCell key={k}>{cell(r._extra[k])}</TableCell>
+                      ))}
+                      <TableCell className="text-right">
+                        <ConfidenceBadge score={Number(r.matching_score) || 0} />
+                      </TableCell>
+                    </TableRow>
+                  ))
+                )}
+              </TableBody>
+            </Table>
+          </div>
         </ScrollArea>
       </div>
       {filtered.length > MAX_ROWS && (

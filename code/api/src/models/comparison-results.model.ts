@@ -12,6 +12,8 @@ export interface ComparisonResultInput {
   batch_number: number;
   is_complete: boolean;
   session_id: string;
+  upload_name?: string | null;
+  extra?: string | null;
 }
 
 interface BatchStatus {
@@ -35,16 +37,41 @@ export class ComparisonResultsModel extends DBModel {
       // Postgres has a real boolean column — bind an actual boolean.
       is_complete: record.is_complete,
       session_id: record.session_id,
+      upload_name: record.upload_name ?? null,
+      extra: record.extra ?? null,
     }));
 
     return db.insertInto("comparison_results").values(data).returningAll().execute();
   }
 
+  /**
+   * Results for a session, with `upload_name` filled in: use the matcher-provided
+   * value if present, else fall back to the uploader of the matching Facebook row
+   * (a scalar subquery, so a shared fb_name never multiplies the result rows).
+   */
   static async findBySessionId(sessionId: string) {
     const db = await this.getKyselyDB();
     return db
       .selectFrom("comparison_results")
-      .selectAll()
+      .select([
+        "uuid",
+        "fb_name",
+        "person_name_en",
+        "person_name_th",
+        "matching_score",
+        "batch_number",
+        "is_complete",
+        "session_id",
+        "extra",
+      ])
+      .select(
+        sql<string | null>`coalesce(comparison_results.upload_name, (
+          select f.upload_person_name from facebook_data f
+          where f.fb_name = comparison_results.fb_name
+            and f.upload_person_name is not null
+          limit 1
+        ))`.as("upload_name")
+      )
       .where("session_id", "=", sessionId)
       .orderBy("batch_number", "asc")
       .execute() as Promise<ComparisonResults[]>;

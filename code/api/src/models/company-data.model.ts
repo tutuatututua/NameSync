@@ -114,6 +114,26 @@ export class CompanyDataModel extends DBModel {
     return Number(result?.numDeletedRows ?? 0);
   }
 
+  /** Delete every company row imported in a session (used to roll back an upload). */
+  static async deleteBySessionId(sessionId: string): Promise<number> {
+    const db = await this.getKyselyDB();
+    const result = await db.deleteFrom("company_data").where("session_id", "=", sessionId).executeTakeFirst();
+    return Number(result?.numDeletedRows ?? 0);
+  }
+
+  /** Distinct, non-null company names — the list you can compare against. */
+  static async distinctCompanies(): Promise<string[]> {
+    const db = await this.getKyselyDB();
+    const rows = await db
+      .selectFrom("company_data")
+      .select("company_name")
+      .where("company_name", "is not", null)
+      .distinct()
+      .orderBy("company_name", "asc")
+      .execute();
+    return rows.map((r) => r.company_name as string);
+  }
+
   /** Delete a single company row by uuid. Returns the number of rows removed. */
   static async deleteByUuid(uuid: string): Promise<number> {
     const db = await this.getKyselyDB();

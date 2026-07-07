@@ -5,4 +5,5 @@ export * from './callbacks';
 export * from './sessions';
 export * from './history';
 export * from './upload-history';
+export * from './uploads';
 export * from './ws';

@@ -115,6 +115,13 @@ export class FacebookDataModel extends DBModel {
     return Number(result?.numDeletedRows ?? 0);
   }
 
+  /** Delete every Facebook row imported in a session (used to roll back an upload). */
+  static async deleteBySessionId(sessionId: string): Promise<number> {
+    const db = await this.getKyselyDB();
+    const result = await db.deleteFrom("facebook_data").where("session_id", "=", sessionId).executeTakeFirst();
+    return Number(result?.numDeletedRows ?? 0);
+  }
+
   /** Delete a single Facebook row by uuid. Returns the number of rows removed. */
   static async deleteByUuid(uuid: string): Promise<number> {
     const db = await this.getKyselyDB();
