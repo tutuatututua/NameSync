@@ -81,4 +81,15 @@ export class UploadSessionModel extends DBModel {
       .orderBy("created_at", "desc")
       .execute();
   }
+
+  /** Direct child (merge/continue) sessions of a given parent, newest first. */
+  static async findChildren(parentSessionId: string) {
+    const db = await this.getKyselyDB();
+    return db
+      .selectFrom("upload_sessions")
+      .selectAll()
+      .where("parent_session_id", "=", parentSessionId)
+      .orderBy("created_at", "desc")
+      .execute();
+  }
 }

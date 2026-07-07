@@ -1,35 +1,30 @@
 # Project Overview
 
-Monorepo `fx-generated`.
+Monorepo `fx-generated` — see `README.md` for full details.
 
 # Layout
-- `api/`
-- `frontend/`
-- `extensions/`
-- `test/`
+- `api/` — Fastify v5 + TypeScript API on PostgreSQL (Kysely). OpenAPI at `/docs`.
+- `frontend/` — Next.js 15 + React 19, shadcn/ui + Tailwind, TanStack Query.
+- `extensions/` — shared workspace packages (`contract`, `sqldb`, ...).
+- `test/` — Playwright E2E.
 
 # Dependencies
 ## `api/`
-- @extensions/sqldb@^1.0.0
-- cors@^2.8.5
-- csv-parse@^6.2.1
-- dotenv@^16.0.0
-- express@^4.17.3
-- jsonwebtoken@^9.0.2
-- multer@^2.1.1
-- node-fetch@^3.3.2
-- sqlite@^5.0.1
-- sqlite3@^5.0.2
-- ws@^8.21.0
+- @extensions/contract@^1.0.0 (shared Zod schemas/types)
+- @extensions/sqldb@^1.0.0 (Kysely pool)
+- fastify@^5, fastify-type-provider-zod@^4, zod@^3
+- @fastify/cors, @fastify/multipart, @fastify/websocket, @fastify/swagger, @fastify/swagger-ui
+- kysely@^0.27, pg@^8, csv-parse@^6, dotenv@^16, ws@^8
+- dev: vitest, tsx, form-data, pino-pretty, typescript@^5
+
 ## `frontend/`
-- next@^15.1.11
-- react@^19.0.0
-- react-dom@^19.2.3
+- next@^15, react@^19, react-dom@^19
+- @tanstack/react-query@^5, zod@^3, @extensions/contract
+- shadcn/ui deps: @radix-ui/*, class-variance-authority, clsx, tailwind-merge, lucide-react
+- next-themes, sonner, framer-motion
+- tailwindcss@^3 (+ tailwindcss-animate, @tailwindcss/forms)
 
 # Installed Extensions
-
-## `auth-guard`
-
-## `cookie-auth`
-
-## `sqldb`
+## `contract` — shared API/WS Zod contract
+## `sqldb` — Kysely connection pools (Postgres for the app)
+## `auth-guard` / `cookie-auth` — scaffolds for the multi-user upgrade (see docs/AUTH.md)

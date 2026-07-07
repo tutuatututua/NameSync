@@ -1,18 +1,48 @@
-# Run the published images from Docker Hub (no source code needed).
+# Run the published images from Docker Hub (no source checkout needed):
 #   docker compose -f docker-compose.hub.yml up
+#
+# NOTE: the app now runs on PostgreSQL (not SQLite). The api-2.0 / frontend-2.0 images
+# must be built from this repo and pushed before this file will work:
+#   docker compose -f docker-compose.yml build
+#   docker tag <built-api> tuadocker/namesync:api-2.0 && docker push tuadocker/namesync:api-2.0
+#   docker tag <built-frontend> tuadocker/namesync:frontend-2.0 && docker push ...
 # The repo tuadocker/namesync is PRIVATE, so first run: docker login
 services:
-  api:
-    image: tuadocker/namesync:api-1.0
+  postgres:
+    image: postgres:16-alpine
     environment:
-      ENVIRONMENT: TEST            # file-backed SQLite
-      DATABASE_FILE: /data/database.sqlite
+      POSTGRES_USER: namesync
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-namesync}
+      POSTGRES_DB: namesync
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U namesync -d namesync"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    image: tuadocker/namesync:api-2.0
+    environment:
+      NODE_ENV: production
+      DB_ENGINE: postgres
+      DATABASE_URL: postgres://namesync:${POSTGRES_PASSWORD:-namesync}@postgres:5432/namesync
       UPLOAD_DIR: /data/uploads
-      CORS_ORIGIN: http://localhost:3000
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3000}
+      COMPANY_WEBHOOK_URL: ${COMPANY_WEBHOOK_URL:-}
+      FACEBOOK_WEBHOOK_URL: ${FACEBOOK_WEBHOOK_URL:-}
+      COMPARE_WEBHOOK_URL: ${COMPARE_WEBHOOK_URL:-}
+      WEBHOOK_CALLBACK_URL_BASE: ${WEBHOOK_CALLBACK_URL_BASE:-}
+      CALLBACK_TOKEN: ${CALLBACK_TOKEN:-}
     ports:
       - "8080:8080"
     volumes:
       - api-data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 15s
@@ -22,7 +52,7 @@ services:
     restart: unless-stopped
 
   frontend:
-    image: tuadocker/namesync:frontend-1.0
+    image: tuadocker/namesync:frontend-2.0
     ports:
       - "3000:3000"
     depends_on:
@@ -32,3 +62,4 @@ services:
 
 volumes:
   api-data:
+  pgdata:

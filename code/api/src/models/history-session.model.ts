@@ -1,5 +1,6 @@
 import { DBModel } from "@extensions/sqldb";
 import crypto from "crypto";
+import type { HistorySessions } from "../db.types";
 
 export interface HistorySessionData {
   id?: string;
@@ -22,7 +23,7 @@ export class HistorySessionModel extends DBModel {
       query = query.where("user_id", "=", userId);
     }
     
-    return query.orderBy("created_at", "desc").execute();
+    return query.orderBy("created_at", "desc").execute() as Promise<HistorySessions[]>;
   }
 
   static async findById(id: string) {
@@ -41,7 +42,7 @@ export class HistorySessionModel extends DBModel {
       .selectAll()
       .where("user_id", "=", userId)
       .orderBy("created_at", "desc")
-      .execute();
+      .execute() as Promise<HistorySessions[]>;
   }
 
   static async create(session: Omit<HistorySessionData, "id" | "created_at" | "updated_at"> & { id?: string }) {
@@ -108,7 +109,7 @@ export class HistorySessionModel extends DBModel {
       dbQuery = dbQuery.where("user_id", "=", userId);
     }
     
-    return dbQuery.orderBy("created_at", "desc").execute();
+    return dbQuery.orderBy("created_at", "desc").execute() as Promise<HistorySessions[]>;
   }
 
   static async searchByDateRange(startDate: string, endDate: string, userId?: string) {
@@ -123,6 +124,6 @@ export class HistorySessionModel extends DBModel {
       query = query.where("user_id", "=", userId);
     }
     
-    return query.orderBy("created_at", "desc").execute();
+    return query.orderBy("created_at", "desc").execute() as Promise<HistorySessions[]>;
   }
 }

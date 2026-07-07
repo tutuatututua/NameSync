@@ -1,4 +1,5 @@
 import { DBModel } from "@extensions/sqldb";
+import type { PaginatedResult } from "@extensions/contract";
 import type { FacebookData } from "../db.types";
 
 export interface FacebookDataInput {
@@ -7,16 +8,6 @@ export interface FacebookDataInput {
   timestamp: string | null;
   upload_person_name: string | null;
   session_id: string;
-}
-
-export interface PaginatedResult<T> {
-  data: T[];
-  pagination: {
-    page: number;
-    limit: number;
-    total: number;
-    totalPages: number;
-  };
 }
 
 export class FacebookDataModel extends DBModel {
@@ -95,6 +86,26 @@ export class FacebookDataModel extends DBModel {
       .select(db.fn.count("uuid").as("count"))
       .executeTakeFirst();
     return Number(row?.count) || 0;
+  }
+
+  /** Row counts split into total and "new" (not yet through a completed comparison). */
+  static async stats(): Promise<{ total: number; newRows: number }> {
+    const db = await this.getKyselyDB();
+    const [totalRow, newRow] = await Promise.all([
+      db.selectFrom("facebook_data").select(db.fn.count("uuid").as("count")).executeTakeFirst(),
+      db
+        .selectFrom("facebook_data")
+        .select(db.fn.count("uuid").as("count"))
+        .where("fetched", "=", false)
+        .executeTakeFirst(),
+    ]);
+    return { total: Number(totalRow?.count) || 0, newRows: Number(newRow?.count) || 0 };
+  }
+
+  /** Mark every new Facebook row as fetched — called when a comparison completes. */
+  static async markAllFetched(): Promise<void> {
+    const db = await this.getKyselyDB();
+    await db.updateTable("facebook_data").set({ fetched: true }).where("fetched", "=", false).execute();
   }
 
   /** Delete every Facebook row. Returns the number of rows removed. */

@@ -1,28 +1,47 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: namesync
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-namesync}
+      POSTGRES_DB: namesync
+    # Published on 55432 (not 5432) to avoid clashing with a local Postgres. Used
+    # by non-docker local dev and the test suite; the api container uses postgres:5432.
+    ports:
+      - "55432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U namesync -d namesync"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
   api:
     build:
       context: .
       dockerfile: api/Dockerfile
     environment:
       NODE_ENV: production
-      ENVIRONMENT: TEST            # TEST => file-backed SQLite (see DBModel.createPool)
+      DB_ENGINE: postgres
+      DATABASE_URL: postgres://namesync:${POSTGRES_PASSWORD:-namesync}@postgres:5432/namesync
       PORT: "8080"
-      DATABASE_FILE: /data/database.sqlite
       UPLOAD_DIR: /data/uploads
-      CORS_ORIGIN: ${CORS_ORIGIN:-}   # empty => allow any origin (LAN visitors by IP)
-      JWT_SECRET: ${JWT_SECRET:-change-me}
-      JWT_EXPIRES_IN: 8h
-      REFRESH_TOKEN_EXPIRES_IN: 7d
-      RATE_LIMIT_WINDOW: "1"
-      RATE_LIMIT_MAX_REQUESTS: "500"
+      # REQUIRED in production (no allow-all). Comma-separated origins.
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3000}
       COMPANY_WEBHOOK_URL: ${COMPANY_WEBHOOK_URL:-}
       FACEBOOK_WEBHOOK_URL: ${FACEBOOK_WEBHOOK_URL:-}
       COMPARE_WEBHOOK_URL: ${COMPARE_WEBHOOK_URL:-}
       WEBHOOK_CALLBACK_URL_BASE: ${WEBHOOK_CALLBACK_URL_BASE:-}
+      CALLBACK_TOKEN: ${CALLBACK_TOKEN:-}
     ports:
       - "8080:8080"
     volumes:
       - api-data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 15s
@@ -49,3 +68,4 @@ services:
 
 volumes:
   api-data:
+  pgdata:

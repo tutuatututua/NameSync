@@ -13,6 +13,7 @@ export interface UploadSessions {
   mode: string | null;
   parent_session_id: string | null;
   status: string | null;
+  expected_batches: number | null;
   created_at: string | null;
   updated_at: string | null;
 }
@@ -23,7 +24,9 @@ export interface CompanyData {
   person_name_th: string | null;
   person_name_en: string | null;
   status: string | null;
+  upload_person_name: string | null;
   session_id: string | null;
+  fetched: Generated<boolean>;
 }
 
 export interface FacebookData {
@@ -33,6 +36,7 @@ export interface FacebookData {
   upload_person_name: string | null;
   status: string | null;
   session_id: string | null;
+  fetched: Generated<boolean>;
 }
 
 export interface ComparisonResults {

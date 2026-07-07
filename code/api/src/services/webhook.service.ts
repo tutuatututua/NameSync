@@ -1,91 +1,75 @@
-import fetch from 'node-fetch';
-import { CompanyDataRecord, FacebookDataRecord } from './file-parser.service';
+import { CompanyDataRecord, FacebookDataRecord } from "./file-parser.service";
 
-const WEBHOOK_URLS = {
-  company: process.env.COMPANY_WEBHOOK_URL,
-  facebook: process.env.FACEBOOK_WEBHOOK_URL
-};
-
+/**
+ * Forwards CSV payloads to the external ingestion webhooks. Uses Node 20's global
+ * fetch/FormData/Blob (no node-fetch / form-data). Field name `file`, `text/csv`,
+ * with an X-Session-ID header — matching what the external service expects.
+ */
 export class WebhookService {
-  /**
-   * Convert records to CSV format
-   */
-  static recordsToCSV(records: Record<string, any>[], columns: string[]): string {
-    if (records.length === 0) return '';
-    
-    const header = columns.join(',');
-    const rows = records.map(record => 
-      columns.map(col => {
-        const value = record[col];
-        if (value === null || value === undefined) return '';
-        const str = String(value);
-        if (str.includes(',') || str.includes('"') || str.includes('\n')) {
-          return `"${str.replace(/"/g, '""')}"`;
-        }
-        return str;
-      }).join(',')
+  static recordsToCSV(records: Record<string, unknown>[], columns: string[]): string {
+    if (records.length === 0) return "";
+    const header = columns.join(",");
+    const rows = records.map((record) =>
+      columns
+        .map((col) => {
+          const value = record[col];
+          if (value === null || value === undefined) return "";
+          const str = String(value);
+          if (str.includes(",") || str.includes('"') || str.includes("\n")) {
+            return `"${str.replace(/"/g, '""')}"`;
+          }
+          return str;
+        })
+        .join(",")
     );
-    
-    return [header, ...rows].join('\n');
+    return [header, ...rows].join("\n");
   }
 
-  /**
-   * Send company data to webhook
-   */
+  private static async post(url: string, csv: string, sessionId: string, filename: string): Promise<boolean> {
+    const form = new FormData();
+    form.append("file", new Blob([csv], { type: "text/csv" }), filename);
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "X-Session-ID": sessionId },
+      body: form,
+    });
+    return res.ok;
+  }
+
   static async sendCompanyData(records: CompanyDataRecord[]): Promise<boolean> {
-    if (records.length === 0) {
-      // Nothing to forward (e.g. a Facebook-only upload with a placeholder company file).
+    if (records.length === 0) return true; // nothing to forward
+    const url = process.env.COMPANY_WEBHOOK_URL;
+    if (!url) {
+      console.warn("[WebhookService] COMPANY_WEBHOOK_URL not configured, skipping company webhook call");
       return true;
     }
-
-    if (!WEBHOOK_URLS.company) {
-      console.warn('[WebhookService] COMPANY_WEBHOOK_URL not configured, skipping company webhook call');
-      return true;
-    }
-
-    const csv = this.recordsToCSV(records, ['uuid', 'company_name', 'person_name_th', 'person_name_en', 'status', 'session_id']);
-    
-    const response = await fetch(WEBHOOK_URLS.company, {
-      method: 'POST',
-      headers: {
-        // Body is CSV text. The receiver (Fastify) has no text/csv parser and
-        // returns 415 for it, so declare text/plain — the raw bytes are identical.
-        'Content-Type': 'text/plain',
-        'X-Session-ID': records[0]?.session_id || ''
-      },
-      body: csv
-    });
-
-    return response.ok;
+    const csv = this.recordsToCSV(records as unknown as Record<string, unknown>[], [
+      "uuid",
+      "company_name",
+      "person_name_th",
+      "person_name_en",
+      "status",
+      "session_id",
+    ]);
+    const sessionId = records[0]?.session_id || "";
+    return this.post(url, csv, sessionId, `company-${sessionId || "data"}.csv`);
   }
 
-  /**
-   * Send Facebook data to webhook
-   */
   static async sendFacebookData(records: FacebookDataRecord[]): Promise<boolean> {
-    if (records.length === 0) {
-      // Nothing to forward (e.g. a Company-only upload, or no unprocessed rows).
+    if (records.length === 0) return true;
+    const url = process.env.FACEBOOK_WEBHOOK_URL;
+    if (!url) {
+      console.warn("[WebhookService] FACEBOOK_WEBHOOK_URL not configured, skipping facebook webhook call");
       return true;
     }
-
-    if (!WEBHOOK_URLS.facebook) {
-      console.warn('[WebhookService] FACEBOOK_WEBHOOK_URL not configured, skipping facebook webhook call');
-      return true;
-    }
-
-    const csv = this.recordsToCSV(records, ['uuid', 'fb_name', 'timestamp', 'upload_person_name', 'session_id']);
-    
-    const response = await fetch(WEBHOOK_URLS.facebook, {
-      method: 'POST',
-      headers: {
-        // Body is CSV text. The receiver (Fastify) has no text/csv parser and
-        // returns 415 for it, so declare text/plain — the raw bytes are identical.
-        'Content-Type': 'text/plain',
-        'X-Session-ID': records[0]?.session_id || ''
-      },
-      body: csv
-    });
-
-    return response.ok;
+    const csv = this.recordsToCSV(records as unknown as Record<string, unknown>[], [
+      "uuid",
+      "fb_name",
+      "timestamp",
+      "upload_person_name",
+      "session_id",
+    ]);
+    const sessionId = records[0]?.session_id || "";
+    return this.post(url, csv, sessionId, `facebook-${sessionId || "data"}.csv`);
   }
 }
