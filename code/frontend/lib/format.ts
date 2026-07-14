@@ -16,6 +16,26 @@ export function formatDate(iso: string | null | undefined): string {
   return d.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
 }
 
+/**
+ * What to call a run.
+ *
+ * A run is auto-named `${company} · ${YYYY-MM-DD}` at creation (comparisons.route.ts), and
+ * every place that lists one also prints its date — so the stock name rendered the date twice,
+ * in two different formats, on the same line: "BLUEBIK GROUP · 2026-07-14" over "Jul 14, 2026".
+ *
+ * Stripping the suffix rather than dropping `name` entirely is what keeps a *renamed* run's
+ * name: the rename endpoint writes free text to the same field, and that text is the one thing
+ * the old save-to-history flow really gave you.
+ */
+export function runTitle(run: {
+  name: string | null;
+  selectedCompany: string | null;
+  id: string;
+}): string {
+  const stripped = run.name?.replace(/\s*·\s*\d{4}-\d{2}-\d{2}\s*$/, "").trim();
+  return stripped || run.selectedCompany || `Run ${run.id}`;
+}
+
 export function formatRelativeTime(iso: string | null | undefined): string {
   if (!iso) return "";
   const then = new Date(iso).getTime();

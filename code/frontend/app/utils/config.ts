@@ -2,11 +2,11 @@
 //
 // When the env vars are unset we derive the host from the address the page was
 // loaded from (window.location), so a visitor reaching the site at e.g.
-// http://192.168.1.50:3000 will call the API at http://192.168.1.50:8080.
+// http://192.168.1.50:3000 will call the API at http://192.168.1.50:4000.
 // Hardcoding "localhost" only works on the machine running the server, which is
-// why remote visitors saw "failed to fetch localhost:8080".
+// why remote visitors saw "failed to fetch localhost:4000".
 
-const API_PORT = '8080';
+const API_PORT = '4000';
 
 function deriveBaseUrl(protocol: string, suffix: string): string {
   if (typeof window !== 'undefined' && window.location?.hostname) {

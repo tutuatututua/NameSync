@@ -13,12 +13,25 @@ import { Kysely } from "kysely";
  * (status stays a plain varchar — no migration needed for the new value).
  */
 export async function up(db: Kysely<any>): Promise<void> {
+  // SQLite only allows one ADD COLUMN per ALTER TABLE statement, so run each separately.
   await db.schema
     .alterTable("upload_sessions")
     .addColumn("upload_type", "varchar(20)")
+    .execute();
+  await db.schema
+    .alterTable("upload_sessions")
     .addColumn("uploaded_by", "varchar(255)")
+    .execute();
+  await db.schema
+    .alterTable("upload_sessions")
     .addColumn("records_uploaded", "integer")
+    .execute();
+  await db.schema
+    .alterTable("upload_sessions")
     .addColumn("duplicate_records", "integer")
+    .execute();
+  await db.schema
+    .alterTable("upload_sessions")
     .addColumn("selected_company", "varchar(255)")
     .execute();
 
@@ -33,12 +46,10 @@ export async function up(db: Kysely<any>): Promise<void> {
 export async function down(db: Kysely<any>): Promise<void> {
   await db.schema.dropIndex("idx_upload_sessions_upload_type").ifExists().execute();
 
-  await db.schema
-    .alterTable("upload_sessions")
-    .dropColumn("upload_type")
-    .dropColumn("uploaded_by")
-    .dropColumn("records_uploaded")
-    .dropColumn("duplicate_records")
-    .dropColumn("selected_company")
-    .execute();
+  // SQLite only allows one DROP COLUMN per ALTER TABLE statement, so run each separately.
+  await db.schema.alterTable("upload_sessions").dropColumn("upload_type").execute();
+  await db.schema.alterTable("upload_sessions").dropColumn("uploaded_by").execute();
+  await db.schema.alterTable("upload_sessions").dropColumn("records_uploaded").execute();
+  await db.schema.alterTable("upload_sessions").dropColumn("duplicate_records").execute();
+  await db.schema.alterTable("upload_sessions").dropColumn("selected_company").execute();
 }

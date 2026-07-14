@@ -1,115 +1,614 @@
 "use client";
 
+import * as React from "react";
 import Link from "next/link";
-import { Building2, Users, GitCompareArrows, ArrowRight, History } from "lucide-react";
+import { useRouter, useSearchParams } from "next/navigation";
+import { AnimatePresence, motion } from "framer-motion";
+import {
+  Building2,
+  GitCompareArrows,
+  History,
+  Loader2,
+  RotateCcw,
+  Search,
+  Trash2,
+  UploadCloud,
+  Users,
+} from "lucide-react";
+import { toast } from "sonner";
+import { useQueryClient } from "@tanstack/react-query";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
-import { ConfidenceBadge } from "@/components/confidence/ConfidenceBadge";
-import { useCompanyCount, useFacebookCount, useHistoryList } from "@/hooks/queries";
-import { formatDate } from "@/lib/format";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { LoadingButton } from "@/components/loading-button";
+import { ConfirmButton } from "@/components/confirm-button";
+import { PageHeader, SectionHeader } from "@/components/page-header";
+import { EmptyState } from "@/components/empty-state";
+import { ResultsView } from "@/components/results/ResultsView";
+import { RunOutcome } from "@/components/results/RunOutcome";
+import { RunProgress } from "@/components/results/RunProgress";
+import { RunRows } from "@/components/results/RunRows";
+import { useComparisonSocket } from "@/hooks/useComparisonSocket";
+import { useCompareByCompany, useDeleteComparison } from "@/hooks/mutations";
+import {
+  useCompanies,
+  useCompanyCount,
+  useComparisonProgress,
+  useComparisons,
+  useFacebookCount,
+  useResults,
+} from "@/hooks/queries";
+import { qk } from "@/hooks/queryKeys";
+import { formatDate, runTitle } from "@/lib/format";
+import { fade, fadeUp } from "@/lib/motion";
 
-function StatCard({
-  icon: Icon,
-  label,
-  value,
-  loading,
-  href,
-}: {
-  icon: typeof Building2;
-  label: string;
-  value: number | undefined;
-  loading: boolean;
-  href: string;
-}) {
+/**
+ * Compare — the app's one job, and the record of every time you've done it.
+ *
+ * Running a comparison and looking at past comparisons are the same workflow at two points
+ * in time, so they're one page: the action on top, the archive underneath. The archive hides
+ * while a run is in flight or its results are on screen — at that moment you're reading a
+ * result, not browsing for one.
+ *
+ * A run reaches this page two ways, and they end in the same place:
+ *   · you pick a company and press Compare;
+ *   · you import a file, which (with the external matcher) starts a run of its own and sends
+ *     you here with `?run=<id>`.
+ * Both land in `running` and then in `done`. The import flow deliberately does NOT get its own
+ * "your upload is processing" screen — that would be a second page describing the same run, and
+ * two screens showing one thing eventually disagree about it.
+ */
+
+type Mode = "choose" | "running" | "done";
+
+/** Past runs only need a filter box once the list is long enough to scan badly. */
+const SEARCH_THRESHOLD = 5;
+
+export default function ComparePage() {
+  // `useSearchParams` opts the subtree out of prerendering; without a boundary Next refuses to
+  // build the route. The fallback is the page's own resting state, so nothing jumps.
   return (
-    <Link href={href}>
-      <Card className="transition-colors hover:border-primary/50">
-        <CardContent className="flex items-center gap-4 p-6">
-          <div className="flex h-12 w-12 items-center justify-center rounded-xl bg-primary/10 text-primary">
-            <Icon className="h-6 w-6" />
-          </div>
-          <div>
-            {loading ? (
-              <Skeleton className="h-8 w-16" />
-            ) : (
-              <p className="font-display text-3xl font-bold tabular-nums">{(value ?? 0).toLocaleString()}</p>
-            )}
-            <p className="text-sm text-muted-foreground">{label}</p>
-          </div>
-        </CardContent>
-      </Card>
-    </Link>
+    <React.Suspense fallback={<CompareSkeleton />}>
+      <CompareScreen />
+    </React.Suspense>
   );
 }
 
-export default function DashboardPage() {
-  const company = useCompanyCount();
-  const facebook = useFacebookCount();
-  const history = useHistoryList();
+function CompareScreen() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const qc = useQueryClient();
+
+  // The run an import just started and sent us here to watch.
+  const importedRun = searchParams.get("run");
+
+  const [company, setCompany] = React.useState("");
+  const [sessionId, setSessionId] = React.useState<string | null>(importedRun);
+  const [mode, setMode] = React.useState<Mode>(importedRun ? "running" : "choose");
+  const [socketProgress, setSocketProgress] = React.useState(0);
+
+  const companies = useCompanies();
+  const compareMut = useCompareByCompany();
+  const results = useResults(mode === "done" && sessionId ? sessionId : "");
+
+  /**
+   * Two clocks, because there are two matchers.
+   *
+   * The external workflow never speaks to us — it writes verdicts into Postgres and moves on —
+   * so the only way to follow it is to keep counting the rows it has not stamped. That is this
+   * poll, and it is also what *completes* the run server-side.
+   *
+   * The older callback-style matcher does push batches over the socket, so that stays. A run
+   * driven by it has no import behind it, and the poll reports `total: 0` — which is the tell
+   * we use below to decide which of the two to draw.
+   */
+  // Kept alive past the run, not only during it: the hook stops polling the moment the run is
+  // terminal, so a finished run costs one request — and its counts are what label the row table's
+  // filter tabs once the results are up.
+  const progress = useComparisonProgress(sessionId);
+
+  useComparisonSocket(mode === "running" ? sessionId : null, {
+    onMessage: (m) => {
+      if (m.type === "batch_received" && typeof m.progress === "number") setSocketProgress(m.progress);
+    },
+    onComplete: () => {
+      setSocketProgress(100);
+      setMode("done");
+      qc.invalidateQueries({ queryKey: qk.results(sessionId ?? "") });
+      qc.invalidateQueries({ queryKey: qk.runRowsAll(sessionId ?? "") });
+    },
+    onFailed: (m) => {
+      toast.error(("message" in m && m.message) || "Comparison failed");
+      setMode("choose");
+    },
+  });
+
+  // The poll is the only completion signal the workflow gives us, so it has to be the thing
+  // that ends the wait — and the run has to be re-read, because it only has results now.
+  const polled = progress.data?.status;
+  React.useEffect(() => {
+    if (mode !== "running" || !sessionId) return;
+
+    if (polled === "completed") {
+      setMode("done");
+      qc.invalidateQueries({ queryKey: qk.results(sessionId) });
+      qc.invalidateQueries({ queryKey: qk.comparisons() });
+      // The row table's last poll landed up to two seconds before the final rows were stamped,
+      // and completing the run is what stops it polling — so the rows it is holding are one tick
+      // short of the truth. Switching to the "done" panel happens to remount it, which happens to
+      // refetch; that is a coincidence of the layout, not a guarantee, and the same table on the
+      // run's own page has no such luck. Ask for the rows again, explicitly.
+      qc.invalidateQueries({ queryKey: qk.runRowsAll(sessionId) });
+    } else if (polled === "failed") {
+      toast.error("The matching workflow never received this import.");
+      setMode("choose");
+    }
+  }, [polled, mode, sessionId, qc]);
+
+  async function compare() {
+    if (!company) return;
+    try {
+      const data = await compareMut.mutateAsync(company);
+      setSessionId(data.sessionId);
+
+      // The internal matcher runs inside the request, so by the time this resolves the results
+      // are already stored. Dropping into "running" to wait would mean waiting for something
+      // that has already happened.
+      if (data.status === "completed") {
+        setSocketProgress(100);
+        setMode("done");
+        qc.invalidateQueries({ queryKey: qk.results(data.sessionId) });
+        return;
+      }
+
+      setSocketProgress(0);
+      setMode("running");
+    } catch {
+      /* mutations surface errors as toasts */
+    }
+  }
+
+  function reset() {
+    setMode("choose");
+    setSessionId(null);
+    setSocketProgress(0);
+    // Drop `?run=` — otherwise "Run another" leaves the finished run in the URL, and a reload
+    // drags you straight back into the result you just dismissed.
+    if (importedRun) router.replace("/");
+  }
+
+  /**
+   * Follow the URL back out of a run.
+   *
+   * Navigating from `/?run=7` to `/` — the sidebar's Compare link, the browser's back button —
+   * does not remount this component: it is the same route, so React keeps the state and only
+   * `useSearchParams` changes. Without this, `mode` stayed "running" and the page went on
+   * showing the monitor for a run the URL no longer mentions, which made the Compare nav link
+   * look broken. It was: you could click it all day and nothing moved.
+   *
+   * Guarded on the run we were actually watching, so a compare-by-company run — which never puts
+   * anything in the URL — is not torn down by an effect that sees `?run=` absent and assumes it
+   * has just been dismissed.
+   */
+  const watchedRef = React.useRef(importedRun);
+  React.useEffect(() => {
+    const previous = watchedRef.current;
+    watchedRef.current = importedRun;
+    if (previous && !importedRun && sessionId === previous) {
+      setMode("choose");
+      setSessionId(null);
+      setSocketProgress(0);
+    }
+  }, [importedRun, sessionId]);
+
+  const hasCompanies = (companies.data?.length ?? 0) > 0;
+
+  // An import-driven run counts real rows; a callback-driven one has none to count.
+  const rowProgress = progress.data && progress.data.total > 0 ? progress.data : null;
 
   return (
-    <div className="space-y-8">
-      <div className="relative overflow-hidden rounded-2xl bg-gradient-brand p-8 text-primary-foreground shadow-lg">
-        <div className="relative z-10 max-w-xl">
-          <h1 className="font-display text-3xl font-bold">Sync &amp; match names with confidence</h1>
-          <p className="mt-2 text-primary-foreground/90">
-            Import your company and Facebook data, then pick a company to find connected uploaders.
-          </p>
-          <Button asChild variant="secondary" className="mt-5">
-            <Link href="/compare">
-              <GitCompareArrows className="h-4 w-4" /> Compare <ArrowRight className="h-4 w-4" />
-            </Link>
-          </Button>
-        </div>
-        <div className="pointer-events-none absolute -right-16 -top-16 h-64 w-64 rounded-full bg-white/10 blur-2xl" />
-      </div>
+    <div className="space-y-10">
+      <PageHeader
+        title="Compare"
+        description="Pick a company to find out whether any uploader has a potential connection with people who belong to it."
+      />
 
-      <div className="grid gap-4 sm:grid-cols-2">
-        <StatCard icon={Building2} label="Company records" value={company.data} loading={company.isLoading} href="/data/company" />
-        <StatCard icon={Users} label="Facebook records" value={facebook.data} loading={facebook.isLoading} href="/data/facebook" />
-      </div>
+      {mode === "choose" && <DataSummary />}
 
-      <div>
-        <div className="mb-3 flex items-center justify-between">
-          <h2 className="font-display text-lg font-semibold">Recent comparisons</h2>
-          <Button asChild variant="ghost" size="sm">
-            <Link href="/history">
-              <History className="h-4 w-4" /> View all
-            </Link>
-          </Button>
-        </div>
-        {history.isLoading ? (
-          <Skeleton className="h-24 w-full rounded-xl" />
-        ) : !history.data?.length ? (
-          <Card>
-            <CardContent className="p-8 text-center text-muted-foreground">
-              No saved comparisons yet.{" "}
-              <Link href="/compare" className="text-primary underline">
-                Run your first →
-              </Link>
-            </CardContent>
-          </Card>
-        ) : (
-          <div className="space-y-2">
-            {history.data.slice(0, 5).map((h) => (
-              <Link
-                key={h.id}
-                href={`/comparisons/${h.id}`}
-                className="flex items-center justify-between rounded-xl border bg-card p-4 transition-colors hover:border-primary/50"
-              >
-                <div>
-                  <p className="font-medium">{h.name}</p>
+      <AnimatePresence mode="wait" initial={false}>
+        {mode === "choose" && (
+          <motion.div key="choose" variants={fadeUp} initial="hidden" animate="show" exit="exit">
+            <Card>
+              <CardContent className="space-y-4 p-5">
+                <div className="space-y-1.5">
+                  <Label htmlFor="company">Company</Label>
+                  <div className="flex flex-col gap-2 sm:flex-row">
+                    <Select value={company} onValueChange={setCompany} disabled={!hasCompanies}>
+                      <SelectTrigger id="company" className="sm:flex-1">
+                        <SelectValue
+                          placeholder={hasCompanies ? "Select a company…" : "No companies yet"}
+                        />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {(companies.data ?? []).map((c) => (
+                          <SelectItem key={c} value={c}>
+                            {c}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <LoadingButton
+                      variant="gradient"
+                      className="sm:w-36"
+                      isLoading={compareMut.isPending}
+                      disabled={!company}
+                      onClick={compare}
+                    >
+                      <GitCompareArrows className="h-4 w-4" /> Compare
+                    </LoadingButton>
+                  </div>
+                </div>
+
+                {!hasCompanies && !companies.isLoading && (
                   <p className="text-sm text-muted-foreground">
-                    {formatDate(h.date)} · {h.rowCount.toLocaleString()} rows
+                    There&apos;s nothing to compare against yet.{" "}
+                    <Link
+                      href="/uploads"
+                      className="font-medium text-primary underline-offset-4 hover:underline"
+                    >
+                      Import company data
+                    </Link>{" "}
+                    to build this list.
+                  </p>
+                )}
+              </CardContent>
+            </Card>
+          </motion.div>
+        )}
+
+        {/* A run started by an import has real rows to count, so it gets the real panel —
+            "6 of 12 rows, 3 matched so far" — rather than a bar with a number painted on it,
+            and under it the rows themselves, resolving one by one. */}
+        {mode === "running" && rowProgress && (
+          <motion.div
+            key="running-rows"
+            variants={fade}
+            initial="hidden"
+            animate="show"
+            exit="exit"
+            className="space-y-6"
+          >
+            <RunProgress progress={rowProgress} />
+
+            {/*
+              A way out.
+
+              Watching a run takes over this page, and a large import can hold it for a long
+              while — a thousand names is a thousand names. Without this the only exits were the
+              browser's back button and a nav link that (until now) did nothing, so the honest
+              description of the screen was "stuck". The run does not need a witness: the workflow
+              writes to Postgres whether or not anyone is looking, the run is already saved, and
+              it is already in Past runs — so leaving costs nothing, and the panel above says so.
+            */}
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <p className="text-sm text-muted-foreground">
+                You don&apos;t have to wait here — pick it back up from Past runs whenever.
+              </p>
+              <Button variant="outline" onClick={reset}>
+                <GitCompareArrows className="h-4 w-4" /> Back to Compare
+              </Button>
+            </div>
+
+            {sessionId && <RunRows comparisonId={sessionId} progress={rowProgress} live />}
+          </motion.div>
+        )}
+
+        {mode === "running" && !rowProgress && (
+          <motion.div key="running" variants={fade} initial="hidden" animate="show" exit="exit">
+            <Card>
+              <CardContent className="flex flex-col items-center gap-4 p-10">
+                <Loader2 className="h-6 w-6 animate-spin text-primary" />
+                <div className="space-y-1 text-center">
+                  <p className="font-medium">
+                    {company ? `Matching against ${company}…` : "Matching…"}
+                  </p>
+                  <p className="text-sm text-muted-foreground">
+                    This runs in the background — you&apos;ll see results here when it finishes.
                   </p>
                 </div>
-                <ConfidenceBadge score={h.meanConfidence} />
-              </Link>
-            ))}
-          </div>
+                <div className="w-full max-w-sm space-y-1.5">
+                  <Progress value={socketProgress} />
+                  <p className="text-right text-xs tabular-nums text-muted-foreground">
+                    {socketProgress}%
+                  </p>
+                </div>
+
+                {/* The same way out, and here it matters more: this is the panel you get before
+                    the first poll lands, and the one a run with nothing to count never leaves.
+                    A spinner with no exit is a trap, however briefly it is usually on screen. */}
+                <Button variant="outline" size="sm" onClick={reset}>
+                  <GitCompareArrows className="h-4 w-4" /> Back to Compare
+                </Button>
+              </CardContent>
+            </Card>
+          </motion.div>
         )}
-      </div>
+
+        {mode === "done" && (
+          <motion.div
+            key="done"
+            variants={fadeUp}
+            initial="hidden"
+            animate="show"
+            className="space-y-6"
+          >
+            {results.isLoading ? (
+              <ResultsSkeleton />
+            ) : results.data ? (
+              <>
+                <ResultsView
+                  results={results.data.results}
+                  scoredCount={results.data.scoredCount}
+                  selectedCompany={results.data.selectedCompany}
+                />
+
+                {/* The rows that did NOT match live only here. The results table above lists the
+                    matches, and for an import-driven run that is all it can list — the workflow
+                    need only write a result for a name it matched. Renders nothing for a
+                    compare-by-company run, which has no import and no row statuses. */}
+                {sessionId && (
+                  <RunRows comparisonId={sessionId} progress={progress.data} live={false} />
+                )}
+
+                {/* No "Save to history" button. The run was written to the database before
+                    this screen rendered and is already in Past runs, so a save button would
+                    be asking you to keep a second copy of something you already have. */}
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-sm text-muted-foreground">
+                    Kept automatically — it&apos;s in Past runs.
+                  </p>
+                  <Button variant="outline" onClick={reset}>
+                    <RotateCcw className="h-4 w-4" /> Run another
+                  </Button>
+                </div>
+              </>
+            ) : (
+              <EmptyState
+                icon={Search}
+                title="No results"
+                description="The comparison finished but returned nothing to show."
+                action={
+                  <Button variant="outline" onClick={reset}>
+                    <RotateCcw className="h-4 w-4" /> Run another
+                  </Button>
+                }
+              />
+            )}
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {mode === "choose" && <PastRuns />}
     </div>
   );
 }
+
+/**
+ * How much there is to compare against. Doubles as the way into Uploads — the answer to
+ * "that number is too low" is to add more, not to go read the rows one by one.
+ */
+function DataSummary() {
+  const company = useCompanyCount();
+  const facebook = useFacebookCount();
+
+  const tiles = [
+    { icon: Building2, label: "Company records", q: company },
+    { icon: Users, label: "Facebook records", q: facebook },
+  ];
+
+  return (
+    <div className="grid gap-3 sm:grid-cols-2">
+      {tiles.map(({ icon: Icon, label, q }) => (
+        <Link key={label} href="/uploads" className="group rounded-lg outline-none">
+          <Card interactive className="h-full">
+            <CardContent className="flex items-center gap-3.5 p-4">
+              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border bg-muted text-muted-foreground">
+                <Icon className="h-4 w-4" />
+              </div>
+              <div className="min-w-0">
+                {q.isLoading ? (
+                  <Skeleton className="h-7 w-16" />
+                ) : (
+                  <p className="font-display text-2xl font-semibold leading-none tracking-tight">
+                    {(q.data ?? 0).toLocaleString()}
+                  </p>
+                )}
+                <p className="mt-1 text-sm text-muted-foreground">{label}</p>
+              </div>
+              <span className="ml-auto flex shrink-0 items-center gap-1.5 text-sm text-muted-foreground transition-colors group-hover:text-foreground">
+                <UploadCloud className="h-4 w-4" />
+                <span className="hidden sm:inline">Upload</span>
+              </span>
+            </CardContent>
+          </Card>
+        </Link>
+      ))}
+    </div>
+  );
+}
+
+/** The page's resting shape, for the Suspense boundary — header, tiles, the picker. */
+function CompareSkeleton() {
+  return (
+    <div className="space-y-10">
+      <div className="space-y-2">
+        <Skeleton className="h-8 w-40" />
+        <Skeleton className="h-5 w-96 max-w-full" />
+      </div>
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Skeleton className="h-[74px] rounded-lg" />
+        <Skeleton className="h-[74px] rounded-lg" />
+      </div>
+      <Skeleton className="h-[118px] rounded-lg" />
+    </div>
+  );
+}
+
+/** Shape-matched to ResultsView, so finishing a run doesn't shove the page around. */
+function ResultsSkeleton() {
+  return (
+    <div className="space-y-6">
+      <Skeleton className="h-[116px] rounded-lg" />
+      <Skeleton className="h-56 rounded-lg" />
+      <Skeleton className="h-72 rounded-lg" />
+    </div>
+  );
+}
+
+/**
+ * Every comparison, not just the ones you remembered to save.
+ *
+ * This lists the runs themselves. There used to be a second table of saved snapshots, and
+ * a run only appeared here if you pressed "Save to history" — which meant every other run
+ * still sat in the database, invisible and un-deletable, accumulating forever. A run is
+ * already immutable the moment it finishes (its results store names and scores as text, not
+ * references), so the copy protected against nothing and only gave the same data a second
+ * shape to drift out of.
+ */
+function PastRuns() {
+  const { data, isLoading } = useComparisons();
+  const del = useDeleteComparison();
+  const [query, setQuery] = React.useState("");
+
+  const runs = data ?? [];
+  const needle = query.trim().toLowerCase();
+  const shown = needle
+    ? runs.filter((h) =>
+        [h.name, h.selectedCompany].some((v) => v?.toLowerCase().includes(needle))
+      )
+    : runs;
+
+  return (
+    <section className="space-y-4">
+      <SectionHeader
+        title="Past runs"
+        description={runs.length ? `${runs.length} run${runs.length === 1 ? "" : "s"}` : undefined}
+        actions={
+          runs.length > SEARCH_THRESHOLD ? (
+            <div className="relative w-full max-w-xs">
+              <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Filter by name…"
+                className="h-8 pl-8"
+                aria-label="Filter past runs"
+              />
+            </div>
+          ) : undefined
+        }
+      />
+
+      {isLoading ? (
+        <div className="grid gap-3 sm:grid-cols-2">
+          {[0, 1].map((i) => (
+            <Skeleton key={i} className="h-[104px] rounded-lg" />
+          ))}
+        </div>
+      ) : runs.length === 0 ? (
+        <EmptyState
+          icon={History}
+          title="No runs yet"
+          description="Every comparison you run is kept here automatically."
+          action={
+            <Button asChild variant="outline" size="sm">
+              <Link href="/uploads">
+                <UploadCloud className="h-4 w-4" /> Import data
+              </Link>
+            </Button>
+          }
+        />
+      ) : shown.length === 0 ? (
+        <EmptyState
+          icon={Search}
+          title={`No runs match “${query}”`}
+          description="Try a shorter search, or clear the filter."
+          action={
+            <Button variant="outline" size="sm" onClick={() => setQuery("")}>
+              Clear filter
+            </Button>
+          }
+        />
+      ) : (
+        /* A history reads top-down, newest first — one run per line, not a grid you have
+           to scan in two directions. The API already returns them created_at DESC. */
+        <div className="overflow-hidden rounded-lg border">
+          {shown.map((h) => (
+            <div
+              key={h.id}
+              className="group relative flex items-center gap-4 border-b p-4 transition-colors last:border-b-0 hover:bg-muted/40 focus-within:bg-muted/40"
+            >
+              {/* The whole row is the click target, not just the title: `absolute inset-0`
+                  stretches this link over the line. Anything that must stay clickable on
+                  top of it (the delete button) needs its own stacking context. */}
+              <Link
+                href={`/comparisons/${h.id}`}
+                className="min-w-0 flex-1 outline-none after:absolute after:inset-0 after:content-[''] focus-visible:underline"
+              >
+                <p className="truncate font-medium">{runTitle(h)}</p>
+                {/* Matches, not rows. `rowCount` is the size of the friend list, so it is the
+                    same number on every run made against the same friends — this list used to
+                    print "320 rows" three times and leave you to click each one to find out
+                    which had found anything. */}
+                <p className="mt-0.5 text-sm tabular-nums text-muted-foreground">
+                  {formatDate(h.date)}
+                  {h.status === "completed" && (
+                    <>
+                      {" · "}
+                      <span className={h.matchCount > 0 ? "font-medium text-foreground" : undefined}>
+                        {h.matchCount.toLocaleString()}{" "}
+                        {h.matchCount === 1 ? "match" : "matches"}
+                      </span>
+                      {" "}
+                      <span className="text-muted-foreground">
+                        of {h.scoredCount.toLocaleString()} scored
+                      </span>
+                    </>
+                  )}
+                </p>
+              </Link>
+
+              <RunOutcome
+                status={h.status}
+                matchCount={h.matchCount}
+                topConfidence={h.topConfidence}
+              />
+
+              {/* Hidden until the row is hovered or something inside it takes focus — a
+                  delete button on every line is a column of little red targets you never
+                  asked for. focus-within keeps it reachable by keyboard. */}
+              <ConfirmButton
+                variant="ghost"
+                size="icon-sm"
+                aria-label={`Delete ${runTitle(h)}`}
+                title="Delete this comparison?"
+                description="The run and its results are removed. This cannot be undone."
+                confirmLabel="Delete"
+                isLoading={del.isPending}
+                onConfirm={() => del.mutateAsync(h.id)}
+                className="relative z-10 shrink-0 opacity-0 transition-opacity hover:text-destructive focus-visible:opacity-100 group-hover:opacity-100"
+              >
+                <Trash2 className="h-4 w-4" />
+              </ConfirmButton>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+

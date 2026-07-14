@@ -11,7 +11,7 @@ const optionalUrl = z.string().url().or(z.literal('')).optional();
 
 const EnvSchema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
-  PORT: z.coerce.number().int().positive().default(8080),
+  PORT: z.coerce.number().int().positive().default(4000),
 
   // DB engine. Prefer a Postgres DATABASE_URL; DB_ENGINE can force a specific pool
   // (the sqldb extension's SQLite pools are retained for its own tests).
@@ -24,20 +24,76 @@ const EnvSchema = z.object({
 
   UPLOAD_DIR: z.string().default('uploads'),
 
-  // External matcher webhooks. Optional here — the app fails loudly per-request if a
-  // needed one is missing, rather than refusing to boot.
+  // External *ingestion* webhooks, still used by /:id/send-webhook. Optional here — the
+  // app fails loudly per-request if a needed one is missing, rather than refusing to boot.
   COMPANY_WEBHOOK_URL: optionalUrl,
   FACEBOOK_WEBHOOK_URL: optionalUrl,
-  COMPARE_WEBHOOK_URL: optionalUrl,
+
+  // ── Which matcher runs ────────────────────────────────────────────────────
+  // Off (the default): NameSync scores names itself, in Postgres (matcher.service), and a
+  // compare run finishes inside the request that started it. An import is just an import.
+  //
+  // On: the external workflow is the matcher. An import also *starts a run* — its rows land
+  // at status='processing', a `comparison` is opened for them, and the workflow stamps each
+  // row 'match'/'unmatch' and writes the pairs into comparison_result directly in Postgres.
+  // NameSync finds out by polling its own tables; there is no callback. See docs/EXTERNAL-MATCHER.md.
+  //
+  // A flag rather than a replacement because the two matchers disagree about *when* an
+  // answer exists — one returns it, the other is waited on — and that difference reaches all
+  // the way into the UI. Both paths stay live so this can be turned off again without a deploy.
+  EXTERNAL_MATCHER: z.string().optional(),
   // Public base URL external services POST results back to. Must be absolute http(s);
   // otherwise the server derives it from the incoming request.
   WEBHOOK_CALLBACK_URL_BASE: z.string().optional(),
 
   // Shared secret guarding /api/callbacks/* and destructive /all endpoints (auth-lite).
   CALLBACK_TOKEN: z.string().optional(),
+
+  // ── Auth ──────────────────────────────────────────────────────────────────
+  // NameSync signs people in itself: a password against `app_user`, then an opaque
+  // session token in an httpOnly cookie (lib/session.ts). There is nothing to configure
+  // for it to work — no secret, no issuer, no JWKS — because there is no external issuer
+  // to agree with any more. What is left is cookie policy and how long a session lasts.
+  //
+  // How long a session survives without activity. It slides on use, so this is an
+  // idle timeout, not a hard cap. 168h = 7 days.
+  SESSION_TTL_HOURS: z.coerce.number().positive().max(8760).default(168),
+  AUTH_COOKIE_NAME: z.string().default('namesync_session'),
+  // `lax` is right whenever the site and the API share a registrable domain — including
+  // localhost:3000 -> localhost:4000, because the port is not part of the "site". Only a
+  // genuinely cross-site deployment needs `none`, and the browser then requires Secure.
+  AUTH_COOKIE_SAMESITE: z.enum(['lax', 'strict', 'none']).default('lax'),
+  // Defaults to true in production and false elsewhere (a Secure cookie is dropped over
+  // plain http, which would make local dev impossible to sign in to).
+  AUTH_COOKIE_SECURE: z
+    .enum(['true', 'false'])
+    .transform((v) => v === 'true')
+    .optional(),
+  // Set only to share the cookie across subdomains (e.g. `.example.com`).
+  AUTH_COOKIE_DOMAIN: z.string().optional(),
+  // Dev/test escape hatch: skip auth entirely and treat every request as a local admin.
+  // Refused in production.
+  AUTH_DISABLED: z.string().optional(),
+
+  // Optional read-only connection for the SQL console. Falls back to DATABASE_URL,
+  // which is still safe (read-only transaction), but a role that physically cannot
+  // write is the stronger guarantee.
+  DATABASE_URL_READONLY: z.string().optional(),
+  // Server-side cap on a SQL console query.
+  SQL_CONSOLE_TIMEOUT_MS: z.coerce.number().int().positive().max(60_000).default(5_000),
+  SQL_CONSOLE_MAX_ROWS: z.coerce.number().int().positive().max(10_000).default(1_000),
 });
 
 export type Env = z.infer<typeof EnvSchema>;
+
+/** A flag, not a value: any non-empty, non-"false"/"0" string turns it on. */
+const isFlagOn = (raw: string | undefined): boolean => {
+  const v = raw?.trim().toLowerCase();
+  return !!v && v !== 'false' && v !== '0';
+};
+
+/** AUTH_DISABLED is a flag, not a value: any non-empty, non-"false"/"0" string turns it on. */
+export const isAuthDisabled = (e: Pick<Env, 'AUTH_DISABLED'>): boolean => isFlagOn(e.AUTH_DISABLED);
 
 function loadEnv(): Env {
   const parsed = EnvSchema.safeParse(process.env);
@@ -58,6 +114,24 @@ function loadEnv(): Env {
   if (isProd && !env.DATABASE_URL && env.DB_ENGINE !== 'sqlite-file' && env.DB_ENGINE !== 'sqlite-mem') {
     missing.push('DATABASE_URL (required in production Postgres)');
   }
+  // Auth must be real in production: no silent open door, and no opt-out. There is
+  // nothing else to require — the app is its own issuer now, so there is no shared secret
+  // to forget to set, which is one whole class of misconfiguration deleted.
+  if (isProd && isAuthDisabled(env)) {
+    missing.push('AUTH_DISABLED must not be set in production (it turns auth off entirely)');
+  }
+  // A SameSite=None cookie without Secure is silently DROPPED by every current browser —
+  // so this misconfiguration would present as "login succeeds, then nothing is signed in".
+  // Fail at boot with the reason instead of at 2am with the symptom.
+  // Checked against the *effective* value, since AUTH_COOKIE_SECURE defaults to `isProd`
+  // when unset — so SameSite=none in dev is broken even though nobody set it to false.
+  const cookieSecure = env.AUTH_COOKIE_SECURE ?? isProd;
+  if (env.AUTH_COOKIE_SAMESITE === 'none' && !cookieSecure) {
+    missing.push('AUTH_COOKIE_SECURE=true is required when AUTH_COOKIE_SAMESITE=none (browsers drop the cookie otherwise)');
+  }
+  if (isProd && env.AUTH_COOKIE_SECURE === false) {
+    missing.push('AUTH_COOKIE_SECURE=false is refused in production (it would send the session cookie over plain http)');
+  }
   if (missing.length > 0) {
     // eslint-disable-next-line no-console
     console.error('Missing required environment for production:\n' + missing.map((m) => `  - ${m}`).join('\n'));
@@ -77,3 +151,11 @@ export const corsOrigins: string[] = (env.CORS_ORIGIN ?? '')
 
 export const isProduction = env.NODE_ENV === 'production';
 export const isTest = env.NODE_ENV === 'test';
+
+/**
+ * Is the external workflow the matcher?
+ *
+ * Read this rather than `env.EXTERNAL_MATCHER` — it is the difference between an import that
+ * finishes when the request returns and one that finishes when a workflow says so.
+ */
+export const isExternalMatcher = (): boolean => isFlagOn(env.EXTERNAL_MATCHER);

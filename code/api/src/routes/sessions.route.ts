@@ -8,7 +8,7 @@ import {
   SessionDetailSchema,
   LatestSessionSchema,
 } from "@extensions/contract";
-import { UploadSessionModel } from "../models/upload-session.model";
+import { UploadModel } from "../models/upload.model";
 import { NotFound } from "../lib/errors";
 import { ok } from "../lib/http";
 
@@ -24,7 +24,7 @@ export default async function sessionsRoutes(fastify: FastifyInstance): Promise<
     "/",
     { schema: { response: { 200: apiSuccess(z.array(SessionSummarySchema)) } } },
     async () => {
-      const sessions = await UploadSessionModel.findAvailableSessions();
+      const sessions = await UploadModel.findAvailableSessions();
       const data = sessions
         .filter((s) => s.status === "completed" && s.name)
         .map((s) => ({
@@ -42,7 +42,7 @@ export default async function sessionsRoutes(fastify: FastifyInstance): Promise<
     "/latest",
     { schema: { response: { 200: apiSuccess(LatestSessionSchema) } } },
     async () => {
-      const s = await UploadSessionModel.findLatestCompareable();
+      const s = await UploadModel.findLatestCompareable();
       return ok(s ? { id: s.id, status: s.status ?? "" } : null);
     }
   );
@@ -51,7 +51,7 @@ export default async function sessionsRoutes(fastify: FastifyInstance): Promise<
     "/:id",
     { schema: { params: IdParamSchema, response: { 200: apiSuccess(SessionDetailSchema) } } },
     async (req) => {
-      const s = await UploadSessionModel.findById(req.params.id);
+      const s = await UploadModel.findById(req.params.id);
       if (!s) throw new NotFound("Session not found");
       return ok({
         id: s.id,

@@ -1,5 +1,19 @@
 import { API_BASE_URL } from "@/app/utils/config";
+import { notifyUnauthorized } from "@/lib/auth/session";
 import type {
+  AuthSessionData,
+  AuthUser,
+  ChangePasswordBody,
+  CreateUserBody,
+  LoginBody,
+  CreateSavedQueryBody,
+  DbRow,
+  DbTablesData,
+  DeletedData,
+  SavedQueryRow,
+  SqlResult,
+  TableQueryBody,
+  UpdateSavedQueryBody,
   CreateComparisonData,
   RunComparisonData,
   ResultsData,
@@ -9,14 +23,13 @@ import type {
   SessionSummary,
   SessionDetail,
   LatestSession,
-  HistoryListItem,
-  HistoryDetail,
-  CreateHistoryData,
-  CloneHistoryData,
-  CreateHistoryBody,
-  UploadHistoryRow,
-  CreateUploadHistoryBody,
+  UploadPreview,
   TriggerCompareData,
+  ComparisonListItem,
+  ComparisonProgress,
+  RunRow,
+  RunRowsQuery,
+  RenameComparisonBody,
   SendWebhookData,
   DataStats,
   SourceType,
@@ -40,6 +53,13 @@ export class ApiError extends Error {
 
 type Envelope<T> = { success: true; message?: string; data: T };
 type Paginated<T> = { success: true; data: T[]; pagination: Pagination };
+
+/** Which page of a run's rows, and which status bucket. Mirrors RunRowsQuerySchema. */
+export type RunRowsParams = {
+  page?: number;
+  limit?: number;
+  filter?: RunRowsQuery["filter"];
+};
 
 /** Search/filter params for the upload-history and upload-session tables. */
 export type UploadListParams = {
@@ -67,7 +87,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
   let res: Response;
   try {
-    res = await fetch(`${API_BASE_URL}${path}`, { ...init, headers });
+    // `credentials: "include"` is what carries the session: the token lives in an httpOnly
+    // cookie the browser attaches itself, so no bearer header is built here any more —
+    // there is nothing for this code to read, which is exactly the security property.
+    // (The API sets CORS `credentials: true` and an explicit origin, as it must for this.)
+    res = await fetch(`${API_BASE_URL}${path}`, { ...init, headers, credentials: "include" });
   } catch {
     throw new ApiError("Network error — could not reach the server", 0);
   }
@@ -92,6 +116,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       (typeof record.message === "string" && record.message) ||
       (typeof record.error === "string" && record.error) ||
       `Request failed (${res.status})`;
+
+    // A 401 anywhere means the session is gone — expired, revoked, or the account was
+    // disabled. Tell the auth layer once, from the one place every request passes through,
+    // rather than making every caller remember to handle it. The login endpoint is the
+    // exception: a 401 there is "wrong password", which the form shows inline.
+    if (res.status === 401 && path !== "/auth/login") notifyUnauthorized();
+
     throw new ApiError(message, res.status, json);
   }
 
@@ -106,7 +137,39 @@ const qs = (params: Record<string, string | number | undefined>) => {
 };
 
 export const api = {
+  /**
+   * Sign-in. The session token never passes through this code: the API returns it as an
+   * httpOnly Set-Cookie, so these calls only ever carry the *user*.
+   */
+  auth: {
+    login: (body: LoginBody) =>
+      request<Envelope<AuthSessionData>>("/auth/login", { method: "POST", body: JSON.stringify(body) }).then(
+        (r) => r.data.user
+      ),
+    logout: () => request<{ success: true; message: string }>("/auth/logout", { method: "POST" }),
+    /** 401s when signed out — that is how the AuthGuard asks "is anyone there?". */
+    me: () => request<Envelope<AuthSessionData>>("/auth/me").then((r) => r.data.user),
+    changePassword: (body: ChangePasswordBody) =>
+      request<{ success: true; message: string }>("/auth/change-password", {
+        method: "POST",
+        body: JSON.stringify(body),
+      }),
+    /** Admin only. There is no public sign-up; the first admin comes from `npm run create-user`. */
+    createUser: (body: CreateUserBody) =>
+      request<Envelope<AuthUser>>("/auth/users", { method: "POST", body: JSON.stringify(body) }).then(
+        (r) => r.data
+      ),
+  },
   comparisons: {
+    /** Every run, newest first — this is "Past runs". A run is its own record; there is no
+     *  separate saved copy to keep in step with it. */
+    list: () => request<Envelope<ComparisonListItem[]>>("/comparisons").then((r) => r.data),
+    rename: (id: string, name: string) =>
+      request<Envelope<never>>(`/comparisons/${id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ name } satisfies RenameComparisonBody),
+      }),
+    remove: (id: string) => request<Envelope<never>>(`/comparisons/${id}`, { method: "DELETE" }),
     run: (form: FormData) =>
       request<Envelope<RunComparisonData>>("/comparisons/run", { method: "POST", body: form }).then((r) => r.data),
     create: (form: FormData) =>
@@ -115,6 +178,14 @@ export const api = {
       request<Envelope<CreateComparisonData>>(`/comparisons/${id}/merge`, { method: "POST", body: form }).then((r) => r.data),
     sendWebhook: (id: string) =>
       request<Envelope<SendWebhookData>>(`/comparisons/${id}/send-webhook`, { method: "POST" }).then((r) => r.data),
+    /** How far the external workflow has got. Polled while a run is in flight; also what
+     *  completes the run — see the route's comment. */
+    progress: (id: string) =>
+      request<Envelope<ComparisonProgress>>(`/comparisons/${id}/progress`).then((r) => r.data),
+    /** The run's own rows and what the workflow decided about each — the live monitor's table.
+     *  `progress` says how far along; this says which rows, and what happened to them. */
+    rows: (id: string, params: RunRowsParams) =>
+      request<Paginated<RunRow>>(`/comparisons/${id}/rows${qs({ ...params })}`),
     trigger: (id: string) =>
       request<Envelope<TriggerCompareData>>(`/comparisons/${id}/compare`, { method: "POST" }).then((r) => r.data),
     companies: () => request<Envelope<CompaniesData>>(`/comparisons/companies`).then((r) => r.data),
@@ -146,31 +217,45 @@ export const api = {
     latest: () => request<Envelope<LatestSession>>("/sessions/latest").then((r) => r.data),
     get: (id: string) => request<Envelope<SessionDetail>>(`/sessions/${id}`).then((r) => r.data),
   },
-  history: {
-    list: () => request<Envelope<HistoryListItem[]>>("/history").then((r) => r.data),
-    get: (id: string) => request<Envelope<HistoryDetail>>(`/history/${id}`).then((r) => r.data),
-    search: (params: Record<string, string>) =>
-      request<Envelope<HistoryListItem[]>>(`/history/search${qs(params)}`).then((r) => r.data),
-    create: (body: CreateHistoryBody) =>
-      request<Envelope<CreateHistoryData>>("/history", { method: "POST", body: JSON.stringify(body) }).then((r) => r.data),
-    remove: (id: string) => request<Envelope<never>>(`/history/${id}`, { method: "DELETE" }),
-    clone: (id: string) =>
-      request<Envelope<CloneHistoryData>>(`/history/${id}/clone`, { method: "POST" }).then((r) => r.data),
-  },
-  uploadHistory: {
-    bySource: (source: SourceType, page: number, limit: number) =>
-      request<Paginated<UploadHistoryRow>>(`/upload-history/by-source/${source}${qs({ page, limit })}`),
-    list: (params: UploadListParams) =>
-      request<Paginated<UploadHistoryRow>>(`/upload-history${qs(params)}`),
-    create: (body: CreateUploadHistoryBody) =>
-      request<Envelope<UploadHistoryRow>>("/upload-history", { method: "POST", body: JSON.stringify(body) }).then((r) => r.data),
-    clearSource: (source: SourceType) =>
-      request<Envelope<never>>(`/upload-history/by-source/${source}`, { method: "DELETE" }),
-  },
+  // /api/upload-history is gone — it returned these same `upload` rows under different
+  // field names, minus the status and the undo. One import, one record.
   uploadSessions: {
     list: (params: UploadListParams) =>
       request<Paginated<UploadSessionRow>>(`/upload-sessions${qs(params)}`),
     rollback: (id: string) =>
       request<Envelope<RollbackData>>(`/upload-sessions/${id}/rollback`, { method: "POST" }).then((r) => r.data),
+    /** Read a file and report what it would import. Writes nothing. */
+    preview: (form: FormData) =>
+      request<Envelope<UploadPreview>>("/upload-sessions/preview", { method: "POST", body: form }).then(
+        (r) => r.data
+      ),
+  },
+  /** The Database console — row editor, read-only SQL, saved queries. */
+  db: {
+    tables: () => request<Envelope<DbTablesData>>("/db/tables").then((r) => r.data),
+    // POST, not GET: the filter list travels as JSON rather than a query string.
+    queryRows: (table: string, body: TableQueryBody) =>
+      request<Paginated<DbRow>>(`/db/tables/${table}/query`, { method: "POST", body: JSON.stringify(body) }),
+    insertRow: (table: string, values: DbRow) =>
+      request<Envelope<DbRow>>(`/db/tables/${table}/rows`, {
+        method: "POST",
+        body: JSON.stringify({ values }),
+      }).then((r) => r.data),
+    updateRow: (table: string, id: string, values: DbRow) =>
+      request<Envelope<DbRow>>(`/db/tables/${table}/rows/${id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ values }),
+      }).then((r) => r.data),
+    deleteRow: (table: string, id: string) =>
+      request<Envelope<DeletedData>>(`/db/tables/${table}/rows/${id}`, { method: "DELETE" }).then((r) => r.data),
+    runSql: (sql: string) =>
+      request<Envelope<SqlResult>>("/db/sql", { method: "POST", body: JSON.stringify({ sql }) }).then((r) => r.data),
+    savedQueries: () => request<Envelope<SavedQueryRow[]>>("/db/saved-queries").then((r) => r.data),
+    saveQuery: (body: CreateSavedQueryBody) =>
+      request<Envelope<SavedQueryRow>>("/db/saved-queries", { method: "POST", body: JSON.stringify(body) }).then((r) => r.data),
+    updateSavedQuery: (id: string, body: UpdateSavedQueryBody) =>
+      request<Envelope<SavedQueryRow>>(`/db/saved-queries/${id}`, { method: "PATCH", body: JSON.stringify(body) }).then((r) => r.data),
+    deleteSavedQuery: (id: string) =>
+      request<Envelope<DeletedData>>(`/db/saved-queries/${id}`, { method: "DELETE" }).then((r) => r.data),
   },
 };

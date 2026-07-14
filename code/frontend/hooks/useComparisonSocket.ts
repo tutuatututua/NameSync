@@ -58,7 +58,13 @@ export function useComparisonSocket(sessionId: string | null, opts: Options = {}
     setStatus("polling");
     pollRef.current = setInterval(async () => {
       try {
-        const res = await fetch(`${API_BASE_URL}/comparisons/${sid}/results`);
+        // `credentials: "include"` is not optional here. The session is an httpOnly cookie and
+        // the API is a different origin (:3000 -> :4000), so fetch's default `same-origin` mode
+        // sends nothing, the API answers 401, and the `!res.ok` below swallows it — silently,
+        // every three seconds, forever. This is the socket's last resort; it has to actually work.
+        const res = await fetch(`${API_BASE_URL}/comparisons/${sid}/results`, {
+          credentials: "include",
+        });
         if (!res.ok) return;
         const json = await res.json();
         if (json?.data?.status === "completed") {

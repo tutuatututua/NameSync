@@ -1,6 +1,6 @@
 # NameSync
 
-Upload **Company data** (CSV) and **Facebook friends** (JSON), forward both to an external
+Upload **Company data** and **Facebook friends** (both `.xlsx`), forward both to an external
 name-matching service, watch progress live over WebSocket, and review **confidence-scored
 name matches** — with history and saved comparisons.
 
@@ -24,11 +24,11 @@ The external matcher is reached via webhooks; it POSTs results back (in batches)
 cd code
 # Provide secrets/config via env or a .env file next to docker-compose.yml:
 #   POSTGRES_PASSWORD, CORS_ORIGIN, COMPANY_WEBHOOK_URL, FACEBOOK_WEBHOOK_URL,
-#   COMPARE_WEBHOOK_URL, WEBHOOK_CALLBACK_URL_BASE, CALLBACK_TOKEN
+#   WEBHOOK_CALLBACK_URL_BASE, CALLBACK_TOKEN
 docker compose up --build
 ```
 
-- Frontend → http://localhost:3000  ·  API → http://localhost:8080  ·  API docs → http://localhost:8080/docs
+- Frontend → http://localhost:3000  ·  API → http://localhost:4000  ·  API docs → http://localhost:4000/docs
 - Postgres is provisioned automatically; the API migrates then serves.
 
 ## Local development
@@ -40,7 +40,7 @@ docker compose up -d postgres          # Postgres on host port 55432
 cp api/.env.example api/.env           # then fill in webhook URLs; keep DATABASE_URL
 
 npm --prefix api run migrate           # apply migrations
-npm --prefix api run dev               # API on :8080 (tsx watch)
+npm --prefix api run dev               # API on :4000 (tsx watch)
 npm --prefix frontend run dev          # Frontend on :3000
 ```
 

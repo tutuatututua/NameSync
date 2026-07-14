@@ -31,7 +31,7 @@ WORKDIR /app/api
 
 ENV NODE_ENV=production \
     DB_ENGINE=postgres \
-    PORT=8080 \
+    PORT=4000 \
     UPLOAD_DIR=/data/uploads
 # DATABASE_URL is supplied at runtime (docker-compose / deploy env), not baked in.
 
@@ -47,7 +47,7 @@ COPY --from=builder /app/api /app/api
 RUN mkdir -p /data && chown node:node /data
 USER node
 
-EXPOSE 8080
+EXPOSE 4000
 # Run via tsx (transpile on the fly): the sqldb/contract extensions are consumed
 # as TS source, so there is no compiled dist to `node` directly. Migrate first
 # (idempotent), then exec the server so it receives SIGTERM for graceful shutdown.

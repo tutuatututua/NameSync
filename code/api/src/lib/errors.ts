@@ -39,6 +39,19 @@ export class NotFound extends AppError {
   }
 }
 
+export class Conflict extends AppError {
+  constructor(message = "Conflict") {
+    super(message, 409, "CONFLICT");
+  }
+}
+
+/** Raised by the sign-in throttle (services/auth.service.ts). */
+export class TooManyRequests extends AppError {
+  constructor(message = "Too Many Requests") {
+    super(message, 429, "TOO_MANY_REQUESTS");
+  }
+}
+
 export class Upstream extends AppError {
   constructor(message = "Upstream service error") {
     super(message, 502, "UPSTREAM");

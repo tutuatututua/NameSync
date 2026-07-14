@@ -1,8 +1,10 @@
-import { execSync } from "node:child_process";
+import { promises as fs } from "node:fs";
+import path from "node:path";
 import { Client } from "pg";
 
 const DATABASE_URL =
   process.env.TEST_DATABASE_URL || "postgres://namesync:namesync@localhost:55432/namesync_test";
+const SCHEMA = process.env.DB_SCHEMA || "lakeshore";
 
 /** Create the test database if it doesn't exist yet (CREATE DATABASE can't run in a tx). */
 async function ensureDatabase(url: string): Promise<void> {
@@ -19,14 +21,19 @@ async function ensureDatabase(url: string): Promise<void> {
 }
 
 /**
- * Runs once before the suite: ensure the test DB exists, then migrate it in a child
- * tsx process (tsx can dynamic-import the migration files by absolute path, which
- * Vitest's own ESM loader cannot on Windows `c:\` paths).
+ * Runs once before the suite: ensure the test DB exists, then (re)apply the
+ * lakeshore schema from docs/schema-redesign.sql. The file is idempotent — it drops
+ * and recreates its tables — so a fresh, empty schema is guaranteed each run.
+ * (The app's on-boot migrator is disabled via DB_SKIP_MIGRATE; the schema is
+ * managed by this SQL, not the old migrations.)
  */
 export default async function setup(): Promise<void> {
   await ensureDatabase(DATABASE_URL);
-  execSync("npx tsx src/migrate.ts", {
-    stdio: "inherit",
-    env: { ...process.env, DATABASE_URL },
-  });
+  const sql = await fs.readFile(path.resolve(process.cwd(), "docs/schema-redesign.sql"), "utf8");
+
+  const client = new Client({ connectionString: DATABASE_URL });
+  await client.connect();
+  await client.query(`CREATE SCHEMA IF NOT EXISTS ${SCHEMA}`);
+  await client.query(sql);
+  await client.end();
 }

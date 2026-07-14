@@ -14,12 +14,14 @@ import {
 import { DBModel } from "@extensions/sqldb";
 import { corsOrigins, isProduction, isTest } from "./config/env";
 import { AppError } from "./lib/errors";
+import { registerAuth } from "./plugins/auth";
+import { closeSqlConsolePool } from "./services/sql-console.service";
+import authRoutes from "./routes/auth.route";
+import dbRoutes from "./routes/db.route";
 import healthRoutes from "./routes/health.route";
 import comparisonsRoutes from "./routes/comparisons.route";
 import callbacksRoutes from "./routes/callbacks.route";
 import sessionsRoutes from "./routes/sessions.route";
-import historyRoutes from "./routes/history.route";
-import uploadHistoryRoutes from "./routes/upload-history.route";
 import uploadSessionsRoutes from "./routes/upload-sessions.route";
 import wsRoutes from "./routes/ws.route";
 
@@ -63,7 +65,13 @@ export async function buildApp(): Promise<FastifyInstance> {
   await DBModel.getPool();
   app.addHook("onClose", async () => {
     await DBModel.closePool();
+    await closeSqlConsolePool(); // the SQL console keeps its own read-only pool
   });
+
+  // Global session guard (public allowlist inside). Registered before the routes so it
+  // covers all of them. NameSync issues its own sessions now — there is no external JWT
+  // to verify — so this is on by default and only AUTH_DISABLED (dev/test) turns it off.
+  registerAuth(app);
 
   app.setErrorHandler((err: FastifyError, req, reply) => {
     if (hasZodFastifySchemaValidationErrors(err)) {
@@ -85,12 +93,17 @@ export async function buildApp(): Promise<FastifyInstance> {
   });
 
   await app.register(healthRoutes, { prefix: "/api" });
+  await app.register(authRoutes, { prefix: "/api/auth" });
   await app.register(comparisonsRoutes, { prefix: "/api/comparisons" });
   await app.register(callbacksRoutes, { prefix: "/api/callbacks" });
   await app.register(sessionsRoutes, { prefix: "/api/sessions" });
-  await app.register(historyRoutes, { prefix: "/api/history" });
-  await app.register(uploadHistoryRoutes, { prefix: "/api/upload-history" });
+  // /api/history is gone: "Past runs" now lists the runs themselves (GET /api/comparisons).
+  // A run is already immutable, so the saved-snapshot table was a second copy of the same
+  // data in a second shape — and the two drifted. One run, one record.
+  // /api/upload-history is gone too: it served the same `upload` rows as /api/upload-sessions,
+  // renamed and with status+undo dropped. One import, one record.
   await app.register(uploadSessionsRoutes, { prefix: "/api/upload-sessions" });
+  await app.register(dbRoutes, { prefix: "/api/db" });
   await app.register(wsRoutes);
 
   return app;

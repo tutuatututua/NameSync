@@ -14,7 +14,7 @@ Monorepo `fx-generated` — see `README.md` for full details.
 - @extensions/sqldb@^1.0.0 (Kysely pool)
 - fastify@^5, fastify-type-provider-zod@^4, zod@^3
 - @fastify/cors, @fastify/multipart, @fastify/websocket, @fastify/swagger, @fastify/swagger-ui
-- kysely@^0.27, pg@^8, csv-parse@^6, dotenv@^16, ws@^8
+- kysely@^0.27, pg@^8, exceljs@^4 (.xlsx uploads), dotenv@^16, ws@^8
 - dev: vitest, tsx, form-data, pino-pretty, typescript@^5
 
 ## `frontend/`

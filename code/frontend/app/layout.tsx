@@ -25,8 +25,20 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" suppressHydrationWarning>
-      <body className={`${sans.variable} ${mono.variable} ${thai.variable} antialiased`}>
+    // The font variables belong on <html>, not <body>.
+    //
+    // Tailwind's preflight sets `html { font-family: var(--font-sans), … }`. next/font
+    // defines --font-sans through a generated class, and while that class sat on <body> the
+    // variable did not exist at <html> — so the declaration was invalid, the browser fell
+    // back to its default, and every piece of unstyled body text in this app rendered in
+    // Times New Roman. Only nodes carrying an explicit font-* utility escaped, because they
+    // resolved the variable from inside <body>. Hoisting the classes one level up fixes it.
+    <html
+      lang="en"
+      className={`${sans.variable} ${mono.variable} ${thai.variable}`}
+      suppressHydrationWarning
+    >
+      <body className="antialiased">
         <ThemeProvider attribute="class" defaultTheme="system" enableSystem disableTransitionOnChange>
           <Providers>{children}</Providers>
           <Toaster />

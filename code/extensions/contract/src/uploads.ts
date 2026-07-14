@@ -27,6 +27,17 @@ export const UploadSessionRowSchema = z.object({
   duplicate_records: z.number().nullable(),
   status: z.string().nullable(),
   created_at: z.string().nullable(),
+  /**
+   * The run this import started, when it started one (EXTERNAL_MATCHER only — an import made
+   * by the internal matcher compares nothing and opens no run, so this is null).
+   *
+   * It is here so the Uploads table can link a row to the run that is matching it. Without it
+   * an import stuck on "Processing" is a dead end: the page tells you something is happening
+   * and gives you no way to go and look at it — and the run page is not just where you *watch*
+   * the work, it is the thing that *finishes* it (the progress poll is what completes a run),
+   * so an unreachable run is also an uncompletable one.
+   */
+  comparison_id: z.string().nullable(),
 });
 export type UploadSessionRow = z.infer<typeof UploadSessionRowSchema>;
 
@@ -38,6 +49,49 @@ export const RollbackDataSchema = z.object({
   facebookDeleted: z.number(),
 });
 export type RollbackData = z.infer<typeof RollbackDataSchema>;
+
+// ── Import preview ──────────────────────────────────────────────────────────
+/**
+ * POST /api/upload-sessions/preview — what a file *would* import, without importing it.
+ *
+ * The server answers this by running the file through the same reader the import uses
+ * (api/src/services/file-parser.service.ts), so what you see here is what you get. Nothing
+ * is written to the database and the temp file is deleted before the response is sent.
+ */
+
+/** One target column, and the header in the file that supplies it (null = the file has none). */
+export const ColumnMappingSchema = z.object({
+  /** The database column, e.g. person_name_th. */
+  target: z.string(),
+  /** How it reads in the UI, e.g. "Thai name". */
+  label: z.string(),
+  /** The header found in the uploaded file, or null if nothing matched. */
+  sourceColumn: z.string().nullable(),
+  /**
+   * This column is a person's name, so it is cleaned on import (titles, suffixes,
+   * nicknames and middle names removed) and each sample row carries a `<target>_clean`
+   * key beside the raw one. The preview shows both — the raw name is what the file said,
+   * the clean name is what will be matched and displayed. Both are stored.
+   */
+  cleaned: z.boolean().optional(),
+});
+export type ColumnMapping = z.infer<typeof ColumnMappingSchema>;
+
+export const UploadPreviewSchema = z.object({
+  kind: z.enum(['company', 'facebook']),
+  fileName: z.string(),
+  totalRows: z.number(),
+  /** Every column/key found in the file. */
+  sourceColumns: z.array(z.string()),
+  /** Columns the file has that nothing maps to — the import will drop them. */
+  ignoredColumns: z.array(z.string()),
+  mapping: z.array(ColumnMappingSchema),
+  /** The first few rows, already mapped to the target columns. */
+  sampleRows: z.array(z.record(z.string().nullable())),
+  /** Things worth knowing before committing — an unmatched column, blank rows. Not errors. */
+  warnings: z.array(z.string()),
+});
+export type UploadPreview = z.infer<typeof UploadPreviewSchema>;
 
 /** GET /api/comparisons/companies — distinct companies to compare against. */
 export const CompaniesDataSchema = z.object({

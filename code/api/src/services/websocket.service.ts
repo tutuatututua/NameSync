@@ -58,6 +58,11 @@ export class WebSocketService {
     });
   }
 
+  /** Send to one socket, not the session — used to replay a run's terminal state on connect. */
+  static sendTo(socket: WebSocket, message: WsServerMessage): void {
+    this.send(socket, message);
+  }
+
   private static send(socket: WebSocket, message: WsServerMessage): void {
     if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
   }

@@ -8,17 +8,19 @@ import { Kysely } from "kysely";
  *  - extra        JSON blob of any non-standard fields from the callback payload.
  */
 export async function up(db: Kysely<any>): Promise<void> {
+  // SQLite only allows one ADD COLUMN per ALTER TABLE statement, so run each separately.
   await db.schema
     .alterTable("comparison_results")
     .addColumn("upload_name", "varchar(255)")
+    .execute();
+  await db.schema
+    .alterTable("comparison_results")
     .addColumn("extra", "text")
     .execute();
 }
 
 export async function down(db: Kysely<any>): Promise<void> {
-  await db.schema
-    .alterTable("comparison_results")
-    .dropColumn("upload_name")
-    .dropColumn("extra")
-    .execute();
+  // SQLite only allows one DROP COLUMN per ALTER TABLE statement, so run each separately.
+  await db.schema.alterTable("comparison_results").dropColumn("upload_name").execute();
+  await db.schema.alterTable("comparison_results").dropColumn("extra").execute();
 }

@@ -13,7 +13,6 @@
 
 import 'dotenv/config';
 import dns from 'node:dns/promises';
-import FormData from 'form-data';
 
 const TARGETS = {
   compare: {
@@ -22,15 +21,15 @@ const TARGETS = {
     sessionId: 'diag-test-session',
     body: JSON.stringify({
       session_id: 'diag-test-session',
-      callback_url: `${(process.env.WEBHOOK_CALLBACK_URL_BASE || 'http://localhost:8080').replace(/\/+$/, '')}/api/callbacks/comparison-results`,
+      callback_url: `${(process.env.WEBHOOK_CALLBACK_URL_BASE || 'http://localhost:4000').replace(/\/+$/, '')}/api/callbacks/comparison-results`,
     }),
   },
+  // The two upload webhooks take the CSV as an uploaded file (multipart, part named
+  // `file`, text/csv). A raw text/csv request body is rejected 415 by the receiver — see
+  // the note in src/services/webhook.service.ts.
   company: {
     url: process.env.COMPANY_WEBHOOK_URL,
-    multipart: {
-      filename: 'company-diag-test-session.csv',
-      contentType: 'text/csv',
-    },
+    upload: { filename: 'company-diag-test-session.csv', contentType: 'text/csv' },
     sessionId: 'diag-test-session',
     body: [
       'uuid,company_name,person_name_th,person_name_en,status,session_id',
@@ -39,10 +38,7 @@ const TARGETS = {
   },
   facebook: {
     url: process.env.FACEBOOK_WEBHOOK_URL,
-    multipart: {
-      filename: 'facebook-diag-test-session.csv',
-      contentType: 'text/csv',
-    },
+    upload: { filename: 'facebook-diag-test-session.csv', contentType: 'text/csv' },
     sessionId: 'diag-test-session',
     body: [
       'uuid,fb_name,timestamp,upload_person_name,session_id',
@@ -77,8 +73,8 @@ async function testWebhook(name, target) {
   }
 
   console.log(`  URL: ${target.url}`);
-  if (target.multipart) {
-    console.log(`  Mode: multipart/form-data (field "file", filename "${target.multipart.filename}", contentType "${target.multipart.contentType}")`);
+  if (target.upload) {
+    console.log(`  Mode: multipart/form-data — part "file", filename "${target.upload.filename}", ${target.upload.contentType}`);
   } else {
     console.log(`  Content-Type: ${target.contentType}`);
   }
@@ -97,15 +93,14 @@ async function testWebhook(name, target) {
   const start = Date.now();
 
   try {
+    // Mirrors WebhookService.postCSV: fetch derives the multipart boundary itself, so the
+    // Content-Type header is deliberately not set by hand for uploads.
     let requestHeaders;
     let requestBody;
-    if (target.multipart) {
+    if (target.upload) {
       const form = new FormData();
-      form.append('file', Buffer.from(target.body, 'utf8'), {
-        filename: target.multipart.filename,
-        contentType: target.multipart.contentType,
-      });
-      requestHeaders = { ...form.getHeaders(), 'X-Session-ID': target.sessionId };
+      form.append('file', new Blob([target.body], { type: target.upload.contentType }), target.upload.filename);
+      requestHeaders = { 'X-Session-ID': target.sessionId };
       requestBody = form;
     } else {
       requestHeaders = { 'Content-Type': target.contentType, 'X-Session-ID': target.sessionId };
@@ -140,12 +135,11 @@ async function testWebhook(name, target) {
     if (response.ok) {
       console.log(`  ✔ Webhook accepted the request.`);
     } else if (response.status === 415) {
-      const sentCt = target.multipart ? 'multipart/form-data' : target.contentType;
+      const sent = target.upload ? 'multipart/form-data' : target.contentType;
       console.log(
-        `  ⚠ 415 Unsupported Media Type — the webhook rejects the Content-Type\n` +
-          `    "${sentCt}". The API sends the same Content-Type, so response.ok is false\n` +
-          `    and the upload endpoint returns 502 Bad Gateway. FIX: confirm the receiver\n` +
-          `    accepts file uploads (multipart) on this endpoint.`
+        `  ⚠ 415 Unsupported Media Type — the webhook rejects "${sent}". The API sends the\n` +
+          `    same thing, so response.ok is false and the upload endpoint returns 502 Bad\n` +
+          `    Gateway. The receiver only parses content types it has a parser registered for.`
       );
     } else if (response.status === 404) {
       console.log(

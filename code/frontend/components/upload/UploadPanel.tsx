@@ -14,12 +14,26 @@ interface UploadPanelProps {
   title: string;
   hint?: string;
   maxSizeMB?: number;
+  /** Sizing for the drop target. The Uploads page wants a big one; the dialog doesn't. */
+  className?: string;
 }
 
-export function UploadPanel({ accept, file, onChange, title, hint, maxSizeMB = 500 }: UploadPanelProps) {
+export function UploadPanel({
+  accept,
+  file,
+  onChange,
+  title,
+  hint,
+  maxSizeMB = 500,
+  className,
+}: UploadPanelProps) {
   const [error, setError] = React.useState<string | null>(null);
   const [drag, setDrag] = React.useState(false);
   const inputRef = React.useRef<HTMLInputElement>(null);
+  // A drag over a child element fires dragleave on the parent, so a bare boolean flickers
+  // the whole target off and on as the cursor crosses the icon. Counting enter/leave pairs
+  // is the standard fix.
+  const dragDepth = React.useRef(0);
 
   const pick = (f: File | null) => {
     if (!f) {
@@ -40,15 +54,20 @@ export function UploadPanel({ accept, file, onChange, title, hint, maxSizeMB = 5
   return (
     <div>
       {file ? (
-        <div className="flex items-center gap-3 rounded-xl border bg-card p-4">
-          <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary/10 text-primary">
-            <FileText className="h-5 w-5" />
+        <div className="flex items-center gap-3 rounded-lg border bg-card p-3">
+          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border bg-muted text-muted-foreground">
+            <FileText className="h-4 w-4" />
           </div>
           <div className="min-w-0 flex-1">
             <p className="truncate font-medium">{file.name}</p>
-            <p className="text-sm text-muted-foreground">{formatFileSize(file.size)}</p>
+            <p className="text-xs tabular-nums text-muted-foreground">{formatFileSize(file.size)}</p>
           </div>
-          <Button variant="ghost" size="icon" aria-label="Remove file" onClick={() => pick(null)}>
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            aria-label="Remove file"
+            onClick={() => pick(null)}
+          >
             <X className="h-4 w-4" />
           </Button>
         </div>
@@ -56,22 +75,42 @@ export function UploadPanel({ accept, file, onChange, title, hint, maxSizeMB = 5
         <button
           type="button"
           onClick={() => inputRef.current?.click()}
-          onDragOver={(e) => {
+          onDragEnter={(e) => {
             e.preventDefault();
+            dragDepth.current += 1;
             setDrag(true);
           }}
-          onDragLeave={() => setDrag(false)}
+          onDragOver={(e) => e.preventDefault()}
+          onDragLeave={(e) => {
+            e.preventDefault();
+            dragDepth.current -= 1;
+            if (dragDepth.current <= 0) {
+              dragDepth.current = 0;
+              setDrag(false);
+            }
+          }}
           onDrop={(e) => {
             e.preventDefault();
+            dragDepth.current = 0;
             setDrag(false);
             pick(e.dataTransfer.files?.[0] ?? null);
           }}
           className={cn(
-            "flex w-full flex-col items-center gap-2 rounded-xl border-2 border-dashed p-8 text-center transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-            drag ? "border-primary bg-primary/5" : "border-input hover:border-primary/50"
+            "flex w-full flex-col items-center justify-center gap-1.5 rounded-lg border border-dashed p-8 text-center",
+            "transition-colors duration-fast ease-swift",
+            "outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-card",
+            drag
+              ? "border-primary bg-primary/5"
+              : "border-border-strong bg-muted/30 hover:border-primary/50 hover:bg-muted/60",
+            className
           )}
         >
-          <UploadCloud className="h-8 w-8 text-muted-foreground" />
+          <UploadCloud
+            className={cn(
+              "mb-1 h-6 w-6 transition-colors",
+              drag ? "text-primary" : "text-muted-foreground"
+            )}
+          />
           <span className="font-medium">{title}</span>
           {hint && <span className="text-sm text-muted-foreground">{hint}</span>}
           <span className="text-xs text-muted-foreground">Accepts {accept.join(", ")}</span>
