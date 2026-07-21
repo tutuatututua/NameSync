@@ -11,12 +11,20 @@ import { ComparisonModel } from "../src/models/comparison.model";
 let app: FastifyInstance;
 let mock: MockServer;
 
+/**
+ * N callback result items, one in every five of them a match.
+ *
+ * The verdict is stated per item because it has to be: `matching_score` is gone and an item with
+ * no `status` is recorded as `unmatch`, so a generator that left it off would build N rows and
+ * zero matches. The 1-in-5 shape is what the old `0.5 + (i % 5) * 0.1` produced once its scores
+ * were judged against the 0.8 bar, so the counts these tests assert on are unchanged.
+ */
 const results = (n: number) =>
   Array.from({ length: n }, (_, i) => ({
     fb_name: `Friend ${i}`,
     person_name_en: `Person ${i}`,
     person_name_th: `บุคคล ${i}`,
-    matching_score: 0.5 + (i % 5) * 0.1,
+    status: i % 5 === 4 ? "match" : "unmatch",
   }));
 
 beforeAll(async () => {
@@ -39,7 +47,7 @@ beforeEach(async () => {
 const CO_CSV = "company_name,thai_name,eng_name\nMCKINSEY,นพมาศ,Noppamas\nBLUEBIK,ธนา,Thana\n";
 
 describe("import (/run)", () => {
-  it("imports a company file, a facebook file, or neither", async () => {
+  it("imports a company file or a facebook file — and 400s a request with neither", async () => {
     const co = (await importCompany(app, { uploader: "Alex" })).json().data;
     expect(co.companyAdded).toBe(2);
     expect(co.facebookAdded).toBe(0);
@@ -53,10 +61,11 @@ describe("import (/run)", () => {
     expect(fb.facebookAdded).toBe(1);
     expect(fb.companyAdded).toBe(0);
 
+    // No file is not an import. Answering 200 would leave the caller believing something
+    // was recorded when nothing was.
     const none = await importCompanyRaw();
-    expect(none.statusCode).toBe(200);
-    expect(none.json().data.companyAdded).toBe(0);
-    expect(none.json().data.facebookAdded).toBe(0);
+    expect(none.statusCode).toBe(400);
+    expect(none.json().message).toMatch(/no file/i);
   });
 
   async function importCompanyRaw() {
@@ -92,6 +101,68 @@ describe("import (/run)", () => {
     const res = await importWithoutUploader("facebookFile");
     expect(res.statusCode).toBe(400);
     expect(res.json().message).toMatch(/upload user/i);
+  });
+
+  /** GET /api/upload-sessions — the import history the Uploads page renders. */
+  const uploadHistory = async (): Promise<{ id: string }[]> =>
+    (await app.inject({ method: "GET", url: "/api/upload-sessions" })).json().data;
+
+  it("400s an empty workbook and records nothing — not even history", async () => {
+    const res = await importCompany(app, { csv: "company_name,thai_name,eng_name\n" });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toMatch(/no rows/i);
+    expect(await uploadHistory()).toHaveLength(0);
+  });
+
+  it("400s a workbook whose columns match nothing — wrong structure, nothing saved", async () => {
+    // The rows are read (there are two of them) and every one comes out nameless, which is the
+    // same rejection a file with the right headers and empty name cells gets: a contact with no
+    // person's name is nothing the matcher can score.
+    const res = await importCompany(app, { csv: "foo,bar\nsome,text\nmore,text\n" });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toMatch(/person's name/i);
+    expect(await uploadHistory()).toHaveLength(0);
+  });
+
+  it("400s a company file whose rows have a company but no person — there is nothing to match on", async () => {
+    const res = await importCompany(app, { csv: "company_name,thai_name,eng_name\nAcme Co,,\nBeta Ltd,,\n" });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toMatch(/person's name/i);
+    expect(await uploadHistory()).toHaveLength(0);
+  });
+
+  it("400s a friends file whose every row is nameless", async () => {
+    // The timestamp column matched, so the rows aren't empty — but a friend without a name
+    // can never be matched, deduped or displayed.
+    const res = await importFacebook(app, { friends: [["", 1], ["", 2]], uploader: "Alex" });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toMatch(/name/i);
+    expect(await uploadHistory()).toHaveLength(0);
+  });
+
+  it("drops a nameless friend row rather than storing a NULL name", async () => {
+    const res = (await importFacebook(app, { friends: [["Somchai", 1], ["", 2]], uploader: "Alex" })).json().data;
+    expect(res.facebookAdded).toBe(1);
+
+    const all = (await app.inject({ method: "GET", url: "/api/comparisons/facebook-data/all?page=1&limit=50" })).json();
+    expect(all.pagination.total).toBe(1);
+    // Stored as the cleaner left it: lower case, and that is the only spelling there is.
+    expect(all.data[0].fb_name).toBe("somchai");
+  });
+
+  it("keeps no history row for an import whose every row was a duplicate", async () => {
+    const first = (await importCompany(app, { uploader: "Alex" })).json().data;
+    expect(first.companyAdded).toBe(2);
+
+    // The re-import is answered — added 0, duplicates 2 — but it changed nothing, so it
+    // leaves no record behind: a history of non-events reads as events.
+    const again = (await importCompany(app, { uploader: "Alex" })).json().data;
+    expect(again.companyAdded).toBe(0);
+    expect(again.companyDuplicates).toBe(2);
+
+    const history = await uploadHistory();
+    expect(history).toHaveLength(1);
+    expect(history[0].id).toBe(first.sessionId);
   });
 });
 
@@ -133,7 +204,7 @@ describe("dedup — exactly matching rows are skipped", () => {
 
   // Dedup compares the *cleaned* name, which is what makes it mean anything: the same
   // person exported twice, dressed differently, was two rows before cleaning existed.
-  it("treats two spellings of one company contact as a duplicate", async () => {
+  it("treats two spellings of one company contact as a duplicate, storing only the cleaned name", async () => {
     const first = (await importCompany(app, {
       csv: "company_name,thai_name,eng_name\nAcme Co,นายสมชาย ใจดี,Mr. Somchai Jaidee\n",
     })).json().data;
@@ -145,13 +216,15 @@ describe("dedup — exactly matching rows are skipped", () => {
     expect(second.companyAdded).toBe(0);
     expect(second.companyDuplicates).toBe(1);
 
-    // And the row that landed kept the file's own text alongside the cleaned name.
+    // And the row that landed holds the cleaned name in the name column itself. There is no
+    // `_clean` twin and no copy of the file's "Mr. Somchai Jaidee" anywhere — the import
+    // preview was the one chance to see it.
     const stored = (
       await app.inject({ method: "GET", url: "/api/comparisons/company-data/all?page=1&limit=50" })
-    ).json().data as { person_name_en: string; person_name_en_clean: string }[];
+    ).json().data as { person_name_en: string; person_name_th: string }[];
     expect(stored).toHaveLength(1);
-    expect(stored[0].person_name_en).toBe("Mr. Somchai Jaidee");
-    expect(stored[0].person_name_en_clean).toBe("Somchai Jaidee");
+    expect(stored[0].person_name_en).toBe("somchai jaidee");
+    expect(stored[0].person_name_th).toBe("สมชาย ใจดี");
   });
 
   it("treats two spellings of one friend from the same uploader as a duplicate", async () => {
@@ -165,12 +238,38 @@ describe("dedup — exactly matching rows are skipped", () => {
     expect(second.facebookDuplicates).toBe(1);
   });
 
+  // Case is now folded by the cleaner itself — "McKinsey Jaidee" and "MCKINSEY JAIDEE" are
+  // one stored string, so the dedup key has nothing left to do about case on a person's name.
+  // A company name is different: it is stored as the file spelled it, so "Acme Co" and
+  // "ACME CO" really are two strings and the key is what folds them.
+  it("treats a case-variant company contact as a duplicate", async () => {
+    const first = (await importCompany(app, {
+      csv: "company_name,thai_name,eng_name\nAcme Co,สมชาย,McKinsey Jaidee\n",
+    })).json().data;
+    expect(first.companyAdded).toBe(1);
+
+    const second = (await importCompany(app, {
+      csv: "company_name,thai_name,eng_name\nACME CO,สมชาย,MCKINSEY JAIDEE\n",
+    })).json().data;
+    expect(second.companyAdded).toBe(0);
+    expect(second.companyDuplicates).toBe(1);
+  });
+
+  it("treats a case-variant friend from the same uploader as a duplicate", async () => {
+    const first = (await importFacebook(app, { friends: [["McKinsey Jaidee", 1]], uploader: "Alice" })).json().data;
+    expect(first.facebookAdded).toBe(1);
+
+    const second = (await importFacebook(app, { friends: [["MCKINSEY JAIDEE", 2]], uploader: "Alice" })).json().data;
+    expect(second.facebookAdded).toBe(0);
+    expect(second.facebookDuplicates).toBe(1);
+  });
+
   it("keeps the same friend name from two different uploaders as separate rows", async () => {
     await importFacebook(app, { friends: [["Somchai", 1]], uploader: "Alice" });
     await importFacebook(app, { friends: [["Somchai", 2]], uploader: "Bob" });
 
     const all = (await app.inject({ method: "GET", url: "/api/comparisons/facebook-data/all?page=1&limit=50" })).json();
-    const somchai = all.data.filter((r: { fb_name: string }) => r.fb_name === "Somchai");
+    const somchai = all.data.filter((r: { fb_name: string }) => r.fb_name === "somchai");
     expect(somchai).toHaveLength(2);
     expect(new Set(somchai.map((r: { upload_person_name: string }) => r.upload_person_name))).toEqual(
       new Set(["Alice", "Bob"])
@@ -198,18 +297,14 @@ const filePart = (body: string): string => {
   return body.slice(start + 4, end);
 };
 
-describe("send-webhook (ingestion)", () => {
+describe("ingestion webhook — the import forwards itself", () => {
   const sendWebhook = (id: string) =>
     app.inject({ method: "POST", url: `/api/comparisons/${id}/send-webhook` });
 
-  it("forwards a company import as a CSV file part", async () => {
+  it("forwards a company import as a CSV file part, inside the import request", async () => {
     const id = (await importCompany(app, { csv: CO_CSV, uploader: "Alex" })).json().data.sessionId;
 
-    const res = await sendWebhook(id);
-    expect(res.statusCode, res.body).toBe(200);
-    expect(res.json().data.companyRecordsCount).toBe(2);
-    expect(res.json().data.facebookRecordsCount).toBe(0);
-
+    // No second request: /run handed the rows over before it responded.
     expect(mock.state.company).toHaveLength(1);
     expect(mock.state.facebook).toHaveLength(0);
     const hit = mock.state.company[0];
@@ -219,23 +314,29 @@ describe("send-webhook (ingestion)", () => {
     expect(hit.body).toContain('name="file"');
     expect(hit.body).toContain(`filename="company-${id}.csv"`);
     expect(hit.body).toContain("Content-Type: text/csv");
+    // The upload id, under its own name and the legacy one; and how big the job is,
+    // without parsing the file.
+    expect(hit.headers["x-upload-id"]).toBe(id);
+    expect(hit.headers["x-session-id"]).toBe(id);
+    expect(hit.headers["x-row-count"]).toBe("2");
 
     const lines = filePart(hit.body).trim().split("\n");
     // `comparison_id` is the run the external workflow writes its results into. Empty here:
-    // the internal matcher is on in tests, so this import started no run.
+    // the internal matcher is on in tests, so this import started no run. There is one column
+    // per name and it carries the cleaned spelling — the `_clean` twins the workflow used to
+    // be told to match on are gone, so it matches on the name it is handed.
     expect(lines[0]).toBe(
-      "uuid,company_name,person_name_th,person_name_en,status,session_id,comparison_id"
+      "uuid,company_name,person_name_th,person_name_en,upload_person_name,status,session_id,comparison_id"
     );
     expect(lines).toHaveLength(3); // header + the 2 imported rows
-    expect(lines[1]).toContain("MCKINSEY");
+    expect(lines[1]).toContain("MCKINSEY"); // the company keeps its case
+    expect(lines[1]).toContain("noppamas"); // the person does not
+    expect(lines[1]).toContain("Alex"); // upload_person_name column
     expect(lines[1]).toContain(id); // session_id column
   });
 
   it("forwards a facebook import as a CSV file part", async () => {
     const id = (await importFacebook(app, { friends: [["Somchai", 1]], uploader: "Alice" })).json().data.sessionId;
-
-    const res = await sendWebhook(id);
-    expect(res.json().data.facebookRecordsCount).toBe(1);
 
     expect(mock.state.facebook).toHaveLength(1);
     const hit = mock.state.facebook[0];
@@ -244,22 +345,48 @@ describe("send-webhook (ingestion)", () => {
     expect(hit.body).toContain("Content-Type: text/csv");
 
     const lines = filePart(hit.body).trim().split("\n");
-    expect(lines[0]).toBe(
-      "uuid,fb_name,timestamp,upload_person_name,status,session_id,comparison_id"
-    );
-    expect(lines[1]).toContain("Somchai");
+    // No `fb_name_clean` twin, and no `timestamp`: the friend row is a name, an uploader and
+    // a status, which is all anything downstream ever read.
+    expect(lines[0]).toBe("uuid,fb_name,upload_person_name,status,session_id,comparison_id");
+    expect(lines[1]).toContain("somchai");
     expect(lines[1]).toContain("Alice");
   });
 
-  it("quotes a field containing a comma rather than splitting the row", async () => {
-    const id = (await importCompany(app, {
-      csv: 'company_name,thai_name,eng_name\n"Acme, Inc.",สมชาย,Somchai\n',
-    })).json().data.sessionId;
+  it("forwards only the NEW rows of a partly-duplicate import", async () => {
+    await importCompany(app, { csv: "company_name,thai_name,eng_name\nAcme Co,สมชาย,Somchai\n" });
+    mock.state.company.length = 0;
 
-    await sendWebhook(id);
+    await importCompany(app, {
+      csv: "company_name,thai_name,eng_name\nAcme Co,สมชาย,Somchai\nAcme Co,อนงค์,Anong\n",
+    });
+
+    // One row, not two: the duplicate was dropped at import, and the workflow is handed
+    // exactly what landed.
+    const lines = filePart(mock.state.company[0].body).trim().split("\n");
+    expect(lines).toHaveLength(2);
+    expect(lines[1]).toContain("anong");
+    expect(mock.state.company[0].headers["x-row-count"]).toBe("1");
+  });
+
+  it("quotes a field containing a comma rather than splitting the row", async () => {
+    await importCompany(app, {
+      csv: 'company_name,thai_name,eng_name\n"Acme, Inc.",สมชาย,Somchai\n',
+    });
+
     const lines = filePart(mock.state.company[0].body).trim().split("\n");
     expect(lines).toHaveLength(2);
     expect(lines[1]).toContain('"Acme, Inc."');
+  });
+
+  it("re-sends an import's rows on demand — the manual retry", async () => {
+    const id = (await importCompany(app, { csv: CO_CSV, uploader: "Alex" })).json().data.sessionId;
+    mock.state.company.length = 0;
+
+    const res = await sendWebhook(id);
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json().data.companyRecordsCount).toBe(2);
+    expect(res.json().data.facebookRecordsCount).toBe(0);
+    expect(mock.state.company).toHaveLength(1);
   });
 
   it("404s an unknown import and sends nothing", async () => {
@@ -282,21 +409,28 @@ describe("compare flow (scored against Postgres, no external matcher)", () => {
     const res = await app.inject({ method: "GET", url: `/api/comparisons/${id}/results` });
     expect(res.statusCode).toBe(200);
     expect(res.json().data.status).toBe("completed");
-    expect(res.json().data.selectedCompany).toBe("Acme Co");
+    expect(res.json().data.selectedCompanies).toEqual(["Acme Co"]);
 
     // One row per friend: each friend keeps only its best match at the company.
     expect(res.json().data.rowCount).toBe(2);
 
-    const rows = res.json().data.results as { fb_name: string; person_name_en: string; matching_score: number }[];
-    const somchai = rows.find((r) => r.fb_name === "Somchai")!;
-    // "Somchai" is Acme Co's only contact and an exact match, so it scores 1.
-    expect(somchai.person_name_en).toBe("Somchai");
-    expect(somchai.matching_score).toBe(1);
+    // Both sides of a result row are the cleaned, lower-cased names: they are the only
+    // spelling stored, so they are what was scored and what the row shows.
+    //
+    // Asserted on `status` rather than on a score, because the score is no longer stored — the
+    // matcher computes it, decides with it and keeps the verdict. Which means these assertions
+    // are now coarser than they read: "matched" no longer distinguishes an exact hit from one
+    // that scraped over the bar, and nothing in the payload can.
+    const rows = res.json().data.results as { fb_name: string; person_name_en: string; status: string }[];
+    const somchai = rows.find((r) => r.fb_name === "somchai")!;
+    // "Somchai" is Acme Co's only contact and an exact match.
+    expect(somchai.person_name_en).toBe("somchai");
+    expect(somchai.status).toBe("match");
 
     // "Anong" belongs to Beta Ltd, which this run did not select — she can only be
-    // scored against Acme Co's contacts, and so scores near zero rather than matching.
-    const anong = rows.find((r) => r.fb_name === "Anong")!;
-    expect(anong.matching_score).toBeLessThan(0.4);
+    // scored against Acme Co's contacts, and so matches nobody.
+    const anong = rows.find((r) => r.fb_name === "anong")!;
+    expect(anong.status).toBe("unmatch");
   });
 
   it("attributes each result to the uploader who contributed the friend", async () => {
@@ -331,16 +465,78 @@ describe("company-selection compare", () => {
 
     const id = await startCompare(app, "MCKINSEY");
     const res = await app.inject({ method: "GET", url: `/api/comparisons/${id}/results` });
-    expect(res.json().data.selectedCompany).toBe("MCKINSEY");
+    expect(res.json().data.selectedCompanies).toEqual(["MCKINSEY"]);
 
     // MCKINSEY's only contact is Noppamas, so she matches exactly and Thana (BLUEBIK) does not.
-    const rows = res.json().data.results as { fb_name: string; matching_score: number }[];
-    expect(rows.find((r) => r.fb_name === "Noppamas")!.matching_score).toBe(1);
-    expect(rows.find((r) => r.fb_name === "Thana")!.matching_score).toBeLessThan(0.4);
+    const rows = res.json().data.results as { fb_name: string; status: string }[];
+    expect(rows.find((r) => r.fb_name === "noppamas")!.status).toBe("match");
+    expect(rows.find((r) => r.fb_name === "thana")!.status).toBe("unmatch");
+  });
+
+  /**
+   * Several companies is ONE run, and each row names the company it actually landed at.
+   *
+   * The pair of assertions at the bottom is the whole point of `comparison_result.company_name`:
+   * before it, the run table worked the company out by looking the matched contact's name up in
+   * `company_contact` — which, with two companies in scope, is a `limit 1` over every company that
+   * employs that name. Noppamas works at both here, so that lookup was a coin toss.
+   */
+  it("scores against several companies at once, keeping each friend's best match", async () => {
+    await importCompany(app, { csv: CO_CSV, uploader: "Alex" });
+    await importFacebook(app, {
+      friends: [["Noppamas", 1700000000], ["Thana", 1700000100]],
+      uploader: "Alex",
+    });
+
+    const id = await startCompare(app, ["MCKINSEY", "BLUEBIK"]);
+    const res = await app.inject({ method: "GET", url: `/api/comparisons/${id}/results` });
+    expect(res.json().data.selectedCompanies).toEqual(["MCKINSEY", "BLUEBIK"]);
+
+    // One row per friend, not one per (friend, company): both friends now match exactly, each at
+    // their own employer. Two companies did not make this four rows.
+    expect(res.json().data.rowCount).toBe(2);
+    expect(res.json().data.matchCount).toBe(2);
+
+    const rows = res.json().data.results as {
+      fb_name: string;
+      company_name: string;
+      status: string;
+    }[];
+    expect(rows.find((r) => r.fb_name === "noppamas")!.status).toBe("match");
+    expect(rows.find((r) => r.fb_name === "thana")!.status).toBe("match");
+
+    // Each row credits the company its winning contact actually came from — under the name the
+    // file gave it, because a company name is tidied and never case-folded.
+    expect(rows.find((r) => r.fb_name === "noppamas")!.company_name).toBe("MCKINSEY");
+    expect(rows.find((r) => r.fb_name === "thana")!.company_name).toBe("BLUEBIK");
+  });
+
+  it("names the matched company on the run's rows, not just on the run", async () => {
+    await importCompany(app, { csv: CO_CSV, uploader: "Alex" });
+    await importFacebook(app, { friends: [["Thana", 1700000100]], uploader: "Alex" });
+
+    const id = await startCompare(app, ["MCKINSEY", "BLUEBIK"]);
+    const res = await app.inject({ method: "GET", url: `/api/comparisons/${id}/rows?page=1&limit=25` });
+    expect(res.statusCode).toBe(200);
+
+    // `matchedContext` is the column the table renders under the "Company" header. On a
+    // multi-company run it has to come from the row's stored answer — this is the assertion that
+    // fails if the by-name fallback is ever allowed to overrule it.
+    const rows = res.json().data as { name: string; matchedContext: string }[];
+    expect(rows.find((r) => r.name === "thana")!.matchedContext).toBe("BLUEBIK");
+  });
+
+  it("deduplicates a repeated company rather than double-weighting it", async () => {
+    await importCompany(app, { csv: CO_CSV, uploader: "Alex" });
+    await importFacebook(app, { friends: [["Noppamas", 1700000000]], uploader: "Alex" });
+
+    const id = await startCompare(app, ["MCKINSEY", "MCKINSEY"]);
+    const res = await app.inject({ method: "GET", url: `/api/comparisons/${id}/results` });
+    expect(res.json().data.selectedCompanies).toEqual(["MCKINSEY"]);
   });
 
   it("400s a compare with no company selected", async () => {
-    const res = await app.inject({ method: "POST", url: "/api/comparisons/compare", payload: { company_name: "" } });
+    const res = await app.inject({ method: "POST", url: "/api/comparisons/compare", payload: { company_names: [] } });
     expect(res.statusCode).toBe(400);
   });
 
@@ -348,9 +544,33 @@ describe("company-selection compare", () => {
     const res = await app.inject({
       method: "POST",
       url: "/api/comparisons/compare",
-      payload: { company_name: "Nobody Inc" },
+      payload: { company_names: ["Nobody Inc"] },
     });
     expect(res.statusCode).toBe(400);
+  });
+
+  /**
+   * One bad name fails the whole request — it does not quietly run the rest.
+   *
+   * Dropping the empty company and comparing against the good one would answer a question nobody
+   * asked and report it as though they had: a headline count over two companies when three were
+   * picked, with nothing on screen admitting the third contributed nothing.
+   */
+  it("400s a multi-company compare if any one company has no contacts, naming it", async () => {
+    await importCompany(app, { csv: CO_CSV, uploader: "Alex" });
+    await importFacebook(app, { friends: [["Noppamas", 1700000000]], uploader: "Alex" });
+
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/comparisons/compare",
+      payload: { company_names: ["MCKINSEY", "Nobody Inc"] },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toContain("Nobody Inc");
+
+    // And nothing was created — a rejected compare must not leave a run behind.
+    const runs = await app.inject({ method: "GET", url: "/api/comparisons" });
+    expect(runs.json().data).toHaveLength(0);
   });
 });
 
@@ -367,18 +587,18 @@ describe("past runs (GET /api/comparisons)", () => {
 
     const res = await app.inject({ method: "GET", url: "/api/comparisons" });
     expect(res.statusCode).toBe(200);
-    const runs = res.json().data as { selectedCompany: string; rowCount: number; status: string }[];
+    const runs = res.json().data as { selectedCompanies: string[]; rowCount: number; status: string }[];
 
     // Both runs are here without anyone pressing "save" — that button is gone, and with it
     // the class of run that existed in the database but appeared nowhere in the UI.
     expect(runs).toHaveLength(2);
-    expect(runs[0].selectedCompany).toBe("BLUEBIK"); // newest first
-    expect(runs[1].selectedCompany).toBe("MCKINSEY");
+    expect(runs[0].selectedCompanies).toEqual(["BLUEBIK"]); // newest first
+    expect(runs[1].selectedCompanies).toEqual(["MCKINSEY"]);
     expect(runs[0].status).toBe("completed");
     expect(runs[0].rowCount).toBe(1);
   });
 
-  it("derives rowCount and topConfidence from the results, so they cannot disagree", async () => {
+  it("derives rowCount and matchCount from the results, so they cannot disagree", async () => {
     const id = await createComparison();
     await postCallback(app, {
       session_id: id,
@@ -386,75 +606,82 @@ describe("past runs (GET /api/comparisons)", () => {
       total_batches: 1,
       is_complete: true,
       results: [
-        { fb_name: "A", person_name_en: "A", person_name_th: "ก", matching_score: 1 },
-        { fb_name: "B", person_name_en: "B", person_name_th: "ข", matching_score: 0.5 },
+        { fb_name: "A", person_name_en: "A", person_name_th: "ก", status: "match" },
+        { fb_name: "B", person_name_en: "B", person_name_th: "ข", status: "unmatch" },
       ],
     });
 
     const runs = (await app.inject({ method: "GET", url: "/api/comparisons" })).json().data;
     expect(runs[0].rowCount).toBe(2);
-    // Fewer than ten results, so every one of them is a top match.
-    expect(runs[0].topConfidence).toBeCloseTo(0.75, 5);
-  });
-
-  it("scores a run on its ten best matches, not on the strangers below them", async () => {
-    const id = await createComparison();
-    // Ten strong matches (0.9), then ninety weak ones. The true mean is 0.15; the run's
-    // score must reflect the connections it found, not the friend list it waded through.
-    const scores = [...Array(10).fill(0.9), ...Array(90).fill(0.07)];
-    await postCallback(app, {
-      session_id: id,
-      batch_number: 1,
-      total_batches: 1,
-      is_complete: true,
-      results: scores.map((matching_score, i) => ({
-        fb_name: `F${i}`,
-        person_name_en: `P${i}`,
-        person_name_th: `ป${i}`,
-        matching_score,
-      })),
-    });
-
-    const runs = (await app.inject({ method: "GET", url: "/api/comparisons" })).json().data;
-    expect(runs[0].rowCount).toBe(100);
-    expect(runs[0].topConfidence).toBeCloseTo(0.9, 5);
-
-    // The detail view must agree with the list — same run, same headline number.
-    const detail = (await app.inject({ method: "GET", url: `/api/comparisons/${id}/results` })).json().data;
-    expect(detail.topConfidence).toBeCloseTo(0.9, 5);
-    expect(detail.meanConfidence).toBeCloseTo(0.153, 3);
+    expect(runs[0].matchCount).toBe(1);
   });
 
   /**
-   * matchCount is the number the whole UI now leads with, and it is the only stat that tells
-   * two runs apart: rowCount is the size of the friend list, so every run against the same
-   * friends reports the same one. It has to mean exactly MATCH_THRESHOLD, on both endpoints.
+   * matchCount is the number the whole UI leads with, and it is the only stat that tells two runs
+   * apart: rowCount is the size of the friend list, so every run against the same friends reports
+   * the same one.
+   *
+   * It used to be counted by comparing each row's score to MATCH_THRESHOLD, and this test used to
+   * straddle the 0.8 bar to prove the comparison was `>=` and not `>`. There is no bar on our side
+   * any more — the matcher sends its verdict and we count it — so what needs proving instead is
+   * the VOCABULARY: which spellings count, which don't, and that the two endpoints agree.
+   *
+   * The unrecognised-value case is the one that matters. `hit` is a plausible thing for a real
+   * matcher to send and there is no CHECK constraint to reject it, so its rows are counted as
+   * unmatched — silently. That is a deliberate choice (see rowVerdict) and this pins it, because
+   * the alternative failure is a run reporting matches nobody claimed.
    */
-  it("counts matches at the threshold, so a run that found nobody says so", async () => {
+  it("counts matches from the status vocabulary, so a run that found nobody says so", async () => {
     const id = await createComparison();
-    // Straddle the 0.6 bar in both directions, including landing exactly on it: a match is
-    // ">= threshold", and an off-by-one here would silently drop a real connection.
-    const scores = [0.95, 0.6, 0.599, 0.2];
+    const statuses = ["match", "matched", "Match ", "unmatch", "hit", "errored"];
     await postCallback(app, {
       session_id: id,
       batch_number: 1,
       total_batches: 1,
       is_complete: true,
-      results: scores.map((matching_score, i) => ({
+      results: statuses.map((status, i) => ({
         fb_name: `F${i}`,
         person_name_en: `P${i}`,
         person_name_th: `ป${i}`,
-        matching_score,
+        status,
       })),
     });
 
     const runs = (await app.inject({ method: "GET", url: "/api/comparisons" })).json().data;
-    expect(runs[0].rowCount).toBe(4);
-    expect(runs[0].matchCount).toBe(2); // 0.95 and 0.6 — not 0.599
+    expect(runs[0].rowCount).toBe(6);
+    // 'match', 'matched' and 'Match ' (trimmed, lower-cased). Not 'hit', which is decided but
+    // unrecognised; not 'errored', which is a broken row rather than a negative result.
+    expect(runs[0].matchCount).toBe(3);
 
     // The list and the detail view must not disagree about how many people a run found.
     const detail = (await app.inject({ method: "GET", url: `/api/comparisons/${id}/results` })).json().data;
-    expect(detail.matchCount).toBe(2);
+    expect(detail.matchCount).toBe(3);
+  });
+
+  /**
+   * An item with no `status` is recorded as unmatched.
+   *
+   * This is the behaviour change that breaks existing callers, so it is pinned rather than left
+   * to the schema's leniency: a matcher that posted `{fb_name, matching_score: 0.95}` and nothing
+   * else used to get a match out of it, via the score. It now gets a non-match, quietly. The
+   * score still arrives — it lands in `extra` rather than being rejected — it just decides nothing.
+   */
+  it("records an item with no status as unmatched, and keeps its score in extra", async () => {
+    const id = await createComparison();
+    await postCallback(app, {
+      session_id: id,
+      batch_number: 1,
+      total_batches: 1,
+      is_complete: true,
+      results: [{ fb_name: "A", person_name_en: "A", person_name_th: "ก", matching_score: 0.95 }],
+    });
+
+    const runs = (await app.inject({ method: "GET", url: "/api/comparisons" })).json().data;
+    expect(runs[0].rowCount).toBe(1);
+    expect(runs[0].matchCount).toBe(0);
+
+    const detail = (await app.inject({ method: "GET", url: `/api/comparisons/${id}/results` })).json().data;
+    expect(JSON.parse(detail.results[0].extra)).toMatchObject({ matching_score: 0.95 });
   });
 
   it("reports zero matches for a run whose every row is a stranger", async () => {
@@ -464,21 +691,19 @@ describe("past runs (GET /api/comparisons)", () => {
       batch_number: 1,
       total_batches: 1,
       is_complete: true,
-      results: [0.51, 0.4, 0.05].map((matching_score, i) => ({
+      results: ["unmatch", "unmatch", "unmatch"].map((status, i) => ({
         fb_name: `F${i}`,
         person_name_en: `P${i}`,
         person_name_th: `ป${i}`,
-        matching_score,
+        status,
       })),
     });
 
     const runs = (await app.inject({ method: "GET", url: "/api/comparisons" })).json().data;
-    // The run still has rows and still has a (meaningless) top score. Only matchCount
-    // distinguishes it from one that worked — which is why the badge reads from this and
-    // not from topConfidence, whose 0.32 here would render as a hopeful "32% Low".
+    // The run still has rows. Only matchCount distinguishes it from one that worked, which is
+    // why the badge reads from this — there is no confidence figure beside it to mislead with.
     expect(runs[0].rowCount).toBe(3);
     expect(runs[0].matchCount).toBe(0);
-    expect(runs[0].topConfidence).toBeGreaterThan(0);
   });
 
   it("lists a failed run with zero rows rather than hiding it", async () => {
@@ -489,7 +714,7 @@ describe("past runs (GET /api/comparisons)", () => {
     expect(runs).toHaveLength(1);
     expect(runs[0].status).toBe("failed");
     expect(runs[0].rowCount).toBe(0);
-    expect(runs[0].topConfidence).toBe(0);
+    expect(runs[0].matchCount).toBe(0);
   });
 
   it("renames a run — the one thing the old save flow really offered", async () => {
@@ -527,18 +752,25 @@ describe("past runs (GET /api/comparisons)", () => {
   });
 });
 
-describe("data-stats (old vs new)", () => {
-  it("counts new rows until a comparison completes, then they become old", async () => {
+// How many rows each table holds, and nothing else. `newRows` used to sit beside `total`,
+// counted off a `fetched` flag that every completing run flipped to true en masse — so the
+// number meant "imported since the last completed run", globally, and two runs finishing in
+// either order could not both be right about it. The column is gone and so is the figure.
+
+describe("data-stats", () => {
+  it("counts what each table holds, and does not change because a run finished", async () => {
     await importCompany(app, { uploader: "Alex" });
+    await importFacebook(app, { uploader: "Alex" });
 
     const before = await app.inject({ method: "GET", url: "/api/comparisons/data-stats" });
-    expect(before.json().data.company).toEqual({ total: 2, newRows: 2 });
+    expect(before.json().data).toEqual({ company: { total: 2 }, facebook: { total: 2 } });
 
-    // The comparison completes inside this call, which is what flips new → old.
+    // A completed comparison used to rewrite these numbers. It is a read of two counts now,
+    // so the rows it scored are exactly as present afterwards as they were before.
     await startCompare(app, "Acme Co");
 
     const after = await app.inject({ method: "GET", url: "/api/comparisons/data-stats" });
-    expect(after.json().data.company).toEqual({ total: 2, newRows: 0 });
+    expect(after.json().data).toEqual({ company: { total: 2 }, facebook: { total: 2 } });
   });
 });
 
@@ -556,7 +788,7 @@ describe("callback behavior", () => {
       total_batches: 1,
       is_complete: true,
       results: [
-        { fb_name: "Nok", person_name_en: "Noppamas", person_name_th: "นพมาศ", matching_score: 0.9, upload_name: "Alex", region: "APAC" },
+        { fb_name: "Nok", person_name_en: "Noppamas", person_name_th: "นพมาศ", status: "match", upload_name: "Alex", region: "APAC" },
       ],
     });
 
@@ -566,18 +798,25 @@ describe("callback behavior", () => {
     expect(JSON.parse(res.json().data.results[0].extra)).toEqual({ region: "APAC" }); // jsonb round-trip
   });
 
-  it("returns results best-match-first, whatever order the batches arrived in", async () => {
+  /**
+   * Matches first, insertion order within — whatever order the batches arrived in.
+   *
+   * This asserted "best-match-first" while rows carried a score to rank by, and the fixture was
+   * built so insertion order was the exact reverse of score order. That sort is gone with the
+   * column: matches can no longer be ranked against each other, only separated from non-matches.
+   * So the fixture now puts a match in each batch, and what is pinned is that BOTH rise above
+   * BOTH non-matches while each pair keeps its own arrival order.
+   */
+  it("returns matches first, whatever order the batches arrived in", async () => {
     const id = await createComparison();
-    // Batch 1 carries the WORST matches and batch 2 the best, so insertion order (the old
-    // sort) is the exact opposite of what the reader wants to see.
     await postCallback(app, {
       session_id: id,
       batch_number: 1,
       total_batches: 2,
       is_complete: false,
       results: [
-        { fb_name: "Stranger", person_name_en: "Somchai", person_name_th: "สมชาย", matching_score: 0.05 },
-        { fb_name: "Cousin", person_name_en: "Somchai", person_name_th: "สมชาย", matching_score: 0.44 },
+        { fb_name: "Stranger", person_name_en: "Somchai", person_name_th: "สมชาย", status: "unmatch" },
+        { fb_name: "Somchai", person_name_en: "Somchai", person_name_th: "สมชาย", status: "match" },
       ],
     });
     await postCallback(app, {
@@ -586,15 +825,15 @@ describe("callback behavior", () => {
       total_batches: 2,
       is_complete: true,
       results: [
-        { fb_name: "Somchai", person_name_en: "Somchai", person_name_th: "สมชาย", matching_score: 1 },
-        { fb_name: "Somchai Kamol", person_name_en: "Somchai", person_name_th: "สมชาย", matching_score: 0.7 },
+        { fb_name: "Cousin", person_name_en: "Somchai", person_name_th: "สมชาย", status: "unmatch" },
+        { fb_name: "Somchai Kamol", person_name_en: "Somchai", person_name_th: "สมชาย", status: "match" },
       ],
     });
 
     const res = await app.inject({ method: "GET", url: `/api/comparisons/${id}/results` });
-    const rows = res.json().data.results as { fb_name: string; matching_score: number }[];
+    const rows = res.json().data.results as { fb_name: string; status: string }[];
 
-    expect(rows.map((r) => r.fb_name)).toEqual(["Somchai", "Somchai Kamol", "Cousin", "Stranger"]);
+    expect(rows.map((r) => r.fb_name)).toEqual(["Somchai", "Somchai Kamol", "Stranger", "Cousin"]);
     // Four different friends all matched the SAME company person — that is kept, not
     // deduplicated: two uploaders knowing the same contact is the signal, not noise.
     expect(rows).toHaveLength(4);
@@ -663,16 +902,19 @@ describe("import preview", () => {
       { target: "person_name_th", label: "Thai name", sourceColumn: "thai_name", cleaned: true },
       { target: "person_name_en", label: "English name", sourceColumn: "eng_name", cleaned: true },
     ]);
-    // These names are already clean, so each `_clean` value equals its raw one — but it is
-    // still present, because the screen renders from it.
+    // `<target>` is the file's own cell and `<target>_clean` is what will be stored. This
+    // pairing is now the only place the original is ever visible — it is not kept — so the
+    // preview carries both even for a name as undressed as this one, where the whole of the
+    // clean is the lower-casing.
     expect(p.sampleRows[0]).toEqual({
       company_name: "Acme Co",
       person_name_th: "สมชาย",
-      person_name_th_clean: "สมชาย",
+      person_name_th_clean: "สมชาย", // Thai has no case: nothing to do
       person_name_en: "Somchai",
-      person_name_en_clean: "Somchai",
+      person_name_en_clean: "somchai",
     });
-    expect(p.warnings).toEqual([]);
+    // And the file is told so: two of its names change on the way in.
+    expect(p.warnings.join(" ")).toMatch(/2 names will be cleaned/);
 
     // The whole promise of a preview: the database is untouched.
     expect(await countUploads()).toBe(0);
@@ -686,19 +928,26 @@ describe("import preview", () => {
 
     await importCompany(app, { csv });
 
-    // Read back the whole row, not the Database console's view of it — the console hides
-    // the `_clean` columns, and those are half of what the preview promised.
     const stored = await app.inject({ method: "GET", url: "/api/comparisons/company-data/all?page=1&limit=10" });
     const data = stored.json().data as Record<string, unknown>[];
 
     expect(data).toHaveLength(preview.totalRows);
+    // A company name is tidied, not cleaned, so the row keeps the file's spelling of it.
     expect(data.map((r) => r.company_name)).toEqual(["Acme Co", "Beta Ltd"]);
-    expect(data[0].person_name_th).toBe(preview.sampleRows[0].person_name_th);
-    expect(data[0].person_name_en).toBe(preview.sampleRows[0].person_name_en);
-    // The cleaned names are held to the same promise: the preview showed them, so the
-    // import must have written exactly those.
-    expect(data[0].person_name_th_clean).toBe(preview.sampleRows[0].person_name_th_clean);
-    expect(data[0].person_name_en_clean).toBe(preview.sampleRows[0].person_name_en_clean);
+
+    // The pin that matters: what the import WROTE into the name column is what the preview
+    // showed under `_clean`. The preview's bare `person_name_*` is the file's own text and is
+    // stored nowhere — asserting the row equalled *that* is what this test used to do, and it
+    // would now be asserting the cleaning never happened.
+    expect(data[0].person_name_th).toBe(preview.sampleRows[0].person_name_th_clean);
+    expect(data[0].person_name_en).toBe(preview.sampleRows[0].person_name_en_clean);
+    expect(data[1].person_name_th).toBe(preview.sampleRows[1].person_name_th_clean);
+    expect(data[1].person_name_en).toBe(preview.sampleRows[1].person_name_en_clean);
+
+    // Not vacuous: the English names really did change, so the two sides of the assertion
+    // above are not just the same untouched string twice.
+    expect(data[0].person_name_en).toBe("somchai");
+    expect(preview.sampleRows[0].person_name_en).toBe("Somchai");
   });
 
   it("accepts the spaced header variant the same way the import does", async () => {
@@ -707,7 +956,9 @@ describe("import preview", () => {
 
     expect(p.mapping.find((m: { target: string }) => m.target === "person_name_th").sourceColumn).toBe("Thai Name");
     expect(p.sampleRows[0].person_name_en).toBe("Somchai");
-    expect(p.warnings).toEqual([]);
+    expect(p.sampleRows[0].person_name_en_clean).toBe("somchai");
+    // Nothing is missing and nothing is unusable — the only note is the lower-casing.
+    expect(p.warnings.join(" ")).not.toMatch(/No column matched|will not be imported/);
   });
 
   it("warns about a column it could not find, and names the ones it will ignore", async () => {
@@ -729,7 +980,20 @@ describe("import preview", () => {
     const p = (await previewUpload(app, { csv })).json().data;
 
     expect(p.totalRows).toBe(2);
-    expect(p.warnings).toContain("1 row has no company or person name.");
+    // A PERSON's name, specifically. The row with only a department is unusable for the same
+    // reason a row with only a company would be: there is nothing on it to match.
+    expect(p.warnings.join(" ")).toMatch(/1 row has no person name and will not be imported/);
+  });
+
+  // The warning above and the import's own gate are one rule, so the preview cannot promise a
+  // row the import then drops on the floor — or rejects the file over.
+  it("agrees with the import about a company-only row being unimportable", async () => {
+    const csv = "company_name,thai_name,eng_name\nAcme Co,สมชาย,Somchai\nBeta Ltd,,\n";
+    const p = (await previewUpload(app, { csv })).json().data;
+    expect(p.warnings.join(" ")).toMatch(/1 row has no person name/);
+
+    const res = (await importCompany(app, { csv })).json().data;
+    expect(res.companyAdded).toBe(1); // Beta Ltd's nameless row is not a contact
   });
 
   it("reads a Facebook export", async () => {
@@ -737,9 +1001,13 @@ describe("import preview", () => {
 
     expect(p.kind).toBe("facebook");
     expect(p.totalRows).toBe(1);
+    // The file's own text, and beside it the one thing that will be stored.
     expect(p.sampleRows[0].friend_name).toBe("Somchai");
-    // The export counts in Unix seconds; the row stores an instant.
-    expect(p.sampleRows[0].source_timestamp).toBe(new Date(1700000000 * 1000).toISOString());
+    expect(p.sampleRows[0].friend_name_clean).toBe("somchai");
+    // The export's "friended on" timestamp is read by nothing and stored nowhere — the column
+    // is gone, so the preview does not carry it and the header is simply ignored.
+    expect(p.sampleRows[0]).not.toHaveProperty("source_timestamp");
+    expect(p.ignoredColumns).toContain("timestamp");
     expect(await countUploads()).toBe(0);
   });
 
@@ -779,6 +1047,23 @@ describe("import preview", () => {
     expect(p.mapping.find((m: { target: string }) => m.target === "friend_name").sourceColumn).toBeNull();
     expect(p.warnings.join(" ")).toMatch(/Facebook name/);
     expect(p.ignoredColumns).toContain("nickname");
+  });
+
+  // Two columns under one header is refused rather than resolved. A row is keyed by its header
+  // text, so a repeat silently overwrites — and the mapping resolves to the first such column
+  // while the row holds the last one's values, which is a preview that disagrees with the import
+  // while looking exactly like one that doesn't.
+  it("400s a workbook with two columns under the same header, naming it", async () => {
+    const csv = "company_name,eng_name,eng_name\nAcme Co,Somchai,Anong\n";
+
+    const p = await previewUpload(app, { csv });
+    expect(p.statusCode).toBe(400);
+    expect(p.json().message).toMatch(/Two columns share the header .*eng_name/);
+
+    // And the import refuses the same file the same way, for the same reason.
+    const imported = await importCompany(app, { csv });
+    expect(imported.statusCode).toBe(400);
+    expect(await countUploads()).toBe(0);
   });
 
   it("400s when no file is attached", async () => {
@@ -826,6 +1111,35 @@ describe("upload sessions + rollback", () => {
     expect(co.json().data.length).toBeGreaterThan(0);
     const fb = await app.inject({ method: "GET", url: "/api/upload-sessions?uploadType=facebook" });
     expect(fb.json().data).toHaveLength(0);
+  });
+
+  /**
+   * Rollback after an all-duplicate re-import leaves a consistent world.
+   *
+   * The state this guards against: import a file, import it again (all duplicates), roll the
+   * FIRST import back. The re-import used to be recorded as its own completed session — so
+   * after the rollback, the uploads screen showed a session claiming rows that were gone
+   * (dedup stores one copy, owned by the first import; the "duplicate" session never owned
+   * anything). Now the re-import is answered but not recorded, so nothing is left to lie:
+   * no sessions, no rows, no ghost claim.
+   */
+  it("rollback after an all-duplicate re-import leaves no ghost claim", async () => {
+    const first = (await importCompany(app, { csv: CO_CSV, uploader: "Alex" })).json().data.sessionId;
+    const again = (await importCompany(app, { csv: CO_CSV, uploader: "Alex" })).json().data;
+    expect(again.companyAdded).toBe(0);
+    expect(again.companyDuplicates).toBe(2);
+
+    const rb = await app.inject({ method: "POST", url: `/api/upload-sessions/${first}/rollback`, payload: {} });
+    expect(rb.statusCode).toBe(200);
+    expect(rb.json().data.companyDeleted).toBe(2);
+
+    // The data is gone, and no session pretends otherwise.
+    const rows = await app.inject({ method: "GET", url: "/api/comparisons/company-data/all?page=1&limit=50" });
+    expect(rows.json().pagination.total).toBe(0);
+    const sessions = (await app.inject({ method: "GET", url: "/api/upload-sessions" })).json().data;
+    expect(sessions).toHaveLength(1); // only the first import, now rolled_back
+    expect(sessions[0].id).toBe(first);
+    expect(sessions[0].status).toBe("rolled_back");
   });
 });
 

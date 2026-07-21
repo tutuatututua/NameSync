@@ -3,27 +3,41 @@
  *
  *   cd code/api && npm run mock:row-status              # write
  *   cd code/api && npm run mock:row-status -- --dry     # show the tally, write nothing
- *   cd code/api && npm run mock:row-status -- --settled # leave no row at 'processing'
+ *   cd code/api && npm run mock:row-status -- --settled # leave no row unfinished
  *
  * The real workflow decides `friend.status` / `company_contact.status` per row and NameSync
  * only ever reads them (docs/EXTERNAL-MATCHER.md). Until that workflow is wired up, every row
  * sits at the column's default — 'processing' — and the Database console is a wall of one
  * value. This fills it in with plausible ones so the column can actually be looked at.
  *
+ * The vocabulary is imported, never spelled out here. A mock that invented its own strings would
+ * be mocking a workflow that does not exist: these are the values `rowVerdict` reads
+ * (extensions/contract/src/row-status.ts), and that is the whole point of writing them.
+ *
  * It is a *mock*, and it is honest about the two ways it is not the workflow:
  *
- *   · It writes no `comparison_result` rows. A row it stamps 'match' has no pair and no score
- *     behind it, so the Uploads page ("5 of 12 matched", counted from these rows) and the
- *     results table (rendered from `comparison_result`) will disagree. That is fine for looking
- *     at the grid and wrong for anything else — don't read the match rate off a mocked table.
- *   · Rows it leaves at 'processing' are indistinguishable from a live import that is still
- *     running: NameSync finishes an upload by counting rows that are *not* 'processing', so a
- *     mocked 'processing' row keeps its upload spinning forever. That is what --settled is for.
+ *   · It writes no `comparison_result` rows, so a row it stamps 'match' has no pair behind it —
+ *     a match to nobody. That USED to be self-correcting: the stamp was advisory, the verdict came
+ *     from a score this script never wrote, and a mocked 'match' rendered as "No match" whatever
+ *     the weights below said. Since 2026-07-20 the stamp IS the verdict, so a mocked 'match' now
+ *     counts as one, all the way up to the headline — with no pair on screen to show for it. The
+ *     match rate you read off a mocked table is this script's weights, not a matcher's judgement.
+ *   · Rows it leaves unfinished are indistinguishable from a live import that is still running:
+ *     NameSync finishes an upload by counting rows that are *not* unfinished, so a mocked
+ *     'pending'/'processing' row keeps its upload spinning forever. That is what --settled is for.
  *
- * Requires the `status` column — docs/migrations/2026-07-14-row-status.sql, applied by hand.
+ * Requires the `status` column on both tables — declared in docs/schema-redesign.sql
+ * (`text NOT NULL DEFAULT 'processing'`, no CHECK). See docs/EXTERNAL-MATCHER.md.
  */
 
 import { DBModel } from "@extensions/sqldb";
+import {
+  ROW_QUEUED,
+  ROW_PENDING,
+  ROW_MATCH,
+  ROW_UNMATCH,
+  ROW_FAILED_VALUES,
+} from "@extensions/contract";
 
 /** `getKyselyDB` is protected on DBModel — a subclass is how everything else reaches it. */
 class Mock extends DBModel {
@@ -38,16 +52,31 @@ const SETTLED = process.argv.includes("--settled");
 const TABLES = ["friend", "company_contact"] as const;
 type Table = (typeof TABLES)[number];
 
+/** One of the four spellings a workflow may use for a row it gave up on. Any of them reads as
+ *  'failed'; picking one keeps the tally legible. */
+const ROW_FAILED = "failed" satisfies (typeof ROW_FAILED_VALUES)[number];
+
 /**
  * The verdicts, and how often to hand each one out.
  *
- * 'complete' is deliberately absent: it exists in the data, but only the migration's backfill
- * writes it (it means "finished before the workflow existed"). A workflow never produces one,
- * so neither does its mock.
+ * Both unfinished spellings appear, and not just the column default, because the workflow
+ * distinguishes a row it has accepted ('pending') from a row it is working on ('processing') and
+ * a mock that only ever wrote one of them would never exercise the other — they are read through
+ * one set (ROW_UNFINISHED_VALUES) precisely so that both are already understood when they arrive.
+ *
+ * A slice of failures too: "we never managed to compare this name" is counted apart from "this
+ * name matched nobody", and a mock that never produced one left that tab permanently empty.
+ * A failed row is *finished* — it is never coming back — so --settled keeps writing them.
  */
 const WEIGHTS: Record<string, number> = SETTLED
-  ? { match: 0.5, unmatch: 0.5 }
-  : { match: 0.45, unmatch: 0.45, processing: 0.1 };
+  ? { [ROW_MATCH]: 0.47, [ROW_UNMATCH]: 0.47, [ROW_FAILED]: 0.06 }
+  : {
+      [ROW_MATCH]: 0.42,
+      [ROW_UNMATCH]: 0.42,
+      [ROW_FAILED]: 0.06,
+      [ROW_PENDING]: 0.05,
+      [ROW_QUEUED]: 0.05,
+    };
 
 /** Pick a status against WEIGHTS. */
 function roll(): string {
@@ -55,7 +84,7 @@ function roll(): string {
   for (const [status, weight] of Object.entries(WEIGHTS)) {
     if ((r -= weight) < 0) return status;
   }
-  return "unmatch"; // float dust at the very top of the range
+  return ROW_UNMATCH; // float dust at the very top of the range
 }
 
 /** Postgres caps a statement's parameters, and an id list is one parameter each. */
@@ -66,7 +95,7 @@ async function stamp(table: Table): Promise<Record<string, number>> {
   const rows = await db.selectFrom(table).select("id").execute();
 
   // Decide every row's verdict first, then write one UPDATE per distinct verdict rather than
-  // one per row — 600 rows is 3 statements, not 600 round trips.
+  // one per row — 600 rows is 5 statements, not 600 round trips.
   const byStatus = new Map<string, string[]>();
   for (const { id } of rows) {
     const status = roll();
@@ -90,7 +119,7 @@ async function stamp(table: Table): Promise<Record<string, number>> {
   return Object.fromEntries([...byStatus].map(([status, ids]) => [status, ids.length]));
 }
 
-/** `match 12 · unmatch 9 · processing 2` — in WEIGHTS order, so the columns line up. */
+/** `match 12 · unmatch 9 · failed 1 · processing 2` — in WEIGHTS order, so the columns line up. */
 const format = (tally: Record<string, number>): string =>
   Object.keys(WEIGHTS)
     .filter((s) => tally[s])
@@ -108,7 +137,9 @@ async function main(): Promise<void> {
 
   if (DRY) console.log("\nRe-run without --dry to write.");
   else if (!SETTLED) {
-    console.log("\nSome rows were left at 'processing' — their uploads will read as still running.");
+    console.log(
+      `\nSome rows were left unfinished ('${ROW_QUEUED}'/'${ROW_PENDING}') — their uploads will read as still running.`
+    );
     console.log("Re-run with --settled to give every row a final verdict.");
   }
 }
@@ -117,7 +148,9 @@ main()
   .then(() => process.exit(0))
   .catch((err) => {
     if (String(err?.message).includes("status")) {
-      console.error("Failed naming `status`. Has docs/migrations/2026-07-14-row-status.sql been applied?\n");
+      console.error(
+        "Failed naming `status`. Both tables should carry it — see docs/schema-redesign.sql and docs/EXTERNAL-MATCHER.md.\n"
+      );
     }
     console.error(err);
     process.exit(1);

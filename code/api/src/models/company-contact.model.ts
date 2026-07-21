@@ -2,41 +2,50 @@ import { DBModel } from "@extensions/sqldb";
 import { sql, type SqlBool } from "kysely";
 import type { PaginatedResult, CompanyDataRow, RunRow } from "@extensions/contract";
 import { isExternalMatcher } from "../config/env";
-import { tallyStatuses, type StatusCounts } from "./row-status";
-import { rowFilterWhere, toRunRow, type RawRunRow, type RunRowFilter } from "./run-rows";
-import { effectiveName } from "../services/name-cleaner.service";
+import { matchedFirstSql, rowVerdictSql, tallyVerdicts, type StatusCounts } from "./row-status";
+import { rowFilterWhere, toRunRow, type RawRunRow, type RunRowFilter, type RunRowSort } from "./run-rows";
 
 /**
  * `company_contact` — company people, stacked upload by upload (upload_id FK), so
  * undoing an upload is just "delete this upload's rows". Reads alias to the legacy
  * CompanyDataRow shape.
  *
- * Each person's name is stored twice: as the file wrote it (`person_name_*`) and cleaned
- * (`person_name_*_clean` — see services/name-cleaner.service.ts). The clean name is what
- * is matched, deduped and shown; the raw one is the record of what was actually uploaded.
+ * `person_name_th` / `person_name_en` hold the names already cleaned and lower-cased — see
+ * services/name-cleaner.service.ts, applied at parse time. They are stored once; there is no
+ * raw twin, and the file's own spelling survives only in the import preview.
  *
- * Dedup key is company name + both *cleaned* person names, matched exactly. Cleaning is
- * what makes the key mean something: "Mr. Somchai Jaidee" and "SOMCHAI JAIDEE" are one
- * contact, and before cleaning they were two. Unlike `friend`, the uploader is not part of
- * the key — a company contact is the same contact no matter who imported them.
+ * `company_name` is NOT cleaned the same way — a company is only ever grouped and matched
+ * exactly, and "Mr" inside a company's name is its name. It is tidied (whitespace, invisible
+ * characters) and nothing more, so it keeps its case and every reader that compares it has to
+ * fold case itself.
+ *
+ * Dedup key is company name + both person names, matched exactly. Cleaning is what makes the
+ * key mean something: "Mr. Somchai Jaidee" and "SOMCHAI JAIDEE" are one contact, and before
+ * cleaning they were two. Unlike `friend`, the uploader is not part of the key — a company
+ * contact is the same contact no matter who imported them.
  */
 
 export interface CompanyContactRecord {
+  /** Tidied, but not de-titled and not case-folded. */
   company_name: string | null;
+  /** Already cleaned and lower-cased by the parser. */
   person_name_th: string | null;
-  person_name_th_clean: string | null;
+  /** Already cleaned and lower-cased by the parser. */
   person_name_en: string | null;
-  person_name_en_clean: string | null;
 }
 
-// JSON keeps a missing field distinct from the literal string "null", and keeps the
-// three fields from running together (e.g. "ab"+"c" vs "a"+"bc").
+// JSON keeps a missing field distinct from the literal string "null", and keeps the three
+// fields from running together (e.g. "ab"+"c" vs "a"+"bc"). All three are lower-cased: the
+// person names arrive lower-cased from the parser so folding them is a no-op on the normal path,
+// but the DB console table editor writes these columns too, bypassing the cleaner — and a
+// hand-typed mixed-case name that did not fold here would never dedupe against an imported one.
+const lower = (s: string | null) => (s === null ? null : s.toLowerCase());
 const contactKey = (r: { company_name: string | null; th: string | null; en: string | null }) =>
-  JSON.stringify([r.company_name, r.th, r.en]);
+  JSON.stringify([lower(r.company_name), lower(r.th), lower(r.en)]);
 
-/** The key for a record about to be inserted — cleaned names. */
+/** The key for a record about to be inserted. */
 const recordKey = (r: CompanyContactRecord) =>
-  contactKey({ company_name: r.company_name, th: r.person_name_th_clean, en: r.person_name_en_clean });
+  contactKey({ company_name: r.company_name, th: r.person_name_th, en: r.person_name_en });
 
 // `status` is only named when the external matcher is on — the column arrives with a
 // hand-applied migration, so until it is run it does not exist. See friend.model.ts.
@@ -44,9 +53,7 @@ const contactRowSelect = [
   "company_contact.id as uuid",
   "company_contact.company_name",
   "company_contact.person_name_th",
-  "company_contact.person_name_th_clean",
   "company_contact.person_name_en",
-  "company_contact.person_name_en_clean",
   isExternalMatcher()
     ? sql<string | null>`company_contact.status`.as("status")
     : sql<string | null>`null`.as("status"),
@@ -67,33 +74,28 @@ export class CompanyContactModel extends DBModel {
     const db = await this.getKyselyDB();
 
     // Only rows for the companies named in this file can collide — no need to read
-    // the whole table.
+    // the whole table. Compared lower-cased, like the key below: filtering exactly would
+    // never load the stored "Acme Co" rows for a file that spells it "ACME CO", and rows
+    // the dedup never sees are rows it cannot dedupe against.
     const companies = [...new Set(records.map((r) => r.company_name))];
-    const named = companies.filter((c): c is string => c !== null);
-    const hasUnnamed = named.length !== companies.length;
+    const named = [...new Set(companies.filter((c): c is string => c !== null).map((c) => c.toLowerCase()))];
+    const hasUnnamed = companies.includes(null);
 
     const prior = await db
       .selectFrom("company_contact")
-      .select(["company_name", "person_name_th", "person_name_th_clean", "person_name_en", "person_name_en_clean"])
+      .select(["company_name", "person_name_th", "person_name_en"])
       .where((eb) =>
         eb.or([
-          ...(named.length > 0 ? [eb("company_name", "in", named)] : []),
+          ...(named.length > 0 ? [eb(sql<string>`lower(company_name)`, "in", named)] : []),
           ...(hasUnnamed ? [eb("company_name", "is", null)] : []),
         ])
       )
       .execute();
 
-    // A row imported before cleaning existed has null clean columns; clean its raw name on
-    // the fly so it still dedupes against the file being imported now. (`backfill:clean-names`
-    // fills them in for real — this just means the answer doesn't depend on having run it.)
+    // Both sides keyed identically: stored names and incoming names have been through the same
+    // cleaner, so they are directly comparable with no fallback on either side.
     const seen = new Set(
-      prior.map((p) =>
-        contactKey({
-          company_name: p.company_name,
-          th: effectiveName(p.person_name_th_clean, p.person_name_th),
-          en: effectiveName(p.person_name_en_clean, p.person_name_en),
-        })
-      )
+      prior.map((p) => contactKey({ company_name: p.company_name, th: p.person_name_th, en: p.person_name_en }))
     );
 
     const fresh: CompanyContactRecord[] = [];
@@ -114,48 +116,52 @@ export class CompanyContactModel extends DBModel {
           upload_id: uploadId,
           company_name: r.company_name,
           person_name_th: r.person_name_th,
-          person_name_th_clean: r.person_name_th_clean,
           person_name_en: r.person_name_en,
-          person_name_en_clean: r.person_name_en_clean,
         }))
       )
       .execute();
     return { added: fresh.length, duplicates };
   }
 
-  static async stats(): Promise<{ total: number; newRows: number }> {
+  static async stats(): Promise<{ total: number }> {
     const db = await this.getKyselyDB();
-    const [totalRow, newRow] = await Promise.all([
-      db.selectFrom("company_contact").select(db.fn.count("id").as("count")).executeTakeFirst(),
-      db.selectFrom("company_contact").select(db.fn.count("id").as("count")).where("fetched", "=", false).executeTakeFirst(),
-    ]);
-    return { total: Number(totalRow?.count) || 0, newRows: Number(newRow?.count) || 0 };
-  }
-
-  static async markAllFetched(): Promise<void> {
-    const db = await this.getKyselyDB();
-    await db.updateTable("company_contact").set({ fetched: true }).where("fetched", "=", false).execute();
+    const row = await db.selectFrom("company_contact").select(db.fn.count("id").as("count")).executeTakeFirst();
+    return { total: Number(row?.count) || 0 };
   }
 
   /**
-   * The names to score a comparison against — every contact at one company.
+   * The names to score a comparison against — every contact at any of the selected companies,
+   * plus the employer, which the matcher stores on the winning row. With one company that was
+   * derivable from the run and did not need carrying; with several it is the only way a result
+   * can say which company it landed at.
    *
-   * Returns the raw names (what the results table displays, so a person recognises the row)
-   * and the clean ones (what the matcher scores, so "Mr." doesn't cost anyone a match).
+   * Company names are compared case-insensitively, because they are stored case-preserving:
+   * a picker offering "ACME CO" has to load the contacts filed under "Acme Co" as well, or
+   * selecting one spelling silently runs against half the company. `distinctCompanies` folds
+   * the same way, so what the picker offers and what this loads agree.
+   *
+   * Ordered, so a run is reproducible. The matcher keeps the first of several equally-good
+   * candidates, and without an ORDER BY that is whatever order the heap came back in — so two
+   * identical runs could credit the same friend to two different companies. `id` alone is
+   * enough to settle it, but ordering by company first also makes the tie-break *legible*:
+   * the earlier-named company wins, which is at least a rule someone could predict.
    */
-  static async findByCompany(companyName: string): Promise<
+  static async findByCompanies(companyNames: string[]): Promise<
     {
+      company_name: string | null;
       person_name_en: string | null;
-      person_name_en_clean: string | null;
       person_name_th: string | null;
-      person_name_th_clean: string | null;
     }[]
   > {
+    if (companyNames.length === 0) return [];
     const db = await this.getKyselyDB();
+    const named = [...new Set(companyNames.map((c) => c.toLowerCase()))];
     return db
       .selectFrom("company_contact")
-      .select(["person_name_en", "person_name_en_clean", "person_name_th", "person_name_th_clean"])
-      .where("company_name", "=", companyName)
+      .select(["company_name", "person_name_en", "person_name_th"])
+      .where(sql<string>`lower(company_name)`, "in", named)
+      .orderBy("company_name", "asc")
+      .orderBy("id", "asc")
       .execute();
   }
 
@@ -163,21 +169,28 @@ export class CompanyContactModel extends DBModel {
    * How far the external workflow has got through one upload's rows. Counting unstamped rows
    * is the entire progress mechanism — see friend.model.ts and models/row-status.ts.
    */
-  static async statusCounts(uploadId: string): Promise<StatusCounts> {
+  static async statusCounts(uploadId: string, comparisonId: string): Promise<StatusCounts> {
     const db = await this.getKyselyDB();
+
     const rows = await db
-      .selectFrom("company_contact")
-      .select(["status", (eb) => eb.fn.countAll().as("count")])
-      .where("upload_id", "=", uploadId)
-      .groupBy("status")
+      .selectFrom((eb) =>
+        eb
+          .selectFrom("company_contact")
+          .select(rowVerdictSql("company_contact.status").as("verdict"))
+          .where("company_contact.upload_id", "=", uploadId)
+          .as("verdicts")
+      )
+      .select((eb) => ["verdicts.verdict", eb.fn.countAll().as("count")])
+      .groupBy("verdicts.verdict")
       .execute();
-    return tallyStatuses(rows);
+
+    return tallyVerdicts(rows as { verdict: string; count: unknown }[]);
   }
 
   /**
    * One page of an import's rows, each with whatever the workflow has said about it so far —
-   * the company side of the live monitor. See FriendModel.findRunRows for why the score is
-   * joined on the name and why the order is deliberately not by status.
+   * the company side of the live monitor. See FriendModel.findRunRows for why the match is
+   * joined on the name and why import order is the default.
    *
    * This is the mirror image of that one, and it is genuinely not symmetrical. Here the uploaded
    * row is the rich side: a contact has an English name, a Thai name and an employer, and all
@@ -196,11 +209,12 @@ export class CompanyContactModel extends DBModel {
     comparisonId: string,
     page: number,
     limit: number,
-    filter: RunRowFilter
+    filter: RunRowFilter,
+    sort: RunRowSort
   ): Promise<PaginatedResult<RunRow>> {
     const db = await this.getKyselyDB();
     const offset = (page - 1) * limit;
-    const where = rowFilterWhere("company_contact.status", filter);
+    const where = rowFilterWhere(rowVerdictSql("company_contact.status"), filter);
 
     let rows = db.selectFrom("company_contact").where("company_contact.upload_id", "=", uploadId);
     if (where) rows = rows.where(where);
@@ -208,47 +222,54 @@ export class CompanyContactModel extends DBModel {
     let count = db.selectFrom("company_contact").where("company_contact.upload_id", "=", uploadId);
     if (where) count = count.where(where);
 
+    const selected = rows
+      .leftJoinLateral(
+        (eb) =>
+          eb
+            .selectFrom("comparison_result")
+            .select([
+              "comparison_result.friend_name",
+              "comparison_result.upload_name",
+              "comparison_result.extra",
+            ])
+            .where("comparison_result.comparison_id", "=", comparisonId)
+            .where(
+              sql<SqlBool>`(
+                comparison_result.person_name_en = company_contact.person_name_en
+                or comparison_result.person_name_th = company_contact.person_name_th
+              )`
+            )
+            .orderBy(matchedFirstSql("comparison_result.status"))
+            .orderBy("comparison_result.id", "asc")
+            .limit(1)
+            .as("best"),
+        (join) => join.onTrue()
+      )
+      .select([
+        "company_contact.id as id",
+        "company_contact.person_name_en as name",
+        "company_contact.person_name_th as nameTh",
+        "company_contact.company_name as context",
+        sql<string | null>`company_contact.status`.as("status"),
+        "best.friend_name as matchedName",
+        // A friend has one name — there is no Thai twin to show.
+        sql<string | null>`null`.as("matchedNameTh"),
+        // Not another name: the person who uploaded that friend. Who they are is the match;
+        // whose they are is what you can act on.
+        "best.upload_name as matchedContext",
+        sql<string | null>`best.extra::text`.as("extras"),
+      ]);
+
+    // See FriendModel.findRunRows — import order while the run moves, matches first once it stops.
+    const ordered =
+      sort === "status"
+        ? selected
+            .orderBy(matchedFirstSql("company_contact.status"))
+            .orderBy("company_contact.id", "asc")
+        : selected.orderBy("company_contact.id", "asc");
+
     const [data, countResult] = await Promise.all([
-      rows
-        .leftJoinLateral(
-          (eb) =>
-            eb
-              .selectFrom("comparison_result")
-              .select([
-                "comparison_result.matching_score",
-                "comparison_result.friend_name",
-                "comparison_result.upload_name",
-              ])
-              .where("comparison_result.comparison_id", "=", comparisonId)
-              .where(
-                sql<SqlBool>`(
-                  comparison_result.person_name_en = company_contact.person_name_en
-                  or comparison_result.person_name_th = company_contact.person_name_th
-                )`
-              )
-              .orderBy(sql`comparison_result.matching_score desc nulls last`)
-              .limit(1)
-              .as("best"),
-          (join) => join.onTrue()
-        )
-        .select([
-          "company_contact.id as id",
-          "company_contact.person_name_en as name",
-          "company_contact.person_name_th as nameTh",
-          "company_contact.company_name as context",
-          sql<string | null>`company_contact.status`.as("status"),
-          "best.matching_score as score",
-          "best.friend_name as matchedName",
-          // A friend has one name — there is no Thai twin to show.
-          sql<string | null>`null`.as("matchedNameTh"),
-          // Not another name: the person who uploaded that friend. Who they are is the match;
-          // whose they are is what you can act on.
-          "best.upload_name as matchedContext",
-        ])
-        .orderBy("company_contact.id", "asc")
-        .limit(limit)
-        .offset(offset)
-        .execute(),
+      ordered.limit(limit).offset(offset).execute(),
       count.select(db.fn.countAll().as("count")).executeTakeFirst(),
     ]);
 
@@ -259,28 +280,52 @@ export class CompanyContactModel extends DBModel {
     };
   }
 
-  /** Whether a company has anyone to compare against — a compare with 0 is a 400, not a run. */
-  static async countByCompany(companyName: string): Promise<number> {
+  /**
+   * Which of these companies actually have someone to compare against — a compare with nobody
+   * on the other side is a 400, not a run.
+   *
+   * Returns the names that have at least one contact, rather than a count or a boolean, because
+   * the caller's next move is to name the ones that *don't*: "No company contacts found for
+   * BANPU" is a fixable error, "one of the companies you picked is empty" is a puzzle. One query
+   * for the set, so picking twenty companies is not twenty round trips.
+   *
+   * Matched case-insensitively, and the CALLER's spelling is what comes back — it is the one
+   * they can be told about. Must fold case for the same reason `findByCompanies` does: a
+   * company this reports as empty but that one then happily loads contacts for is the worst of
+   * both answers.
+   */
+  static async companiesWithContacts(companyNames: string[]): Promise<Set<string>> {
+    if (companyNames.length === 0) return new Set();
     const db = await this.getKyselyDB();
-    const row = await db
+    const rows = await db
       .selectFrom("company_contact")
-      .select(db.fn.count("id").as("count"))
-      .where("company_name", "=", companyName)
-      .executeTakeFirst();
-    return Number(row?.count) || 0;
+      .select(sql<string>`lower(company_name)`.as("folded"))
+      .where(sql<string>`lower(company_name)`, "in", [...new Set(companyNames.map((c) => c.toLowerCase()))])
+      .distinct()
+      .execute();
+    const found = new Set(rows.map((r) => r.folded));
+    return new Set(companyNames.filter((c) => found.has(c.toLowerCase())));
   }
 
-  /** Distinct, non-null company names — the list you can compare against. */
+  /**
+   * Distinct, non-null company names — the list you can compare against.
+   *
+   * Folded by case, one spelling per company. `company_name` is stored as the file wrote it, so
+   * two uploads spelling the same employer "ACME CO" and "Acme Co" put two rows in this list;
+   * picking either then ran against only that spelling's contacts and silently left out the
+   * rest of the company. `min()` picks the survivor — arbitrary, but stable across calls, which
+   * is what stops the picker's options reshuffling between renders.
+   */
   static async distinctCompanies(): Promise<string[]> {
     const db = await this.getKyselyDB();
     const rows = await db
       .selectFrom("company_contact")
-      .select("company_name")
+      .select(sql<string>`min(company_name)`.as("company_name"))
       .where("company_name", "is not", null)
-      .distinct()
-      .orderBy("company_name", "asc")
+      .groupBy(sql`lower(company_name)`)
+      .orderBy(sql`min(company_name) asc`)
       .execute();
-    return rows.map((r) => r.company_name as string);
+    return rows.map((r) => r.company_name);
   }
 
   static async findAllPaginated(page: number, limit: number): Promise<PaginatedResult<CompanyDataRow>> {

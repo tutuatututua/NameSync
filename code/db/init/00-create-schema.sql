@@ -1,0 +1,25 @@
+-- ============================================================================
+-- Create the `lakeshore` schema that api/docs/schema-redesign.sql populates.
+-- ============================================================================
+-- Postgres runs everything in /docker-entrypoint-initdb.d exactly ONCE, when the
+-- data directory is empty — i.e. on a fresh `pgdata` volume, never again. Files run
+-- in alphabetical order, as POSTGRES_USER against POSTGRES_DB, which is why this is
+-- `00-` and the redesign is mounted as `01-`.
+--
+-- This exists because schema-redesign.sql deliberately does NOT create the schema:
+-- in production `lakeshore` already exists inside a database shared with other
+-- services, so the script assumes it and leaves the CREATE commented out. A fresh
+-- container has no such schema, and every `lakeshore.*` statement would fail on a
+-- schema that isn't there.
+--
+-- This is the ONLY DDL the stack applies on its own, and only ever to a brand-new
+-- container-local database. It does not weaken the app's no-DDL rule
+-- (DB_SKIP_MIGRATE=1, api/Dockerfile): Postgres runs this, not the app, and a
+-- database with data in it never re-runs it. Shared/production databases are still
+-- changed by hand — see docs/DB.md.
+--
+-- Hardcodes `lakeshore` because schema-redesign.sql does too. Pointing DB_SCHEMA at
+-- some other name needs both files changed, not just the env var.
+-- ============================================================================
+
+CREATE SCHEMA IF NOT EXISTS lakeshore;

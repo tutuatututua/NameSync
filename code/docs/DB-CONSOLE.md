@@ -76,6 +76,5 @@ jsonb), stamped with the JWT subject of whoever saved it. Saving stores the text
 does not run it — a saved query only ever reaches the database through the read-only path above,
 so it is no more dangerous than a typed one.
 
-Defined in **two** places, which must stay in step: `api/migrations/0014_create_saved_query.ts`
-and `api/docs/schema-redesign.sql` (the test harness builds its schema from the SQL file, not the
-migrations).
+Defined in `api/docs/schema-redesign.sql`, which is the only definition — the test harness
+builds its schema from that file, so it is the one the tests actually exercise.

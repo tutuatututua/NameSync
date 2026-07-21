@@ -21,33 +21,84 @@ import {
   RunRowSchema,
   RunRowsQuerySchema,
   RenameComparisonBodySchema,
-  isMatch,
+  rowVerdict,
   paginated,
 } from "@extensions/contract";
 import type { CompanyDataRow, FacebookDataRow } from "@extensions/contract";
 import { UploadModel } from "../models/upload.model";
-import { ComparisonModel, TOP_MATCHES } from "../models/comparison.model";
+import { ComparisonModel } from "../models/comparison.model";
 import { ComparisonResultModel } from "../models/comparison-result.model";
 import { CompanyContactModel } from "../models/company-contact.model";
 import { FriendModel } from "../models/friend.model";
 import { isFinished, percentDone } from "../models/row-status";
-import { isExternalMatcher } from "../config/env";
+import { env, isExternalMatcher } from "../config/env";
 import { FileParserService } from "../services/file-parser.service";
 import { WebSocketService } from "../services/websocket.service";
 import { WebhookService } from "../services/webhook.service";
 import { MatcherService } from "../services/matcher.service";
-import { BadRequest, NotFound } from "../lib/errors";
+import { BadRequest, NotFound, ServiceUnavailable } from "../lib/errors";
 import { ok, okList, okMessage } from "../lib/http";
 import { requireCallbackToken } from "../lib/auth";
 // Shared with the preview endpoint, so the file the preview read is the file this imports.
 import { parseUpload, unlinkQuiet } from "../lib/upload-files";
+
+/**
+ * Hand an import's stored rows to the ingestion webhook, and keep the books straight either
+ * way. A failed handover fails the import AND its run — nobody is going to work on it, and
+ * failing it here is what stops the Compare page waiting forever on a workflow that never got
+ * the file. A successful one completes the import under the internal matcher; under the
+ * external one it (re)sets both to 'processing' — the workflow has not looked at a single row
+ * yet, and if this send is a *retry* of a failed one, the import and its run are live again.
+ *
+ * Called by POST /run — the import forwards itself, in the same request, because the old
+ * design had the browser make a second call and a browser that died between the two left a
+ * run stuck at 'processing' with rows nobody ever sent — and by POST /:id/send-webhook, which
+ * is the manual retry for exactly that failure.
+ */
+async function forwardRowsToWebhook(
+  uploadId: string,
+  isCompany: boolean,
+  rows: CompanyDataRow[] | FacebookDataRow[],
+  comparisonId: string | null
+): Promise<void> {
+  WebSocketService.broadcast(uploadId, {
+    type: "sending_to_webhook",
+    sessionId: uploadId,
+    message: "Sending data",
+  });
+  try {
+    if (isCompany) await WebhookService.sendCompanyRows(uploadId, rows as CompanyDataRow[], comparisonId);
+    else await WebhookService.sendFacebookRows(uploadId, rows as FacebookDataRow[], comparisonId);
+  } catch (err) {
+    await UploadModel.updateStatus(uploadId, "failed");
+    if (comparisonId) await ComparisonModel.updateStatus(comparisonId, "failed");
+    WebSocketService.broadcast(uploadId, {
+      type: "processing_failed",
+      sessionId: uploadId,
+      message: "Failed to send data to the ingestion webhook",
+    });
+    throw err;
+  }
+  if (isExternalMatcher()) {
+    // Handing the file over is not the same as the work being done — the import stays
+    // 'processing' until the workflow has stamped every row. Written, not assumed, so a
+    // retry un-fails the statuses the failed attempt set. Idempotent on a first send.
+    await UploadModel.updateStatus(uploadId, "processing");
+    if (comparisonId) await ComparisonModel.updateStatus(comparisonId, "processing");
+  } else {
+    await UploadModel.updateStatus(uploadId, "completed");
+  }
+  WebSocketService.broadcast(uploadId, { type: "webhook_success", sessionId: uploadId, message: "Data sent" });
+}
 
 export default async function comparisonsRoutes(fastify: FastifyInstance): Promise<void> {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
 
   // POST /api/comparisons/run — import a company file and/or a facebook file into
   // its cumulative table (deduped, with membership). Each file is its own `upload`.
-  // The external matcher reads Postgres directly, so nothing is forwarded here.
+  // An import that added rows forwards them to the ingestion webhook before this
+  // responds — one request, so there is no window for the browser to die between
+  // "rows imported" and "rows sent" and strand a run nobody is working on.
   app.post(
     "/run",
     { schema: { response: { 200: apiSuccess(RunComparisonDataSchema) } } },
@@ -61,6 +112,11 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
       if (facebookPath && !uploadPersonName) {
         unlinkQuiet(companyPath, facebookPath);
         throw new BadRequest("Upload user is required for a friends import");
+      }
+      // No file is not an import. Answering 200 here used to leave the caller believing
+      // something was recorded when nothing was.
+      if (!companyPath && !facebookPath) {
+        throw new BadRequest("No file attached — upload a company or Facebook .xlsx file");
       }
       const name =
         (fields.name && fields.name.trim()) || `Comparison ${new Date().toISOString().slice(0, 10)}`;
@@ -86,10 +142,10 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
       const openRun = async (): Promise<string> => {
         const run = await ComparisonModel.create({
           name,
-          // No company: a run started by an import scores the new rows against *everything*
-          // on the other side, not against one company the user picked. Past runs renders a
-          // null selected_company as a whole-table run, which is exactly what this is.
-          selected_company: null,
+          // No companies: a run started by an import scores the new rows against *everything*
+          // on the other side, not against companies the user picked. Past runs renders an
+          // empty selected_companies as a whole-table run, which is exactly what this is.
+          selected_companies: null,
           status: "processing",
         });
         return run.id;
@@ -98,48 +154,106 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
       /**
        * Close the books on an import, once we know what it actually brought in.
        *
-       * The run is opened HERE, after the merge — not before it, which is where this used to
-       * happen. An import whose every row was a duplicate adds nothing, and a run over nothing is
-       * not a run: it has no rows for the workflow to stamp, so it can never finish. It used to
-       * open one anyway, and the result was a comparison stuck at "Running · 0 of 0 rows · 100%"
-       * for good — the progress endpoint reporting a full bar (an empty upload is vacuously done)
-       * and simultaneously refusing to complete it (it waits for at least one row). Not opening
-       * the run is the fix, and it is also just the truth: there is nothing new to compare.
+       * An import whose every row was a duplicate added nothing, and it leaves nothing behind —
+       * not even the history row. It used to stay as an audit note ("you imported this file and
+       * all 42 rows were already here"), but a history of non-events reads as events: the Uploads
+       * page listed an import that put nothing in the tables, whose rollback was a button that
+       * did nothing. The response still carries the duplicate count, so the user is told exactly
+       * what happened; it is just not a record.
        *
-       * The upload is still recorded — it is the audit note that says "you imported this file and
-       * all 42 rows were already here", which is worth knowing — but it is `completed` on the
-       * spot, because it is.
+       * The run is opened HERE, after the merge — not before it, which is where this used to
+       * happen. A run over an import that added nothing is not a run: it has no rows for the
+       * workflow to stamp, so it can never finish. It used to open one anyway, and the result was
+       * a comparison stuck at "Running · 0 of 0 rows · 100%" for good — the progress endpoint
+       * reporting a full bar (an empty upload is vacuously done) and simultaneously refusing to
+       * complete it (it waits for at least one row).
        */
-      const finishImport = async (uploadId: string, added: number): Promise<void> => {
-        if (external && added > 0) {
+      const finishImport = async (
+        uploadId: string,
+        merged: { added: number; duplicates: number }
+      ): Promise<string | null> => {
+        if (merged.added === 0) {
+          await UploadModel.deleteById(uploadId);
+          return null;
+        }
+        await UploadModel.updateImportCounts(uploadId, merged.added, merged.duplicates);
+        if (external) {
           // Under the external matcher the import is NOT done — the workflow has not looked at a
           // single row yet. Leaving it 'processing' is the whole point: the Uploads page shows the
           // truth, and the poll has something to wait for.
           comparisonId = await openRun();
           await UploadModel.setComparisonId(uploadId, comparisonId);
-          return;
+          return comparisonId;
         }
         await UploadModel.updateStatus(uploadId, "completed");
+        return null;
       };
 
       try {
+        // Each file is parsed and validated BEFORE its upload row is created. A file that can't
+        // be read, has no rows, or matches none of the expected columns must leave no trace —
+        // creating the row first meant a corrupt workbook left a history entry stuck at
+        // 'processing' for an import that never happened.
         if (companyPath) {
+          // With the external matcher on, the webhook IS the pipeline: importing without it
+          // would store rows and open a run no workflow will ever see. Refuse before writing
+          // anything. With the internal matcher the webhook is an optional mirror — an
+          // unconfigured URL means "don't forward", not "can't import".
+          if (external && !env.COMPANY_WEBHOOK_URL) {
+            throw new ServiceUnavailable("Ingestion service is not configured (COMPANY_WEBHOOK_URL missing)");
+          }
+          const recs = await FileParserService.parseCompanyXLSX(companyPath);
+          if (recs.length === 0) {
+            throw new BadRequest("The company file has no rows to import");
+          }
+          // A contact needs a PERSON name, in either script. A company name alone is not a
+          // contact: there is nothing for the matcher to score, and — worse — every such row
+          // keys to the same (company, null, null) dedup tuple, so a file of them used to
+          // import exactly one row and silently count the rest as duplicates.
+          //
+          // Tested on the cleaned name, which is what will be stored: a cell holding only
+          // "คุณ" cleans to null and is no more a contact than an empty cell is.
+          const usable = recs.filter((r) => r.person_name_th || r.person_name_en);
+          if (usable.length === 0) {
+            throw new BadRequest(
+              "No row in the company file has a person's name — check that it has a Thai name or English name column, and that they aren't empty"
+            );
+          }
           const upload = await UploadModel.create({
             name,
             kind: "company",
             mode: "fresh",
             uploaded_by: uploadPersonName || null,
           });
-          const recs = await FileParserService.parseCompanyXLSX(companyPath);
-          const merged = await CompanyContactModel.mergeUpload(upload.id, recs);
+          const merged = await CompanyContactModel.mergeUpload(upload.id, usable);
           companyAdded = merged.added;
           companyDuplicates = merged.duplicates;
-          await UploadModel.updateImportCounts(upload.id, merged.added, merged.duplicates);
-          await finishImport(upload.id, merged.added);
+          const runId = await finishImport(upload.id, merged);
+          if (merged.added > 0 && env.COMPANY_WEBHOOK_URL) {
+            // The rows as stored, not as parsed: what the webhook receives is what the DB
+            // holds, duplicates already dropped.
+            const rows = await CompanyContactModel.findByUploadId(upload.id);
+            await forwardRowsToWebhook(upload.id, true, rows, runId);
+          }
           sessionId = upload.id;
         }
 
         if (facebookPath) {
+          if (external && !env.FACEBOOK_WEBHOOK_URL) {
+            throw new ServiceUnavailable("Ingestion service is not configured (FACEBOOK_WEBHOOK_URL missing)");
+          }
+          const recs = await FileParserService.parseFacebookXLSX(facebookPath);
+          if (recs.length === 0) {
+            throw new BadRequest("The Facebook file has no friends to import");
+          }
+          // The name column is the file: a friend row without a name can never be matched,
+          // deduped, or displayed, so nameless rows are dropped rather than stored as NULLs.
+          const usable = recs.filter((r) => r.friend_name);
+          if (usable.length === 0) {
+            throw new BadRequest(
+              "No column in the Facebook file matched the friend's name — check the file's structure"
+            );
+          }
           const upload = await UploadModel.create({
             name,
             kind: "social",
@@ -147,12 +261,14 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
             mode: "fresh",
             uploaded_by: uploadPersonName || null,
           });
-          const recs = await FileParserService.parseFacebookXLSX(facebookPath);
-          const merged = await FriendModel.mergeUpload(upload.id, "facebook", recs);
+          const merged = await FriendModel.mergeUpload(upload.id, "facebook", usable);
           facebookAdded = merged.added;
           facebookDuplicates = merged.duplicates;
-          await UploadModel.updateImportCounts(upload.id, merged.added, merged.duplicates);
-          await finishImport(upload.id, merged.added);
+          const runId = await finishImport(upload.id, merged);
+          if (merged.added > 0 && env.FACEBOOK_WEBHOOK_URL) {
+            const rows = await FriendModel.findByUploadId(upload.id);
+            await forwardRowsToWebhook(upload.id, false, rows, runId);
+          }
           sessionId = upload.id;
         }
 
@@ -183,9 +299,11 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
     }
   );
 
-  // POST /api/comparisons/:id/send-webhook — forward this import's rows to the external
-  // ingestion webhook as a raw CSV body (text/csv), then finalize the import. Company
-  // imports go to COMPANY_WEBHOOK_URL, social ones to FACEBOOK_WEBHOOK_URL.
+  // POST /api/comparisons/:id/send-webhook — re-send an import's stored rows to the external
+  // ingestion webhook. The import already forwarded itself inside POST /run; this is the manual
+  // retry for the one that failed (webhook down, timeout), and on success it un-fails the
+  // import and its run. Company imports go to COMPANY_WEBHOOK_URL, social ones to
+  // FACEBOOK_WEBHOOK_URL.
   app.post(
     "/:id/send-webhook",
     { schema: { params: IdParamSchema, response: { 200: apiSuccess(SendWebhookDataSchema) } } },
@@ -205,42 +323,20 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
       // there is no run, and the webhook is then pure ingestion.
       const comparisonId = upload.comparison_id ?? null;
 
-      // Nothing new came in — every row of the file was already on file. There is no work to hand
-      // over, and a CSV with a header and no rows is not a smaller job, it is a job that does not
-      // exist. Sending it would put an empty task through someone else's workflow and, if their
-      // endpoint took exception to it, mark this import `failed` for having imported nothing.
+      // No rows to hand over — an import whose rows were rolled back out from under it. A CSV
+      // with a header and no rows is not a smaller job, it is a job that does not exist.
+      // Sending it would put an empty task through someone else's workflow and, if their
+      // endpoint took exception to it, mark this import `failed` for having sent nothing.
       if (rows.length === 0) {
         return ok(
           { sessionId: id, status: upload.status, companyRecordsCount: 0, facebookRecordsCount: 0 },
-          "Nothing to send — every row in this file was already imported"
+          "Nothing to send — this import has no rows"
         );
       }
 
-      WebSocketService.broadcast(id, { type: "sending_to_webhook", sessionId: id, message: "Sending data" });
-      try {
-        if (isCompany) await WebhookService.sendCompanyRows(id, rows as CompanyDataRow[], comparisonId);
-        else await WebhookService.sendFacebookRows(id, rows as FacebookDataRow[], comparisonId);
-      } catch (err) {
-        await UploadModel.updateStatus(id, "failed");
-        // The run can never finish now — nobody is going to work on it. Failing it here is
-        // what stops the Compare page waiting forever on a workflow that never got the file.
-        if (comparisonId) await ComparisonModel.updateStatus(comparisonId, "failed");
-        WebSocketService.broadcast(id, {
-          type: "processing_failed",
-          sessionId: id,
-          message: "Failed to send data to the ingestion webhook",
-        });
-        throw err;
-      }
+      await forwardRowsToWebhook(id, isCompany, rows, comparisonId);
 
-      // Handing the file over is not the same as the work being done. Under the external
-      // matcher the import stays 'processing' until the workflow has stamped every row —
-      // marking it 'completed' here would mean the Uploads page called it finished at the
-      // exact moment the actual work began.
       const external = isExternalMatcher();
-      if (!external) await UploadModel.updateStatus(id, "completed");
-
-      WebSocketService.broadcast(id, { type: "webhook_success", sessionId: id, message: "Data sent" });
       return ok(
         {
           sessionId: id,
@@ -268,13 +364,12 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
         runs.map((r) => ({
           id: r.id,
           name: r.name,
-          selectedCompany: r.selected_company,
+          selectedCompanies: r.selected_companies,
           status: r.status,
           date: r.created_at,
           rowCount: r.row_count,
           matchCount: r.match_count,
           scoredCount: r.scored_count,
-          topConfidence: r.top_confidence,
         }))
       );
     }
@@ -312,7 +407,12 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
     }
   );
 
-  // POST /api/comparisons/compare — run a comparison against ONE selected company.
+  // POST /api/comparisons/compare — run ONE comparison against one or more selected companies.
+  //
+  // One run, not one per company. Every friend is scored against the union of the selected
+  // companies' contacts and keeps its single closest match, so the output is still one row per
+  // friend and the run still has one finding — see MatcherService.run, which explains why a
+  // per-company best would be the wrong shape.
   //
   // The match is computed here, against Postgres (see matcher.service). It used to be
   // handed to an external matcher via COMPARE_WEBHOOK_URL, which then POSTed batches back
@@ -326,30 +426,48 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
     "/compare",
     { schema: { body: CompareByCompanyBodySchema, response: { 200: apiSuccess(TriggerCompareDataSchema) } } },
     async (req) => {
-      const companyName = req.body.company_name;
+      const companyNames = req.body.company_names;
 
-      // Nothing to score against is a bad request, not a failed run — say so before
-      // creating a `comparison` row that could only ever be empty.
-      if ((await CompanyContactModel.countByCompany(companyName)) === 0) {
-        throw new BadRequest(`No company contacts found for "${companyName}"`);
+      /**
+       * Nothing to score against is a bad request, not a failed run — say so before creating a
+       * `comparison` row that could only ever be empty.
+       *
+       * Every named company has to have contacts, not just one of them. Dropping the empties and
+       * running the rest would answer a question the user did not ask and report it as though they
+       * had: "34 matches" across the two companies that happened to have data, with no mention that
+       * the third contributed nothing. The names come from the picker, which is built from
+       * `distinctCompanies()`, so an empty one means the data moved under them — worth stopping for.
+       */
+      const withContacts = await CompanyContactModel.companiesWithContacts(companyNames);
+      const empty = companyNames.filter((c) => !withContacts.has(c));
+      if (empty.length > 0) {
+        throw new BadRequest(
+          `No company contacts found for ${empty.map((c) => `"${c}"`).join(", ")}`
+        );
       }
 
-      const name = `${companyName} · ${new Date().toISOString().slice(0, 10)}`;
+      // The stock name carries every company, and `runTitle` (frontend/lib/format.ts) strips the
+      // date back off for display. Long for a five-company run, and deliberately so: it is the
+      // record of what was asked, and the list that renders it truncates.
+      const name = `${companyNames.join(", ")} · ${new Date().toISOString().slice(0, 10)}`;
       const comparison = await ComparisonModel.create({
         name,
-        selected_company: companyName,
+        selected_companies: companyNames,
         status: "processing",
       });
       const sessionId = comparison.id;
 
+      const label =
+        companyNames.length === 1 ? companyNames[0] : `${companyNames.length} companies`;
+
       WebSocketService.broadcast(sessionId, {
         type: "comparison_starting",
         sessionId,
-        message: `Comparing against ${companyName}`,
+        message: `Comparing against ${label}`,
       });
 
       try {
-        await MatcherService.run(sessionId, companyName);
+        await MatcherService.run(sessionId, companyNames);
       } catch (err) {
         await ComparisonModel.updateStatus(sessionId, "failed");
         WebSocketService.broadcast(sessionId, {
@@ -357,7 +475,7 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
           sessionId,
           message: "Comparison failed",
         });
-        req.log.error({ err, sessionId, companyName }, "comparison failed");
+        req.log.error({ err, sessionId, companyNames }, "comparison failed");
         throw err;
       }
 
@@ -385,28 +503,54 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
       const comparison = await ComparisonModel.findById(id);
       if (!comparison) throw new NotFound("Comparison not found");
 
-      const upload = await UploadModel.findByComparisonId(id);
+      // Guarded on the flag, not just on the lookup — `upload.comparison_id` arrives with the
+      // hand-applied migration, so naming it on a database that has not had it run fails the
+      // request outright. Same reason, same shape, as the results endpoint below.
+      const upload = isExternalMatcher() ? await UploadModel.findByComparisonId(id) : undefined;
 
-      // A run with no import behind it is one the internal matcher produced: it was finished
-      // inside the request that created it, and there are no row statuses to count. Report the
-      // run's own status and a full bar rather than pretending to track something.
-      if (!upload || !isExternalMatcher()) {
+      // The extra columns the run's matcher sent, if any. Read from the results table either way:
+      // `extra` is a property of a *result*, not of the row that produced it, so both kinds of run
+      // keep theirs in the same place.
+      const extraKeys = await ComparisonResultModel.extraKeys(id);
+
+      /**
+       * A run with no import behind it — compare-by-company, the internal matcher.
+       *
+       * It was finished inside the request that created it, so there is no progress to track and
+       * nothing has stamped a status. But it is NOT the empty run this used to report: its rows
+       * are the `comparison_result` rows themselves, one per friend it scored, and their verdicts
+       * are derived from their scores. The tally is real, and the table above it needs these
+       * numbers to label its filter tabs — reporting zeros gave a run with 320 rows in it a set of
+       * tabs that all read "0".
+       */
+      if (!upload) {
+        const counts = await ComparisonResultModel.statusCounts(id);
         return ok({
           comparisonId: id,
           status: comparison.status,
-          total: 0,
-          pending: 0,
-          matched: 0,
-          unmatched: 0,
-          failed: 0,
-          percent: 100,
+          total: counts.total,
+          // Both are structurally impossible here rather than merely absent: a row exists only
+          // once the matcher has decided it, and the matcher cannot half-fail one row.
+          pending: counts.pending,
+          failed: counts.failed,
+          matched: counts.matched,
+          unmatched: counts.unmatched,
+          percent: percentDone(counts),
+          // These rows are friends: the user picked a company and asked who on file works there.
+          kind: "facebook" as const,
+          origin: "compare" as const,
+          extraKeys,
         });
       }
 
+      // `upload.kind` is the import's vocabulary ('company' | 'social'); `RunRow.kind` is the
+      // reader's ('company' | 'facebook'). Mapped once, here, rather than at each row.
+      const kind = upload.kind === "company" ? ("company" as const) : ("facebook" as const);
+
       const counts =
         upload.kind === "company"
-          ? await CompanyContactModel.statusCounts(upload.id)
-          : await FriendModel.statusCounts(upload.id);
+          ? await CompanyContactModel.statusCounts(upload.id, id)
+          : await FriendModel.statusCounts(upload.id, id);
 
       // A failed run stays failed. The workflow never got the file (send-webhook failed), so
       // its rows will sit at 'processing' forever and counting them would report a job that is
@@ -421,6 +565,9 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
           unmatched: counts.unmatched,
           failed: counts.failed,
           percent: percentDone(counts),
+          kind,
+          origin: "import" as const,
+          extraKeys,
         });
       }
 
@@ -434,9 +581,6 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
           ComparisonModel.updateStatus(id, "completed"),
           UploadModel.updateStatus(upload.id, "completed"),
         ]);
-        // Everything on file has now been through a completed run, so nothing is "new" any
-        // more — the same bookkeeping the callback path does when a run finishes.
-        await Promise.all([CompanyContactModel.markAllFetched(), FriendModel.markAllFetched()]);
         status = "completed";
 
         WebSocketService.broadcast(id, {
@@ -455,6 +599,9 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
         unmatched: counts.unmatched,
         failed: counts.failed,
         percent: percentDone(counts),
+        kind,
+        origin: "import" as const,
+        extraKeys,
       });
     }
   );
@@ -470,8 +617,12 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
    *
    * Deliberately NOT gated on the run still being in flight. A finished run's rows are worth
    * reading too — it is the only view that shows the names that *didn't* match next to the ones
-   * that did, which `comparison_result` alone cannot answer (a workflow need only write a result
-   * for a row that matched).
+   * that did, which `comparison_result` alone cannot answer for an import (a workflow need only
+   * write a result for a row that matched).
+   *
+   * Every run has rows here, whichever matcher made it — the branch below is only about *where*
+   * they physically live, not about whether they exist. That is the whole point: one endpoint, one
+   * row shape, one table on screen, for a friends import, a company import and a compare alike.
    */
   app.get(
     "/:id/rows",
@@ -484,29 +635,27 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
     },
     async (req) => {
       const { id } = req.params;
-      const { page, limit, filter } = req.query;
+      const { page, limit, filter, sort } = req.query;
 
       const comparison = await ComparisonModel.findById(id);
       if (!comparison) throw new NotFound("Comparison not found");
 
-      // No import behind the run, or the internal matcher: there are no row statuses to read.
-      // An empty page is the honest answer — the rows exist, but nothing ever stamped them, so
-      // there is no per-row story to tell. The results table is the view for those runs.
+      // No import behind the run: compare-by-company, whose rows are its `comparison_result` rows
+      // — one per friend scored, verdicts derived from the scores. This used to return an empty
+      // page and send the reader to a second, different table; the rows were always here.
       const upload = isExternalMatcher() ? await UploadModel.findByComparisonId(id) : undefined;
-      if (!upload) {
-        return okList([], { page, limit, total: 0, totalPages: 0 });
-      }
 
-      const rows =
-        upload.kind === "company"
-          ? await CompanyContactModel.findRunRows(upload.id, id, page, limit, filter)
-          : await FriendModel.findRunRows(upload.id, id, page, limit, filter);
+      const rows = !upload
+        ? await ComparisonResultModel.findRunRows(id, page, limit, filter, sort)
+        : upload.kind === "company"
+          ? await CompanyContactModel.findRunRows(upload.id, id, page, limit, filter, sort)
+          : await FriendModel.findRunRows(upload.id, id, page, limit, filter, sort);
 
       return okList(rows.data, rows.pagination);
     }
   );
 
-  // GET /api/comparisons/:id/results — stored match scores for a comparison run
+  // GET /api/comparisons/:id/results — stored matches for a comparison run
   app.get(
     "/:id/results",
     { schema: { params: IdParamSchema, response: { 200: apiSuccess(ResultsDataSchema) } } },
@@ -516,14 +665,12 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
       if (!comparison) throw new NotFound("Comparison not found");
 
       const results = await ComparisonResultModel.findByComparisonId(id);
-      const scores = results.map((r) => Number(r.matching_score)).filter((s) => Number.isFinite(s));
-      const mean = (xs: number[]) => (xs.length ? xs.reduce((sum, s) => sum + s, 0) / xs.length : 0);
 
-      // The headline badge averages the ten best matches — same definition the Past runs
-      // list uses (ComparisonModel.TOP_MATCHES), so a run doesn't change its score when you
-      // click into it. `meanConfidence` stays the true mean over every scored row; it is a
-      // mean over mostly-strangers, which is why the UI no longer leads with it.
-      const topConfidence = mean([...scores].sort((a, b) => b - a).slice(0, TOP_MATCHES));
+      // Counted through `rowVerdict`, the same rule the Past runs list counts with and the same
+      // one the row badges render with — so the headline, the tabs and each row cannot come from
+      // three readings of one column. There is no confidence figure beside it any more: a row
+      // records that it matched, not how well, so there is nothing left to average.
+      const matchCount = results.filter((r) => rowVerdict(r.status) === "matched").length;
 
       // How many names the run actually looked at. A workflow only has to write a result row
       // for a row that *matched*, so counting the results would tell a run that matched 5 of
@@ -537,8 +684,8 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
       const upload = isExternalMatcher() ? await UploadModel.findByComparisonId(id) : undefined;
       const scoredCount = upload
         ? (upload.kind === "company"
-            ? await CompanyContactModel.statusCounts(upload.id)
-            : await FriendModel.statusCounts(upload.id)
+            ? await CompanyContactModel.statusCounts(upload.id, id)
+            : await FriendModel.statusCounts(upload.id, id)
           ).total
         : results.length;
 
@@ -549,10 +696,10 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
         // Never fewer than the rows we hold: a stale or partial count must not make a run look
         // like it matched more people than it scored.
         scoredCount: Math.max(scoredCount, results.length),
-        matchCount: scores.filter(isMatch).length,
-        meanConfidence: mean(scores),
-        topConfidence,
-        selectedCompany: comparison.selected_company ?? null,
+        matchCount,
+        // Empty for a whole-table run. Which company each individual match landed at is on the
+        // result row itself (`company_name`) — this is the question the run asked, not its answers.
+        selectedCompanies: comparison.selected_companies ?? [],
         results,
       });
     }
@@ -590,7 +737,7 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
     }
   );
 
-  // GET /api/comparisons/data-stats — per-table totals split into old vs new
+  // GET /api/comparisons/data-stats — how many rows each table holds
   app.get(
     "/data-stats",
     { schema: { response: { 200: apiSuccess(DataStatsSchema) } } },

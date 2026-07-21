@@ -3,7 +3,7 @@ import { FriendModel } from "../models/friend.model";
 import { ComparisonModel } from "../models/comparison.model";
 import { ComparisonResultModel } from "../models/comparison-result.model";
 import { WebSocketService } from "./websocket.service";
-import { effectiveName } from "./name-cleaner.service";
+import { ROW_MATCH, ROW_UNMATCH } from "@extensions/contract";
 
 /**
  * The comparison, computed here against Postgres. There is no external matcher and no
@@ -21,23 +21,43 @@ import { effectiveName } from "./name-cleaner.service";
  * algorithm exactly is the hedge — if a DBA ever runs `CREATE EXTENSION pg_trgm`, this
  * becomes a single SQL query with the same numbers, and stored scores stay comparable.
  *
- * Trigrams (rather than an edit distance like Jaro-Winkler) because the score feeds the
- * confidence tiers, which need the *low* end to be genuinely low. Edit distances have a
- * high floor — two unrelated Thai transliterations still score ~0.45, which would land
- * unrelated people in the "medium" band. Trigram overlap sends them to ~0.05.
+ * Trigrams (rather than an edit distance like Jaro-Winkler) because the decision below needs the
+ * *low* end to be genuinely low. Edit distances have a high floor — two unrelated Thai
+ * transliterations still score ~0.45, close enough to the bar that noise starts crossing it.
+ * Trigram overlap sends them to ~0.05.
+ *
+ * The score itself is not stored. `comparison_result` records a verdict and not a number, so what
+ * leaves this file is `match` or `unmatch` — the arithmetic is real, but it is this matcher's own
+ * and nothing downstream can see, re-check or re-judge it.
  */
 
 /** Titles carried by company rows but never by a Facebook name. Left in, they would drag
  *  every score down by a constant and compress the bands. pg_trgm would not strip these;
  *  this is the one deliberate departure from it.
  *
- *  Names are now de-titled at *import* (name-cleaner.service.ts) and this scores the clean
- *  column, so in practice there is nothing here for this to strip. It stays as the backstop
- *  for a row that was written before cleaning existed and hasn't been backfilled. */
+ *  Names are de-titled at *import* (name-cleaner.service.ts) and that is the only spelling
+ *  stored, so in practice there is nothing here for this to strip. It stays as the backstop for
+ *  a title the cleaner's rules don't recognise but these do. */
 const HONORIFIC = /^(mr|mrs|ms|miss|dr|prof|khun|นาย|นาง|นางสาว|ดร)$/;
 
 /** Rows per batch. Only shapes the progress events + `batch_number`; not a query limit. */
 const BATCH_SIZE = 200;
+
+/**
+ * The similarity at or above which THIS matcher calls a pair a match.
+ *
+ * Private to the file, where it used to be `MATCH_THRESHOLD` in the shared contract. That move is
+ * the substance of dropping `matching_score`, not a tidy-up: the constant was shared because the
+ * API counted with it and the UI badged with it, both re-deriving each row's verdict from a stored
+ * score on every read. Nothing re-derives anything now — this matcher decides once, writes the
+ * verdict, and the number never leaves this function.
+ *
+ * Two consequences worth knowing before touching it. Changing it no longer restates history: runs
+ * already written keep the verdicts they were written with, where before every past run was
+ * silently re-judged by whatever this said today. And it now describes only the internal matcher —
+ * an external workflow applies its own bar, which we cannot see and this does not constrain.
+ */
+const MATCH_THRESHOLD = 0.8;
 
 /** Lower-case, strip punctuation, drop honorifics. Returns the words that carry identity. */
 function words(name: string): string[] {
@@ -71,6 +91,8 @@ export function similarity(a: Set<string>, b: Set<string>): number {
 }
 
 interface Candidate {
+  /** Where this contact works — carried onto the winning result row. */
+  company_name: string | null;
   person_name_en: string | null;
   person_name_th: string | null;
   en: Set<string>;
@@ -79,16 +101,26 @@ interface Candidate {
 
 export class MatcherService {
   /**
-   * Score every friend against every contact at `companyName`, keep each friend's best
+   * Score every friend against every contact at any of `companyNames`, keep each friend's best
    * match, and store it. Marks the run completed and flips the "new" rows to "old",
    * exactly as the webhook callback did on its final batch.
    *
    * Runs to completion before it returns: the caller is the HTTP request, so a client
    * that gets 200 back can trust the results are already queryable.
+   *
+   * SEVERAL COMPANIES IS ONE RUN, NOT SEVERAL. The candidates are pooled and each friend keeps
+   * its single closest contact across the whole pool, so the output is still one row per friend
+   * and the run still has one finding. It is deliberately NOT a per-company best: a friend who
+   * is a 0.97 match for someone at PTT and a 0.31 match for someone at BANPU has one plausible
+   * colleague, not two, and listing the 0.31 would pad every multi-company run with the nearest
+   * stranger at each company it named.
+   *
+   * The cost of that pooling is that "the run's company" stops existing, which is why the winner
+   * carries `company_name` onto its row — see the 2026-07-16 migration.
    */
-  static async run(comparisonId: string, companyName: string): Promise<number> {
+  static async run(comparisonId: string, companyNames: string[]): Promise<number> {
     const [contacts, friends] = await Promise.all([
-      CompanyContactModel.findByCompany(companyName),
+      CompanyContactModel.findByCompanies(companyNames),
       FriendModel.findAllForMatching(),
     ]);
 
@@ -96,21 +128,21 @@ export class MatcherService {
     // so a Thai-script friend name matches person_name_th and a Latin one matches
     // person_name_en, without having to know which alphabet the export used.
     //
-    // Scored on the *clean* names (titles, suffixes, nicknames and middle names already
-    // stripped at import), but the *raw* names are what's carried into the result row —
-    // the results table has to show the person as their file spells them. `effectiveName`
-    // covers rows written before cleaning existed by cleaning them here instead.
+    // Scored on the stored names directly: they were cleaned and lower-cased at import
+    // (name-cleaner.service.ts), so what is stored is already what should be scored — and it is
+    // also what goes into the result row, because there is no other spelling of them to show.
     const candidates: Candidate[] = contacts.map((c) => ({
+      company_name: c.company_name,
       person_name_en: c.person_name_en,
       person_name_th: c.person_name_th,
-      en: trigrams(effectiveName(c.person_name_en_clean, c.person_name_en)),
-      th: trigrams(effectiveName(c.person_name_th_clean, c.person_name_th)),
+      en: trigrams(c.person_name_en),
+      th: trigrams(c.person_name_th),
     }));
 
     const rows = [];
     for (const friend of friends) {
       if (!friend.friend_name) continue; // an unnamed friend can't match anything
-      const fg = trigrams(effectiveName(friend.friend_name_clean, friend.friend_name));
+      const fg = trigrams(friend.friend_name);
 
       let best: Candidate | null = null;
       let bestScore = -1;
@@ -121,15 +153,21 @@ export class MatcherService {
           best = c;
         }
       }
-      if (!best) continue; // no contacts at this company — nothing to score against
+      if (!best) continue; // no contacts at any selected company — nothing to score against
 
       rows.push({
         comparison_id: comparisonId,
         fb_name: friend.friend_name,
         person_name_en: best.person_name_en,
         person_name_th: best.person_name_th,
-        // real(4-byte) column: 4dp is well inside its precision and keeps the JSON tidy.
-        matching_score: Math.round(bestScore * 10_000) / 10_000,
+        // Which company this friend actually landed at. The run's own list says which companies
+        // were *asked about*; only the winning candidate knows which one answered, and once a run
+        // can name three there is nothing downstream that could work it back out — two companies
+        // employing one name is common enough that guessing by name is a coin toss.
+        company_name: best.company_name,
+        // The verdict, decided here and now, because there is nowhere to defer it to: the score
+        // is not stored, so this is the only moment anything will ever know what `bestScore` was.
+        status: bestScore >= MATCH_THRESHOLD ? ROW_MATCH : ROW_UNMATCH,
         // We know exactly who uploaded this friend, so fill it rather than leaning on the
         // results view's name-based fallback (which guesses when two uploads share a name).
         upload_name: friend.uploaded_by,
@@ -146,8 +184,12 @@ export class MatcherService {
       const slice = rows.slice(i * BATCH_SIZE, batchNumber * BATCH_SIZE);
 
       if (slice.length > 0) {
+        // Each row already carries its `status`, stamped above. These rows are decided the instant
+        // they exist — this matcher scored them moments ago inside this request and nothing is
+        // coming back for them. Passing 'processing' would park a finished run at 0% forever,
+        // since nothing would ever return to unstamp it.
         await ComparisonResultModel.createMany(
-          slice.map((r) => ({ ...r, batch_number: batchNumber, is_complete: isLast }))
+          slice.map((r) => ({ ...r, batch_number: batchNumber }))
         );
       }
 
@@ -163,9 +205,6 @@ export class MatcherService {
     }
 
     await ComparisonModel.updateStatus(comparisonId, "completed");
-    // The run read the full tables, so everything loaded now counts as "old"; rows added
-    // afterwards are "new" until the next completion.
-    await Promise.all([CompanyContactModel.markAllFetched(), FriendModel.markAllFetched()]);
 
     WebSocketService.broadcast(comparisonId, {
       type: "comparison_complete",

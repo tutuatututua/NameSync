@@ -37,9 +37,12 @@ command line, and it must be an admin — otherwise no one can create the second
 
 ```bash
 cd code/api
-npm run migrate
 npm run create-user -- you@example.com 'a long passphrase' --name "Your Name" --admin
 ```
+
+This needs `app_user` / `auth_session` to exist already — they are created by
+`docs/schema-redesign.sql` along with the rest of the schema (see [DB.md](DB.md)), or by
+`docs/add-auth.sql` if you are adding auth to a database that predates it.
 
 After that, an admin creates users through the API (`POST /api/auth/users`).
 

@@ -1,8 +1,8 @@
 # NameSync
 
 Upload **Company data** and **Facebook friends** (both `.xlsx`), forward both to an external
-name-matching service, watch progress live over WebSocket, and review **confidence-scored
-name matches** — with history and saved comparisons.
+name-matching service, watch progress live over WebSocket, and review the **name matches** it
+found — with history and saved comparisons.
 
 ## Architecture
 
@@ -23,42 +23,84 @@ The external matcher is reached via webhooks; it POSTs results back (in batches)
 ```bash
 cd code
 # Provide secrets/config via env or a .env file next to docker-compose.yml:
-#   POSTGRES_PASSWORD, CORS_ORIGIN, COMPANY_WEBHOOK_URL, FACEBOOK_WEBHOOK_URL,
+#   DATABASE_URL (required — the stack will not start without it),
+#   CORS_ORIGIN, COMPANY_WEBHOOK_URL, FACEBOOK_WEBHOOK_URL,
 #   WEBHOOK_CALLBACK_URL_BASE, CALLBACK_TOKEN
 docker compose up --build
 ```
 
 - Frontend → http://localhost:3000  ·  API → http://localhost:4000  ·  API docs → http://localhost:4000/docs
-- Postgres is provisioned automatically; the API migrates then serves.
+- **The stack does not include a database.** The local `postgres` service was removed on
+  2026-07-17; `docker compose up` starts `api` and `frontend` only, and they talk to whatever
+  `DATABASE_URL` points at. It is required, and a missing value aborts the stack rather than
+  falling back to anything.
+- **`DATABASE_URL` points at a live, shared database.** Treat it accordingly: that data is real,
+  it is not container-local, and nothing here recreates it. The API never creates tables either
+  (`DB_SKIP_MIGRATE=1`) — the `lakeshore` schema is owned out-of-band. See
+  [docs/DB.md](docs/DB.md) for how to change a database that has data in it.
+- **There is no `docker compose down -v` reset.** No database volume means nothing to reset, and
+  `api/docs/schema-redesign.sql` is drop-and-recreate — running *that* against the live database
+  destroys it. `git revert` the commit that removed the `postgres` service to get local dev back.
+
+Then create the first account — the schema is built but has no users, and sign-in is the
+only way in (`AUTH_DISABLED` is refused in production):
+
+```bash
+docker compose exec api npm run create-user -- you@example.com 'a long passphrase' --name "You" --admin
+```
+
+(Only needed once per database, and only if it has no users yet.)
 
 ## Local development
+
+Run a process on the host when you want a watch loop.
+
+**You supply the database.** Nothing in this repo starts one. Point `DATABASE_URL` at a Postgres
+you control — a local container of your own, or a scratch database — and build the `lakeshore`
+schema in it yourself with `api/docs/schema-redesign.sql` (drop-and-recreate: never run it against
+data you want to keep).
 
 ```bash
 cd code
 npm ci
-docker compose up -d postgres          # Postgres on host port 55432
-cp api/.env.example api/.env           # then fill in webhook URLs; keep DATABASE_URL
+cp api/.env.example api/.env           # then set DATABASE_URL and the webhook URLs
 
-npm --prefix api run migrate           # apply migrations
 npm --prefix api run dev               # API on :4000 (tsx watch)
 npm --prefix frontend run dev          # Frontend on :3000
 ```
 
-`run-dev.ps1` starts the API + frontend in two windows (Windows).
+The app never creates tables itself — see [docs/DB.md](docs/DB.md) for why, and for how to
+change a database that already has data in it.
 
 The frontend derives the API/WS host from `window.location` by default (so LAN visitors work);
-override with `NEXT_PUBLIC_API_BASE_URL` / `NEXT_PUBLIC_WS_BASE_URL`.
+override with `NEXT_PUBLIC_API_BASE_URL` / `NEXT_PUBLIC_WS_BASE_URL` — these are **build args**,
+so changing them needs `docker compose build frontend`, not just a restart.
 
 ## Tests
 
+The suite needs a **real Postgres you provide** — there is no `postgres` compose service to start.
+By default it looks for one at `postgres://namesync:namesync@localhost:55432/namesync_test`
+(override with `TEST_DATABASE_URL`). Any Postgres reachable at that URL will do; one way to get
+one, if you have no other:
+
 ```bash
-docker compose up -d postgres          # test suite needs a reachable Postgres
+docker run -d --name namesync-pg -p 55432:5432 \
+  -e POSTGRES_USER=namesync -e POSTGRES_PASSWORD=namesync -e POSTGRES_DB=namesync \
+  postgres:16
+```
+
+Do **not** point `TEST_DATABASE_URL` at anything you care about: the suite drops and recreates
+the `lakeshore` tables on every run.
+
+```bash
 npm --prefix api run test              # Vitest: integration (buildApp + inject +
                                        # a mock external service) + unit tests
 ```
 
-The suite auto-creates and migrates a `namesync_test` database (override with `TEST_DATABASE_URL`),
-and simulates the external matcher by posting batches to the callback endpoint.
+The suite creates the `namesync_test` database if it is missing and applies
+`api/docs/schema-redesign.sql` to it on every run (`api/test/globalSetup.ts`) — which is also what
+keeps that file honest. It simulates the external matcher by posting batches to the callback
+endpoint.
 
 Typecheck / lint / build:
 
@@ -70,10 +112,11 @@ npm --prefix frontend run build
 
 ## Environment
 
-See `api/.env.example`. Key vars: `DATABASE_URL` (Postgres), `CORS_ORIGIN` (required in prod —
-no allow-all), the three webhook URLs, `WEBHOOK_CALLBACK_URL_BASE` (public URL the matcher POSTs
-back to), and `CALLBACK_TOKEN` (auth-lite; see [docs/AUTH.md](docs/AUTH.md)). Config is validated
-at boot and fails fast on invalid values.
+See `api/.env.example`. Key vars: `DATABASE_URL` (Postgres — you provide it), `CORS_ORIGIN`
+(required in prod — no allow-all), the two ingestion webhook URLs (`COMPANY_WEBHOOK_URL`,
+`FACEBOOK_WEBHOOK_URL`), `WEBHOOK_CALLBACK_URL_BASE` (public URL the matcher POSTs back to), and
+`CALLBACK_TOKEN` (auth-lite; see [docs/AUTH.md](docs/AUTH.md)). Config is validated at boot and
+fails fast on invalid values.
 
 Further notes: [docs/DB.md](docs/DB.md) (Postgres, migrations, timestamps) ·
 [docs/AUTH.md](docs/AUTH.md) (auth model + upgrade path).

@@ -93,7 +93,9 @@ const config: Config = {
           DEFAULT: "hsl(var(--popover))",
           foreground: "hsl(var(--popover-foreground))",
         },
-        // Confidence tiers (single source; mirrors lib/confidence thresholds).
+        // A four-step status ramp (good → warning → serious → critical). Named "confidence" for
+        // the score tiers it was built for; those are gone with `matching_score`, but the ramp
+        // outlived them — badges, callouts and the console all mean severity by it.
         confidence: {
           high: "hsl(var(--confidence-high))",
           good: "hsl(var(--confidence-good))",

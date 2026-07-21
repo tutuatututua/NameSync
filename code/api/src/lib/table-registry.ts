@@ -1,5 +1,5 @@
 import type { ColumnType, DbColumn, DbTable } from "@extensions/contract";
-import { isExternalMatcher } from "../config/env";
+import { ROW_QUEUED, ROW_PENDING, ROW_MATCH, ROW_UNMATCH } from "@extensions/contract";
 import { BadRequest, NotFound } from "./errors";
 
 /**
@@ -100,28 +100,23 @@ const UPLOAD_STATUS = ["pending", "processing", "pending_webhook", "completed", 
 const COMPARISON_STATUS = ["pending", "processing", "completed", "failed"];
 
 /**
- * What the external workflow has said about one data row (docs/EXTERNAL-MATCHER.md).
+ * What the external workflow has said about one uploaded row (docs/EXTERNAL-MATCHER.md).
  * Not a CHECK constraint — the workflow can store anything, and the console will show it —
- * so this is the pick-list, not a guarantee.
+ * so this is the pick-list, not a guarantee. Built from the contract's constants so the console
+ * cannot start offering a spelling the verdict rule doesn't know.
  */
-const ROW_STATUS = ["processing", "match", "unmatch", "complete"];
+const ROW_STATUS = [ROW_PENDING, ROW_MATCH, ROW_UNMATCH, "failed"];
 
-/**
- * The row's verdict — the column the workflow writes, surfaced in place of `fetched`.
- *
- * These two columns answer the same question ("is this row done?") for the two matchers, and
- * only one matcher is ever live. `fetched` is the internal one's boolean; `status` is the
- * workflow's verdict, and it says *what* the verdict was rather than merely that there was one.
- *
- * Which one the console shows is decided here, at module load, on the same flag the models
- * use — and it has to be, because `status` only exists once docs/migrations/2026-07-14-row-status.sql
- * has been applied by hand. Naming it with the flag off would put a column that isn't there
- * into every SELECT the console builds.
- */
+/** Same, for `comparison_result` — which additionally starts at 'pending', since a workflow may
+ *  insert a result row before it has decided it. */
+const RESULT_STATUS = [ROW_QUEUED, ROW_PENDING, ROW_MATCH, ROW_UNMATCH, "failed"];
+
+/** The row's verdict, as the workflow writes it. It used to be picked at module load against
+ *  isExternalMatcher(), because `status` only existed once a migration had been applied by hand
+ *  and `fetched` was the internal matcher's answer to the same question. `fetched` is gone and
+ *  `status` is unconditional in schema-redesign.sql, so there is nothing left to choose. */
 const verdict = (): RegistryColumn =>
-  isExternalMatcher()
-    ? c("status", "string", { label: "Status", nullable: false, enumValues: ROW_STATUS })
-    : c("fetched", "boolean", { label: "Fetched", nullable: false });
+  c("status", "string", { label: "Status", nullable: false, enumValues: ROW_STATUS });
 
 const TABLES: RegistryTable[] = [
   {
@@ -151,8 +146,8 @@ const TABLES: RegistryTable[] = [
     columns: [
       idCol(),
       c("company_name", "string", { label: "Company" }),
-      c("person_name_th", "string", { label: "Thai name (raw)" }),
-      c("person_name_en", "string", { label: "English name (raw)" }),
+      c("person_name_th", "string", { label: "Thai name" }),
+      c("person_name_en", "string", { label: "English name" }),
       uploadedBy(),
       uploadName(),
       c("upload_id", "number", { label: "Upload ID", nullable: false, required: true }),
@@ -169,10 +164,9 @@ const TABLES: RegistryTable[] = [
     joins: [UPLOAD_JOIN],
     columns: [
       idCol(),
-      c("friend_name", "string", { label: "Facebook name (raw)" }),
+      c("friend_name", "string", { label: "Facebook name" }),
       uploadedBy(),
       c("source", "string", { label: "Source", nullable: false, required: true }),
-      c("source_timestamp", "timestamp", { label: "Added" }),
       uploadName(),
       c("upload_id", "number", { label: "Upload ID", nullable: false, required: true }),
       verdict(),
@@ -187,7 +181,20 @@ const TABLES: RegistryTable[] = [
     columns: [
       idCol(),
       c("name", "string", { label: "Name" }),
-      c("selected_company", "string", { label: "Company" }),
+      /**
+       * text[], surfaced read-only.
+       *
+       * `json` is the closest the console's type system gets to an array, and it is close enough
+       * to *read*: node-postgres hands a text[] back as a JS array and the grid renders it. It is
+       * not close enough to write — the JSON editor would accept `{"a":1}` just as happily as
+       * `["PTT"]` and hand Postgres an object for a text[] column. So `editable: false`, which is
+       * the same guarantee the joined columns rely on: shown, never written.
+       *
+       * Adding a real `array` ColumnType would mean teaching the editor, the filters and the
+       * coercion about arrays — a fair amount of console for one column that is only ever written
+       * by the compare route.
+       */
+      c("selected_companies", "json", { label: "Companies", editable: false }),
       c("source", "string", { label: "Source" }),
       c("status", "string", { label: "Status", nullable: false, enumValues: COMPARISON_STATUS }),
       c("expected_batches", "number", { label: "Expected batches" }),
@@ -198,7 +205,7 @@ const TABLES: RegistryTable[] = [
   {
     name: "comparison_result",
     label: "Comparison results",
-    description: "The scored matches a compare run produced.",
+    description: "The matches a compare run produced.",
     joins: [{ table: "comparison", localColumn: "comparison_id", foreignColumn: "id" }],
     columns: [
       idCol(),
@@ -207,10 +214,10 @@ const TABLES: RegistryTable[] = [
       c("friend_name", "string", { label: "Facebook name" }),
       c("person_name_en", "string", { label: "English name" }),
       c("person_name_th", "string", { label: "Thai name" }),
-      c("matching_score", "number", { label: "Score" }),
       c("batch_number", "number", { label: "Batch" }),
-      c("is_complete", "boolean", { label: "Complete", nullable: false }),
+      c("status", "string", { label: "Status", nullable: false, enumValues: RESULT_STATUS }),
       c("upload_name", "string", { label: "Upload" }),
+      c("company_name", "string", { label: "Company" }),
       c("extra", "json", { label: "Extra" }),
       createdAt(),
     ],

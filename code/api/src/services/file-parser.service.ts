@@ -14,10 +14,11 @@ import { cleanPersonName, tidyText, wasCleaned } from './name-cleaner.service';
  * shared path is the whole point — a preview that disagrees with the import is worse than
  * none, because it's believed.
  *
- * Every person's name is also cleaned here (name-cleaner.service.ts) — the record carries
- * both the raw name and the cleaned one, and both are stored. Cleaning at parse time is
- * what lets the preview show exactly the cleaned values the import will write, rather than
- * showing the raw file and quietly changing it afterwards.
+ * Every person's name is cleaned here (name-cleaner.service.ts) and the cleaned name is what
+ * the record carries — there is no raw twin, in the record or in the database. Which makes the
+ * preview load-bearing rather than decorative: it is the *only* chance to see the original text
+ * next to what will be stored, so it reads the record for the cleaned value rather than
+ * re-deriving it, and cannot drift from what the import writes.
  */
 
 /** A target column, and the headers a file may use to supply it. The real company export
@@ -36,19 +37,18 @@ const COMPANY_FIELDS: FieldSpec[] = [
   { target: 'person_name_en', label: 'English name', aliases: ['eng_name', 'English Name', 'English', 'eng'], isName: true },
 ];
 
-/** Facebook friends, as a sheet. The JSON export's own key names (`name`, `timestamp`) lead
- *  the aliases, because a workbook made by pasting that export in keeps them. */
+/** Facebook friends, as a sheet. The JSON export's own key name (`name`) leads the aliases,
+ *  because a workbook made by pasting that export in keeps it.
+ *
+ *  The export's `timestamp` ("friended on") used to be read into `friend.source_timestamp`.
+ *  Nothing ever matched, grouped or filtered on it — it only ordered the grid — so the column
+ *  is gone and the header is now simply one of the ones this file ignores. */
 const FACEBOOK_FIELDS: FieldSpec[] = [
   {
     target: 'friend_name',
     label: 'Facebook name',
     aliases: ['name', 'friend_name', 'Friend Name', 'Facebook Name', 'fb_name', 'full_name'],
     isName: true,
-  },
-  {
-    target: 'source_timestamp',
-    label: 'Added',
-    aliases: ['timestamp', 'source_timestamp', 'added', 'Added On', 'date'],
   },
 ];
 
@@ -91,62 +91,84 @@ const cell = (row: Record<string, unknown>, sourceColumn: string | null): string
   return s === '' ? null : s;
 };
 
-/**
- * The "Added" column, whatever the sheet chose to put in it.
- *
- * Facebook's export counts in Unix *seconds*, and a workbook built from it usually still
- * holds that number. A date-formatted cell instead arrives as a real date (the reader hands
- * it over as ISO). Anything else that a Date can read — "2023-11-14" — is taken at face
- * value; anything it can't is dropped rather than stored as an epoch-zero lie.
- */
-function toTimestamp(value: string | null): string | null {
-  if (!value) return null;
-
-  if (/^\d+$/.test(value)) {
-    const n = Number(value);
-    // Milliseconds only if the number is far too large to be seconds (year ~5138 upwards).
-    const ms = n > 1e11 ? n : n * 1000;
-    const d = new Date(ms);
-    return Number.isNaN(d.getTime()) ? null : d.toISOString();
-  }
-
-  const d = new Date(value);
-  return Number.isNaN(d.getTime()) ? null : d.toISOString();
-}
+/** The raw cells a row supplies, keyed by target column — the file's own words, before cleaning.
+ *  Only the preview reads this: the import stores cleaned names and nothing else. */
+const rawRow = (row: Record<string, unknown>, mapping: ColumnMapping[]): Record<string, string | null> =>
+  Object.fromEntries(mapping.map((m) => [m.target, cell(row, m.sourceColumn)]));
 
 const mapCompanyRow = (row: Record<string, string>, mapping: ColumnMapping[]): CompanyContactRecord => {
   const by = (target: string) => cell(row, mapping.find((m) => m.target === target)?.sourceColumn ?? null);
-  const th = by('person_name_th');
-  const en = by('person_name_en');
   return {
     // A company name is only ever grouped and matched exactly, so it's tidied (whitespace,
     // invisible characters) but never de-titled: "Mr Pizza Co." is a company called Mr Pizza.
     company_name: tidyText(by('company_name')),
-    person_name_th: th,
-    person_name_th_clean: cleanPersonName(th),
-    person_name_en: en,
-    person_name_en_clean: cleanPersonName(en),
+    person_name_th: cleanPersonName(by('person_name_th')),
+    person_name_en: cleanPersonName(by('person_name_en')),
   };
 };
 
 const mapFriendRow = (row: Record<string, string>, mapping: ColumnMapping[]): FriendRecord => {
   const by = (target: string) => cell(row, mapping.find((m) => m.target === target)?.sourceColumn ?? null);
-  const name = by('friend_name');
-  return {
-    friend_name: name,
-    friend_name_clean: cleanPersonName(name),
-    source_timestamp: toTimestamp(by('source_timestamp')),
-  };
+  return { friend_name: cleanPersonName(by('friend_name')) };
 };
 
-/** "3 names were tidied…" — the preview's account of what cleaning will do to this file, so
- *  it's a thing you agreed to rather than a thing you discover in the grid afterwards. */
-function cleaningNote(pairs: [raw: string | null, clean: string | null][]): string | null {
-  const changed = pairs.filter(([raw, clean]) => raw !== null && wasCleaned(raw, clean)).length;
-  if (changed === 0) return null;
-  return changed === 1
-    ? '1 name will be cleaned — titles, suffixes, nicknames and middle names are removed. The original is kept.'
-    : `${changed.toLocaleString()} names will be cleaned — titles, suffixes, nicknames and middle names are removed. The originals are kept.`;
+/**
+ * The preview's row: what the file says, next to what will be stored.
+ *
+ * `<target>` is the file's raw cell and `<target>_clean` is the value the import will write —
+ * read back off the record rather than re-derived, so the two cannot disagree. This pairing is
+ * now the only place the original text is ever visible: it is not stored, so a name the cleaner
+ * gets wrong has to be caught here or not at all.
+ */
+const previewRow = (
+  raw: Record<string, string | null>,
+  record: CompanyContactRecord | FriendRecord,
+  mapping: ColumnMapping[]
+): Record<string, string | null> => {
+  const stored = record as unknown as Record<string, string | null | undefined>;
+  const out: Record<string, string | null> = {};
+  for (const m of mapping) {
+    if (m.cleaned) {
+      // A name column: the raw cell, plus the cleaned value that will be stored beneath it.
+      out[m.target] = raw[m.target] ?? null;
+      out[`${m.target}_clean`] = stored[m.target] ?? null;
+    } else {
+      // company_name is tidied (whitespace/invisible chars) but not "cleaned", and it is the
+      // TIDIED value that gets stored — so show that, not the raw cell. Showing the raw cell here
+      // would put a double-spaced "Acme  Co" in the preview above an "Acme Co" in the database:
+      // the preview promising something the import does not do, on the one column it is silent about.
+      out[m.target] = stored[m.target] ?? raw[m.target] ?? null;
+    }
+  }
+  return out;
+};
+
+/** "3 names will be cleaned…" — the preview's account of what cleaning will do to this file, so
+ *  it's a thing you agreed to rather than a thing you discover in the grid afterwards.
+ *
+ *  It no longer promises the original is kept, because it isn't. `dropped` is called out
+ *  separately: a name that cleans to nothing was pure decoration, and its row will not import. */
+function cleaningNote(pairs: [raw: string | null, clean: string | null][]): string[] {
+  const present = pairs.filter(([raw]) => raw !== null);
+  const changed = present.filter(([raw, clean]) => wasCleaned(raw, clean)).length;
+  const dropped = present.filter(([, clean]) => clean === null).length;
+
+  const notes: string[] = [];
+  if (changed > 0) {
+    notes.push(
+      changed === 1
+        ? '1 name will be cleaned — titles, suffixes and nicknames are removed and the name is stored in lower case. The original text is not kept, so check it here.'
+        : `${changed.toLocaleString()} names will be cleaned — titles, suffixes and nicknames are removed and names are stored in lower case. The original text is not kept, so check them here.`
+    );
+  }
+  if (dropped > 0) {
+    notes.push(
+      dropped === 1
+        ? '1 name is only a title (like “Mr”) with no name behind it, and will not be imported.'
+        : `${dropped.toLocaleString()} names are only titles (like “Mr”) with no name behind them, and will not be imported.`
+    );
+  }
+  return notes;
 }
 
 export class FileParserService {
@@ -169,6 +191,7 @@ export class FileParserService {
     const { headers, rows } = await readSheet(filePath);
     const mapping = buildMapping(COMPANY_FIELDS, headers);
     const mapped = rows.map((r) => mapCompanyRow(r, mapping));
+    const raws = rows.map((r) => rawRow(r, mapping));
 
     const warnings: string[] = [];
     if (rows.length === 0) warnings.push('This file has no rows to import.');
@@ -179,24 +202,28 @@ export class FileParserService {
       }
     }
 
-    const blank = mapped.filter((r) => !r.company_name && !r.person_name_th && !r.person_name_en).length;
-    if (blank > 0) {
+    // A contact the matcher cannot score is a contact that will not import — see the `usable`
+    // gate in comparisons.route.ts, which this warning has to agree with. Counted on the
+    // CLEANED names, because those are what will be stored and what that gate reads.
+    const unusable = mapped.filter((r) => !r.person_name_th && !r.person_name_en).length;
+    if (unusable > 0) {
       warnings.push(
-        blank === 1
-          ? '1 row has no company or person name.'
-          : `${blank.toLocaleString()} rows have no company or person name.`
+        unusable === 1
+          ? '1 row has no person name and will not be imported — there would be nothing to match it on.'
+          : `${unusable.toLocaleString()} rows have no person name and will not be imported — there would be nothing to match them on.`
       );
     }
 
     // Counted across the whole file, not just the sample — the sample is what you see, but
     // the number has to describe what will actually be written.
-    const note = cleaningNote(
-      mapped.flatMap((r): [string | null, string | null][] => [
-        [r.person_name_th, r.person_name_th_clean],
-        [r.person_name_en, r.person_name_en_clean],
-      ])
+    warnings.push(
+      ...cleaningNote(
+        raws.flatMap((raw, i): [string | null, string | null][] => [
+          [raw.person_name_th, mapped[i].person_name_th],
+          [raw.person_name_en, mapped[i].person_name_en],
+        ])
+      )
     );
-    if (note) warnings.push(note);
 
     return {
       kind: 'company',
@@ -205,7 +232,7 @@ export class FileParserService {
       sourceColumns: headers,
       ignoredColumns: ignoredColumns(headers, mapping),
       mapping,
-      sampleRows: mapped.slice(0, SAMPLE_SIZE).map((r) => ({ ...r })),
+      sampleRows: raws.slice(0, SAMPLE_SIZE).map((raw, i) => previewRow(raw, mapped[i], mapping)),
       warnings,
     };
   }
@@ -215,6 +242,7 @@ export class FileParserService {
     const { headers, rows } = await readSheet(filePath);
     const mapping = buildMapping(FACEBOOK_FIELDS, headers);
     const mapped = rows.map((r) => mapFriendRow(r, mapping));
+    const raws = rows.map((r) => rawRow(r, mapping));
 
     const warnings: string[] = [];
     if (rows.length === 0) warnings.push('This file has no friends to import.');
@@ -227,15 +255,17 @@ export class FileParserService {
       }
     }
 
+    // On the cleaned name, which is what the import's `usable` gate reads.
     const unnamed = mapped.filter((r) => !r.friend_name).length;
     if (unnamed > 0) {
       warnings.push(
-        unnamed === 1 ? '1 friend has no name.' : `${unnamed.toLocaleString()} friends have no name.`
+        unnamed === 1
+          ? '1 friend has no name and will not be imported.'
+          : `${unnamed.toLocaleString()} friends have no name and will not be imported.`
       );
     }
 
-    const note = cleaningNote(mapped.map((r) => [r.friend_name, r.friend_name_clean ?? null]));
-    if (note) warnings.push(note);
+    warnings.push(...cleaningNote(raws.map((raw, i) => [raw.friend_name, mapped[i].friend_name])));
 
     return {
       kind: 'facebook',
@@ -244,13 +274,7 @@ export class FileParserService {
       sourceColumns: headers,
       ignoredColumns: ignoredColumns(headers, mapping),
       mapping,
-      // Spelled out rather than spread: `source_timestamp` is optional on the record, and
-      // the preview's rows are `string | null` — never `undefined`.
-      sampleRows: mapped.slice(0, SAMPLE_SIZE).map((r) => ({
-        friend_name: r.friend_name,
-        friend_name_clean: r.friend_name_clean ?? null,
-        source_timestamp: r.source_timestamp ?? null,
-      })),
+      sampleRows: raws.slice(0, SAMPLE_SIZE).map((raw, i) => previewRow(raw, mapped[i], mapping)),
       warnings,
     };
   }

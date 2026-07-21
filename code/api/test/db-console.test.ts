@@ -66,13 +66,15 @@ describe("table registry", () => {
     // Joined from `upload` — surfaced so a row is legible, but never writable.
     expect(byName.uploaded_by.editable).toBe(false);
 
-    // These suites run with EXTERNAL_MATCHER off, so the internal matcher's `fetched` is the
-    // column on show. `status` is the workflow's answer to the same question and belongs to the
-    // other matcher — naming it here would put a column into every SELECT the console builds
-    // that a database without the row-status migration does not have.
-    // (external-matcher.test.ts runs with the flag on and pins the other half of this switch.)
-    expect(byName.fetched).toBeDefined();
-    expect(byName.status).toBeUndefined();
+    // `status` is the verdict column, and it is on show whether or not EXTERNAL_MATCHER is set —
+    // these suites run with it off. It used to be conditional, because `status` only existed once
+    // the row-status migration had been applied by hand and `fetched` was the internal matcher's
+    // answer to the same question; the column is unconditional in schema-redesign.sql now and
+    // `fetched` has been dropped, so there is one column here and no flag reads on it.
+    expect(byName.status).toBeDefined();
+    // The dead column must not come back. A registry that named it would name it in every SELECT
+    // the console builds and take the whole page down against the real schema.
+    expect(byName.fetched).toBeUndefined();
   });
 
   it("refuses a table that isn't in the registry", async () => {

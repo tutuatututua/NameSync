@@ -100,7 +100,23 @@ export const CompaniesDataSchema = z.object({
 export type CompaniesData = z.infer<typeof CompaniesDataSchema>;
 
 /** POST /api/comparisons/compare — start a comparison against one selected company. */
+/**
+ * POST /api/comparisons/compare — the companies to score every friend against.
+ *
+ * A list, not a name, because one run can span several companies: the matcher holds each friend up
+ * against the union of their contacts and keeps the single closest one, whichever company it came
+ * from. So a run's finding is still one row per friend — "Somchai matches Somchai Prasert at PTT" —
+ * and the company that won is stored on the row (`comparison_result.company_name`), because it is a
+ * property of the *match*, not of the run, the moment the run can name more than one.
+ *
+ * Deduplicated and order-preserving on the way in: the picker cannot offer the same company twice,
+ * but the endpoint is public and scoring a company against itself would double its contacts' odds of
+ * winning a tie for no reason anyone chose.
+ */
 export const CompareByCompanyBodySchema = z.object({
-  company_name: z.string().trim().min(1, 'Select a company to compare against'),
+  company_names: z
+    .array(z.string().trim().min(1))
+    .min(1, 'Select at least one company to compare against')
+    .transform((names) => [...new Set(names)]),
 });
 export type CompareByCompanyBody = z.infer<typeof CompareByCompanyBodySchema>;

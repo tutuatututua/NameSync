@@ -7,8 +7,6 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
-    "migrate": "tsx src/migrate.ts",
-    "backfill:clean-names": "tsx src/scripts/backfill-clean-names.ts",
     "mock:row-status": "tsx src/scripts/mock-row-status.ts",
     "create-user": "tsx src/scripts/create-user.ts",
     "reset-password": "tsx src/scripts/reset-password.ts",

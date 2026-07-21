@@ -1,13 +1,12 @@
-import type { ComparisonResultRow } from "@extensions/contract";
-import { getConfidenceTier, isMatch } from "@/lib/confidence";
+import { rowVerdict, type ComparisonResultRow } from "@extensions/contract";
 
 /**
  * A comparison row, un-merged.
  *
  * What the API returns is a *fused* record — a Facebook name and a company name sitting in
- * adjacent columns with a number beside them, and nothing saying which half came from where.
+ * adjacent columns with a verdict beside them, and nothing saying which half came from where.
  * This is the same row with its seams put back: the Facebook side, the company side, and the
- * score that joined them.
+ * verdict that joined them.
  */
 export interface MatchRow {
   id: string;
@@ -20,8 +19,14 @@ export interface MatchRow {
   personEn: string | null;
   personTh: string | null;
 
-  /** The merge itself. */
-  score: number;
+  /**
+   * The merge itself, raw as the matcher wrote it. Read through `rowVerdict`, never compared
+   * directly — the column has no CHECK constraint and an external matcher spells it how it likes.
+   *
+   * This replaced a `score`, and the loss is real: a row said how *good* its match was, and now
+   * says only that there was one. Nothing here can rank two matches against each other.
+   */
+  status: string | null;
 
   /** Whatever an external matcher put in `extra`. The internal matcher writes none, but the
    *  callback route stuffs an external one's unrecognised fields in there, and the results
@@ -29,7 +34,14 @@ export interface MatchRow {
   extras: Record<string, unknown>;
 }
 
-function parseExtra(raw: unknown): Record<string, unknown> {
+/**
+ * The `extra` blob, whatever shape it arrives in.
+ *
+ * Exported because the run-row table needs it too: `extra` is written by a system that has never
+ * had to agree with us about anything, and both readers have to survive the same nonsense the same
+ * way. A blob that isn't a JSON object costs its columns and nothing else.
+ */
+export function parseExtra(raw: unknown): Record<string, unknown> {
   const value = typeof raw === "string" ? safeParse(raw) : raw;
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -50,7 +62,7 @@ export interface MatchRowInput {
   uploadedBy: string | null;
   personEn: string | null;
   personTh: string | null;
-  score: number;
+  status: string | null;
   /** The raw `extra` blob — a JSON string on the wire, an object once saved to history. */
   extra?: unknown;
 }
@@ -62,7 +74,7 @@ export function buildMatchRow(input: MatchRowInput): MatchRow {
     uploadedBy: input.uploadedBy,
     personEn: input.personEn,
     personTh: input.personTh,
-    score: input.score,
+    status: input.status,
     extras: parseExtra(input.extra),
   };
 }
@@ -74,23 +86,29 @@ export function fromResultRow(r: ComparisonResultRow): MatchRow {
     uploadedBy: r.upload_name,
     personEn: r.person_name_en,
     personTh: r.person_name_th,
-    score: Number(r.matching_score) || 0,
+    status: r.status,
     extra: r.extra,
   });
 }
 
-/** What the two sources actually contributed to this run. */
+/**
+ * What the two sources actually contributed to this run.
+ *
+ * Deliberately named after the *sides* rather than after friends, because a run has two directions
+ * and this used to describe only one of them. `friends` in particular was a lie on a company
+ * import, where every row is a contact — the field was read as "the population we scored", which
+ * is what it always meant, but it said "friends" and so every label built on it said friends too.
+ * The counts below are true of both directions; which noun to put on them is the *reader's* job,
+ * and depends on `RunRow.kind`.
+ */
 export interface MergeFacts {
-  /** Every friend the run scored — the size of the friend list, not of the finding. */
-  friends: number;
-  uploaders: number;
-  /** Friends whose closest contact scored at or above MATCH_THRESHOLD. The finding. */
+  /** Every name the run scored — the size of the population, not of the finding. */
+  scored: number;
+  /** Rows the matcher stamped as a match. The finding. */
   matches: number;
-  /** Matches in the top tier (≥80%) — near-certain, worth acting on first. */
-  strong: number;
-  /** Distinct contacts named by a *match*. */
+  /** Distinct company contacts named by a *match*. */
   contacts: number;
-  /** Uploaders who contributed at least one matching friend. */
+  /** Uploaders with at least one matching friend — the people who can make an introduction. */
   matchedUploaders: number;
 }
 
@@ -101,22 +119,17 @@ export interface MergeFacts {
  * "5 friends match, out of 5 scored".
  */
 export function summarize(rows: MatchRow[], scoredCount?: number): MergeFacts {
-  const uploaders = new Set<string>();
   const matchedUploaders = new Set<string>();
   const contacts = new Set<string>();
   let matches = 0;
-  let strong = 0;
 
   for (const r of rows) {
-    if (r.uploadedBy) uploaders.add(r.uploadedBy);
-
     // Counting contacts over every row — as this once did — counts the contact that each
-    // stranger happened to sit closest to at 3%, which is not a contact anybody matched.
+    // stranger happened to sit closest to, which is not a contact anybody matched.
     // Only a match names a contact.
-    if (!isMatch(r.score)) continue;
+    if (rowVerdict(r.status) !== "matched") continue;
 
     matches++;
-    if (getConfidenceTier(r.score) === "high") strong++;
     if (r.uploadedBy) matchedUploaders.add(r.uploadedBy);
     // A contact is the pair, not either name: two people at one company can share a Thai
     // name and differ in English, and vice versa.
@@ -126,10 +139,8 @@ export function summarize(rows: MatchRow[], scoredCount?: number): MergeFacts {
   return {
     // Never fewer than the rows on screen: a table showing 5 matches under a heading that
     // says "out of 3 scored" is worse than either number alone.
-    friends: Math.max(scoredCount ?? rows.length, rows.length),
-    uploaders: uploaders.size,
+    scored: Math.max(scoredCount ?? rows.length, rows.length),
     matches,
-    strong,
     contacts: contacts.size,
     matchedUploaders: matchedUploaders.size,
   };

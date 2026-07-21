@@ -17,6 +17,10 @@ export async function truncateAll(): Promise<void> {
  * Both sources upload .xlsx, so every helper here posts a real workbook. The rows are still
  * *written* as CSV text (`csv`) or as name/timestamp pairs (`friends`) — that is the fixture
  * these tests are about — and are turned into a workbook on the way out.
+ *
+ * The friends fixture still carries a timestamp because the real export does, and a fixture that
+ * dropped it would stop testing the file we actually receive. Nothing reads it any more: the
+ * column is one of the ones the import ignores.
  */
 export const DEFAULT_CSV =
   "company_name,thai_name,eng_name\nAcme Co,สมชาย,Somchai\nBeta Ltd,อนงค์,Anong\n";
@@ -100,15 +104,24 @@ export async function importFacebook(
 }
 
 /**
- * Run a comparison against a company; returns the comparison id (used as sessionId).
+ * Run a comparison against one or more companies; returns the comparison id (used as sessionId).
  * The match is computed in-process, so this resolves with the results already stored.
- * Requires the company to have contacts — a compare against an empty company is a 400.
+ * Requires every named company to have contacts — a compare against an empty one is a 400.
+ *
+ * Takes a bare string as well as a list, because most callers are asking about something other
+ * than the company (progress, rows, deletion) and `startCompare(app)` is the whole of what they
+ * want to say about it.
  */
-export async function startCompare(app: FastifyInstance, company = "Acme Co"): Promise<string> {
+export async function startCompare(
+  app: FastifyInstance,
+  companies: string | string[] = "Acme Co"
+): Promise<string> {
   const res = await app.inject({
     method: "POST",
     url: "/api/comparisons/compare",
-    payload: JSON.stringify({ company_name: company }),
+    payload: JSON.stringify({
+      company_names: Array.isArray(companies) ? companies : [companies],
+    }),
     headers: { "content-type": "application/json" },
   });
   return res.json().data.sessionId as string;
@@ -122,7 +135,7 @@ export async function startCompare(app: FastifyInstance, company = "Acme Co"): P
 export async function createComparison(company = "Acme Co"): Promise<string> {
   const comparison = await ComparisonModel.create({
     name: company,
-    selected_company: company,
+    selected_companies: [company],
     status: "processing",
   });
   return comparison.id;
@@ -132,7 +145,18 @@ interface ResultItem {
   fb_name: string;
   person_name_en: string;
   person_name_th: string;
-  matching_score: number;
+  /**
+   * The workflow's verdict on this one row, and the whole of it. Optional in the schema, but
+   * omitting it means `unmatch` — there is no `matching_score` left to derive a verdict from, so
+   * a test that wants a match has to say so. Not to be confused with `is_complete` below.
+   */
+  status?: string;
+  /**
+   * Anything else the matcher sends, carried through to `extra`. Typed loosely because that is
+   * exactly what the route promises: unknown keys are preserved, not rejected. `matching_score`
+   * arrives here now — accepted, stored, and deciding nothing.
+   */
+  [key: string]: unknown;
 }
 
 export function postCallback(
@@ -141,6 +165,11 @@ export function postCallback(
     session_id: string;
     batch_number: number;
     total_batches: number;
+    /**
+     * The BATCH's transport flag: "no more batches after this one". It never described a row —
+     * the per-row column that used to store it is gone — but the payload field is alive and is
+     * still one of the two ways a callback-driven run reaches 'completed'.
+     */
     is_complete: boolean;
     results: ResultItem[];
   }

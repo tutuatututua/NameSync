@@ -55,8 +55,8 @@
        These four values are not eyeballed. They were searched against the dataviz validator
        under two constraints at once:
          · CVD separation ≥ 12 ΔE across all pairs (protan/deutan) — worst pair is 14.3;
-         · ≥ 4.5:1 as *text on its own 10% tint*, which is how ConfidenceBadge renders them,
-           and a stricter bar than the 3:1 a chart mark owes the surface.
+         · ≥ 4.5:1 as *text on its own 10% tint*, which is how every badge built on them
+           renders, and a stricter bar than the 3:1 a chart mark owes the surface.
        The obvious ramp (emerald/olive/amber/red) fails the first: olive and amber collapse to
        ΔE 9 under protanopia. Moving `good` to a true green and darkening `medium` fixes it.
        Re-validate before touching these — `scripts/validate_palette.js` in the dataviz skill. */

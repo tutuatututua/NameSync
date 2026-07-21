@@ -1,10 +1,13 @@
 import { FastifyInstance } from "fastify";
 import { ZodTypeProvider } from "fastify-type-provider-zod";
-import { apiSuccess, CallbackPayloadSchema, CallbackAckDataSchema } from "@extensions/contract";
+import {
+  apiSuccess,
+  CallbackPayloadSchema,
+  CallbackAckDataSchema,
+  ROW_UNMATCH,
+} from "@extensions/contract";
 import { ComparisonModel } from "../models/comparison.model";
 import { ComparisonResultModel } from "../models/comparison-result.model";
-import { CompanyContactModel } from "../models/company-contact.model";
-import { FriendModel } from "../models/friend.model";
 import { WebSocketService } from "../services/websocket.service";
 import { NotFound } from "../lib/errors";
 import { ok } from "../lib/http";
@@ -31,11 +34,16 @@ export default async function callbacksRoutes(fastify: FastifyInstance): Promise
       let recordsStored = 0;
       if (!alreadyReceived && payload.results.length > 0) {
         // Standard fields we map to columns; anything else is preserved in `extra`.
+        //
+        // `matching_score` is deliberately NOT known any more. It has no column to go to, and
+        // dropping it from this set is what routes it into `extra` instead of discarding it — a
+        // matcher that still sends a score keeps it visible as an extra column in the results
+        // table, it just no longer decides anything.
         const KNOWN = new Set([
           "fb_name",
           "person_name_en",
           "person_name_th",
-          "matching_score",
+          "status",
           "upload_name",
           "upload_person_name",
         ]);
@@ -51,9 +59,18 @@ export default async function callbacksRoutes(fastify: FastifyInstance): Promise
             fb_name: item.fb_name,
             person_name_en: item.person_name_en ?? null,
             person_name_th: item.person_name_th ?? null,
-            matching_score: item.matching_score,
             batch_number: payload.batch_number,
-            is_complete: payload.is_complete,
+            // The ROW's verdict, which is the item's to give — not `payload.is_complete`, which is
+            // the BATCH's transport flag and says only "no more batches after this one". Stamping
+            // that onto rows is what the old `is_complete` column did: identical, fully-decided
+            // rows came out false in batch 1 and true in batch 9.
+            //
+            // Omitted now means `unmatch`, where it used to mean "derive it from the score". There
+            // is no score to derive from, and the two candidate defaults are not symmetrical: a
+            // real match filed as unmatched is a missed introduction, a stranger filed as a match
+            // is a bad one made in the user's name. This defaults toward the recoverable mistake.
+            // A matcher that posts only its hits MUST now send `status` — see EXTERNAL-MATCHER.md.
+            status: item.status ?? ROW_UNMATCH,
             upload_name: uploadName,
             extra: extraEntries.length ? Object.fromEntries(extraEntries) : null,
           };
@@ -82,11 +99,12 @@ export default async function callbacksRoutes(fastify: FastifyInstance): Promise
             : 0,
       });
 
+      // `payload.is_complete` is the batch's transport flag and stays load-bearing here: it is one
+      // of the two ways a callback-driven run reaches 'completed' (the other being the batch count
+      // reaching the declared total). It never described a row, which is why the column that used
+      // to store it per-row is gone and this reads the request field instead.
       if (allBatchesComplete || payload.is_complete) {
         await ComparisonModel.updateStatus(payload.session_id, "completed");
-        // The comparison ran against the full tables, so everything currently loaded
-        // is now "old"; rows added afterward count as "new" until the next completion.
-        await Promise.all([CompanyContactModel.markAllFetched(), FriendModel.markAllFetched()]);
         WebSocketService.broadcast(payload.session_id, {
           type: "comparison_complete",
           sessionId: payload.session_id,

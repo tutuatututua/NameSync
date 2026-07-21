@@ -22,10 +22,10 @@ export interface Upload {
   updated_at: string;
 }
 
-// `*_clean` is the name with titles/suffixes/nicknames/middle tokens stripped, written at
-// import beside the raw name (see services/name-cleaner.service.ts). Null on rows imported
-// before cleaning existed — readers fall back to the raw name, so treat it as "not yet
-// cleaned", never as "no name".
+// A person's name is stored ONCE, already cleaned and lower-cased (titles/suffixes/nicknames
+// stripped at import — see services/name-cleaner.service.ts). There is no raw twin: null means
+// "no usable name", and a row that had none was never imported. Company names are the exception
+// — tidied only, case-preserving.
 // `status` is the external workflow's verdict on this row: 'processing' until it gets there,
 // then 'match' / 'unmatch' (docs/EXTERNAL-MATCHER.md). It only exists once the row-status
 // migration has been applied, so it is only ever *read* when EXTERNAL_MATCHER is on — with
@@ -35,9 +35,6 @@ export interface Friend {
   upload_id: string;
   source: string;
   friend_name: string | null;
-  friend_name_clean: string | null;
-  source_timestamp: string | null;
-  fetched: boolean;
   status: string;
   created_at: string;
   updated_at: string;
@@ -48,10 +45,7 @@ export interface CompanyContact {
   upload_id: string;
   company_name: string | null;
   person_name_th: string | null;
-  person_name_th_clean: string | null;
   person_name_en: string | null;
-  person_name_en_clean: string | null;
-  fetched: boolean;
   status: string;
   created_at: string;
   updated_at: string;
@@ -60,7 +54,9 @@ export interface CompanyContact {
 export interface Comparison {
   id: string;
   name: string | null;
-  selected_company: string | null;
+  /** The companies the run was pointed at. Null/empty is a whole-table run (an import), not
+   *  a missing value — see schema-redesign.sql. */
+  selected_companies: string[] | null;
   source: string | null;
   status: string;
   expected_batches: number | null;
@@ -74,10 +70,13 @@ export interface ComparisonResult {
   friend_name: string | null;
   person_name_en: string | null;
   person_name_th: string | null;
-  matching_score: number | null;
   batch_number: number | null;
-  is_complete: boolean;
+  /** This row's verdict, and the whole of it — same vocabulary as Friend.status. Defaults to
+   *  'pending' in the database, so a row written ahead of its verdict reads as unfinished. */
+  status: string;
   upload_name: string | null;
+  /** Where the matched contact works. Null when the matcher didn't say — see the contract. */
+  company_name: string | null;
   extra: unknown; // jsonb
   created_at: string;
 }

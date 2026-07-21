@@ -63,6 +63,25 @@ export async function readSheet(filePath: string): Promise<Sheet> {
     headers.push(cellText(headerRow.getCell(c).value).trim());
   }
 
+  // Two columns under one header is refused, not resolved. A row is keyed by header text, so a
+  // repeat silently overwrites: the earlier column's data vanishes, and — worse — the mapping
+  // resolves to the FIRST such header while the row object holds the LAST one's values, so the
+  // preview shows one column and the import reads another. Which of the two was meant is not
+  // knowable here, and a wrong guess imports the wrong column under a preview that agreed with it.
+  const duplicates = [
+    ...new Set(
+      headers.filter((h) => h !== '').filter((h, i, all) => all.indexOf(h) !== i)
+    ),
+  ];
+  if (duplicates.length > 0) {
+    const named = duplicates.map((h) => `“${h}”`).join(', ');
+    throw new BadRequest(
+      duplicates.length === 1
+        ? `Two columns share the header ${named}. Rename or remove one so it's clear which to import.`
+        : `Several columns share headers: ${named}. Rename or remove the duplicates so it's clear which to import.`
+    );
+  }
+
   const rows: Record<string, string>[] = [];
   for (let r = 2; r <= sheet.rowCount; r++) {
     const row = sheet.getRow(r);

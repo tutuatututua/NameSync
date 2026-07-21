@@ -1,28 +1,25 @@
-import { ConfidenceBadge } from "@/components/confidence/ConfidenceBadge";
 import { cn } from "@/lib/utils";
 
 /**
  * How a run ended, in one badge — defined once because it was previously decided twice, and
  * the two answers disagreed with the row they sat on.
  *
- * The trap is `topConfidence`. It's the mean of a run's ten best scores, which is the right
- * headline for a run that found something and a nonsense one for a run that didn't: a run
- * whose ten best rows are strangers at ~51% still gets badged "51% Medium", in the colour of
- * a partial success, directly beside the words "0 matches". The number is real; the thing it
- * implies is false.
+ * It used to end on a `topConfidence` grade: the mean of a run's ten best scores, badged as
+ * "87% High". That number went with `matching_score`, and the badge is better for losing it — it
+ * was the component's own documented trap. A run whose ten best rows were strangers at ~51% still
+ * badged "51% Medium", in the colour of a partial success, directly beside the words "0 matches".
  *
- * So the badge answers "did this run find anyone?" first, and only grades the find if there
- * was one.
+ * What is left is the question that mattered anyway: did this run find anyone, and how many. The
+ * grade is gone rather than replaced, because there is nothing left to grade with — every match is
+ * now equally a match.
  */
 export function RunOutcome({
   status,
   matchCount,
-  topConfidence,
   className,
 }: {
   status: string;
   matchCount: number;
-  topConfidence: number;
   className?: string;
 }) {
   if (status !== "completed") {
@@ -56,5 +53,16 @@ export function RunOutcome({
     );
   }
 
-  return <ConfidenceBadge score={topConfidence} className={cn("shrink-0", className)} />;
+  // Found something. Primary-tinted rather than neutral, so a run with a finding is visibly
+  // different from one without at a glance down the list — which is the whole job of this badge.
+  return (
+    <span
+      className={cn(
+        "shrink-0 whitespace-nowrap rounded-md border border-primary/25 bg-primary/10 px-2 py-0.5 text-xs font-medium tabular-nums text-primary",
+        className
+      )}
+    >
+      {matchCount.toLocaleString()} {matchCount === 1 ? "match" : "matches"}
+    </span>
+  );
 }

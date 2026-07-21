@@ -1,23 +1,8 @@
 services:
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: namesync
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-namesync}
-      POSTGRES_DB: namesync
-    # Published on 55432 (not 5432) to avoid clashing with a local Postgres. Used
-    # by non-docker local dev and the test suite; the api container uses postgres:5432.
-    ports:
-      - "55432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U namesync -d namesync"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-    restart: unless-stopped
-
+  # The local Postgres service was removed on 2026-07-17. The stack now talks straight to
+  # the live promptxdb_prod (DATABASE_URL in the git-ignored code/.env), so there is no
+  # local database to fall back on and no `docker compose down -v` reset: that data is real
+  # and api/docs/schema-redesign.sql drops it. `git revert` this commit to get local dev back.
   api:
     build:
       context: .
@@ -25,13 +10,30 @@ services:
     environment:
       NODE_ENV: production
       DB_ENGINE: postgres
-      DATABASE_URL: postgres://namesync:${POSTGRES_PASSWORD:-namesync}@postgres:5432/namesync
+      # From the git-ignored code/.env — never hardcode the prod credential in this tracked
+      # file. `:?` makes a missing value abort the stack rather than silently fall back.
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in code/.env}
+      # The app must never issue DDL (api/Dockerfile explains why). The image already sets
+      # this, so it is stated again here on purpose: an image built before that ENV existed
+      # boots happily and silently migrates whatever DATABASE_URL points at — which is how
+      # a stale image once dumped a full obsolete schema into this database's `public`.
+      # The image is not a trustworthy place to keep the only copy of a safety switch.
+      DB_SKIP_MIGRATE: "1"
+      # The app's tables live in `lakeshore` and the app never creates them (see docs/DB.md).
+      # Nothing in this stack creates them either — the postgres service that used to build the
+      # schema on a fresh volume is gone, so whatever DATABASE_URL points at owns its own schema
+      # and someone applies api/docs/schema-redesign.sql (fresh) or a script from
+      # api/docs/migrations/ (live) to it by hand. Booting against a database nobody did that
+      # for gets you a running API that finds no tables.
+      DB_SCHEMA: ${DB_SCHEMA:-lakeshore}
       PORT: "4000"
       UPLOAD_DIR: /data/uploads
       # REQUIRED in production (no allow-all). Comma-separated origins.
       CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3000}
-      # Hand the matching to the external workflow (docs/EXTERNAL-MATCHER.md). Needs
-      # docs/migrations/2026-07-14-row-status.sql applied to the database first.
+      # Hand the matching to the external workflow (api/docs/EXTERNAL-MATCHER.md). The database
+      # needs the columns the workflow writes to first — current as of
+      # api/docs/migrations/2026-07-17-single-clean-name-and-result-status.sql, which is a
+      # breaking change for the workflow's own INSERT and has to be coordinated with it.
       EXTERNAL_MATCHER: ${EXTERNAL_MATCHER:-}
       COMPANY_WEBHOOK_URL: ${COMPANY_WEBHOOK_URL:-}
       FACEBOOK_WEBHOOK_URL: ${FACEBOOK_WEBHOOK_URL:-}
@@ -41,9 +43,6 @@ services:
       - "4000:4000"
     volumes:
       - api-data:/data
-    depends_on:
-      postgres:
-        condition: service_healthy
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 15s
@@ -70,4 +69,3 @@ services:
 
 volumes:
   api-data:
-  pgdata:

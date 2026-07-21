@@ -12,11 +12,16 @@ RUN apt-get update \
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
     NEXT_TELEMETRY_DISABLED=1
 
+# Same reason as api/Dockerfile: the lockfile records the root `overrides` as npm 11
+# resolved them, and node:20's bundled npm 10 rejects that tree as out of sync.
+RUN npm install -g npm@11
+
 COPY package.json package-lock.json ./
 COPY api/package.json api/package.json
 COPY frontend/package.json frontend/package.json
 COPY test/package.json test/package.json
 COPY extensions/sqldb/package.json extensions/sqldb/package.json
+COPY extensions/contract/package.json extensions/contract/package.json
 RUN npm ci
 
 COPY . .

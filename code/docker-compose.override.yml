@@ -1,0 +1,23 @@
+# TEMPORARY — LAN demo access, added 2026-07-20. DELETE THIS FILE to restore normal auth.
+#
+# Docker Compose picks this up automatically alongside docker-compose.yml, so
+# `docker compose up` is running with auth OFF while this file exists.
+#
+# AUTH_DISABLED makes every request resolve to a hardcoded local admin
+# (api/src/plugins/auth.ts). It is refused in production by two independent
+# guards (config/env.ts exits at boot; plugins/auth.ts hard-returns false), so
+# NODE_ENV must also leave `production` for it to take effect — which is why
+# both are here and why they must be removed together.
+#
+# WHAT THIS MEANS: anyone who can reach http://<this-host>:3000 on the LAN has
+# full admin access to whatever DATABASE_URL points at, with no login. The base
+# compose file points that at the live promptxdb_prod.
+#
+# DB_SKIP_MIGRATE="1" is deliberately NOT overridden here — it stays inherited
+# from docker-compose.yml. Leaving production mode must not become a route to
+# letting the app issue DDL against that database.
+services:
+  api:
+    environment:
+      NODE_ENV: development
+      AUTH_DISABLED: "1"

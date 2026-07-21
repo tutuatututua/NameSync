@@ -1,6 +1,5 @@
-import { sql, type Expression, type SqlBool } from "kysely";
-import type { RunRow } from "@extensions/contract";
-import { ROW_FILTER_SQL, type RowFilter } from "./row-status";
+import { sql, type Expression, type RawBuilder, type SqlBool } from "kysely";
+import type { RowVerdict, RunRow } from "@extensions/contract";
 
 /**
  * The bits `friend` and `company_contact` both need to serve the live row monitor.
@@ -12,43 +11,45 @@ import { ROW_FILTER_SQL, type RowFilter } from "./row-status";
  * drift into describing the same state two ways.
  */
 
-/** `all` is not a status bucket, it is the absence of a filter — hence not in ROW_FILTER_SQL. */
-export type RunRowFilter = RowFilter | "all";
+/** `all` is not a verdict, it is the absence of a filter. */
+export type RunRowFilter = RowVerdict | "all";
+
+/** See RunRowsQuerySchema — `row` is import order, `status` is matches-first. */
+export type RunRowSort = "row" | "status";
 
 /**
- * The WHERE for a status bucket, or null for "no filter".
+ * The WHERE for one verdict bucket, or null for "no filter".
  *
- * `lower(trim(...))` because the column has no CHECK constraint and is written by another system:
- * it can hold `Match`, or `unmatch `, and a filter that only knew the exact lowercase spelling
- * would quietly return an empty table rather than the rows that are plainly there. The tally in
- * row-status.ts normalises the same way, so the count above the table and the rows in it agree.
+ * Over the verdict expression rather than over the raw column, which is what makes the tab you
+ * press and the number on it the same question: `rowVerdictSql` decides both, so "Matches 4"
+ * cannot label a filter that returns five rows.
  *
- * Values are bound (`sql.val`), not interpolated — they are our own constants today, and that is
- * exactly the assumption that stops being true later.
+ * It also cleans up the old awkwardness. `unmatched` used to be un-expressible except as a NOT IN
+ * over every other status — the one clause guaranteed to rot the day a status was added to one
+ * list and not the other. A verdict is a value, so it is just `= 'unmatched'`.
+ *
+ * The value is bound (`sql.val`), not interpolated — it is our own enum today, and that is exactly
+ * the assumption that stops being true later.
  */
-export function rowFilterWhere(column: string, filter: RunRowFilter): Expression<SqlBool> | null {
+export function rowFilterWhere(
+  verdict: RawBuilder<RowVerdict>,
+  filter: RunRowFilter
+): Expression<SqlBool> | null {
   if (filter === "all") return null;
-
-  const { op, values } = ROW_FILTER_SQL[filter];
-  const status = sql`lower(trim(${sql.ref(column)}))`;
-  const list = sql.join(values.map((v) => sql.val(v)));
-
-  return op === "in"
-    ? sql<SqlBool>`${status} in (${list})`
-    : sql<SqlBool>`${status} not in (${list})`;
+  return sql<SqlBool>`${verdict} = ${sql.val(filter)}`;
 }
 
-/** What the two queries select, before it is handed to the client. */
+/** What the three queries select, before it is handed to the client. */
 export interface RawRunRow {
   id: string | number;
   name: string | null;
   nameTh: string | null;
   context: string | null;
   status: string | null;
-  score: number | string | null;
   matchedName: string | null;
   matchedNameTh: string | null;
   matchedContext: string | null;
+  extras: string | null;
 }
 
 /**
@@ -56,13 +57,8 @@ export interface RawRunRow {
  *
  * `id` is a bigint, which node-postgres hands back as a string on some paths and a number on
  * others; the contract says string, so it is made one here rather than in two call sites.
- * `matching_score` is a `real` and comes back as a JS number, but a null score must survive as
- * null — a row the workflow finished without writing a result for scored *nothing*, and coercing
- * that to 0 would put it on screen as a confident zero-percent match.
  */
 export function toRunRow(kind: "company" | "facebook", r: RawRunRow): RunRow {
-  const score = r.score === null || r.score === undefined ? null : Number(r.score);
-
   return {
     id: String(r.id),
     kind,
@@ -70,9 +66,9 @@ export function toRunRow(kind: "company" | "facebook", r: RawRunRow): RunRow {
     nameTh: r.nameTh,
     context: r.context,
     status: r.status,
-    score: score !== null && Number.isFinite(score) ? score : null,
     matchedName: r.matchedName,
     matchedNameTh: r.matchedNameTh,
     matchedContext: r.matchedContext,
+    extras: r.extras ?? null,
   };
 }

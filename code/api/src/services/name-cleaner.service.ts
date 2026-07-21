@@ -1,27 +1,34 @@
 /**
  * Name cleaning — run once at import, on the way in.
  *
- * Uploaded names arrive dressed: "Mr. Somchai J. Jaidee Jr.", "นายสมชาย  ใจดี",
+ * Uploaded names arrive dressed: "Mr. Somchai Jaidee Jr.", "นายสมชาย  ใจดี",
  * 'SOMCHAI "TUI" JAIDEE'. The decorations are noise for every consumer — they drag the
  * matcher's trigram scores down by a constant, they make two spellings of the same person
  * look like two people to the dedup key, and they read badly in a grid.
  *
- * So each name is cleaned when the file is parsed, and the result is stored *alongside*
- * the original in a `_clean` column. The raw text is never modified: cleaning rules are
- * guesses (a "middle" token may be half of a two-word surname), and a guess you can't undo
- * is a data-loss bug waiting for the one row it gets wrong. Keeping both means a better
- * rule tomorrow is a backfill, not a re-upload.
+ * The cleaned name is what gets STORED, in the name column itself — there is no raw twin.
+ * That is a deliberate reversal of the earlier design (a `_clean` column beside the original)
+ * and it comes with a hard constraint: **every rule here must be one we are willing to apply
+ * with no undo.** A cleaned name is now the only record of what the file said, so a rule that
+ * guesses is a rule that silently destroys data on the row it guesses wrong.
  *
- * Everything downstream — the import preview, the grid, the matcher — reads `_clean` and
- * falls back to the raw name when it's absent (rows imported before this existed).
+ * That constraint is why there is no de-middle rule. Dropping the tokens between the first and
+ * last is the one genuinely lossy thing this module used to do — it is simply wrong for a
+ * two-word Thai surname ("ณ อยุธยา") or a Spanish double surname ("Maria del Carmen Garcia"),
+ * and it was only ever survivable because the original sat in the next column. It doesn't any
+ * more, so the rule is gone. Titles, suffixes and nicknames are still stripped: those are
+ * decorations *around* a name, not part of one, and re-deriving them was never possible anyway.
+ *
+ * The result is lower-cased. Case carries no identity for matching — "SOMCHAI" and "Somchai"
+ * are one person — and folding it on the way in means the dedup key, the matcher and the grid
+ * all read one spelling rather than each lower-casing defensively at their own end.
  *
  * The rules, in order:
  *   1. normalize   NFKC, kill zero-width/NBSP, collapse runs of spaces, trim
  *   2. de-decorate strip quotes and bracketed nicknames:  Somchai "Tui" Jaidee → Somchai Jaidee
  *   3. de-title    drop leading honorifics, spaced or attached: นายสมชาย → สมชาย
  *   4. de-suffix   drop trailing suffixes: Jr., III, PhD
- *   5. de-middle   keep only the first and last token: Somchai J. Jaidee → Somchai Jaidee
- *   6. case        Title Case a Latin name that shouted or whispered; leave mixed case alone
+ *   5. case        fold to lower; Thai has no case and is unaffected
  */
 
 /** Honorifics, dots and spaces removed, lower-cased. Latin + Thai. */
@@ -52,9 +59,6 @@ const ODD_SPACE = /[\u00A0\u1680\u2000-\u200A\u202F\u205F\u3000]/g;
 
 /** A token stripped to letters/digits, for comparing against the sets above. */
 const bare = (token: string): string => token.normalize("NFKC").replace(/[.。]/g, "").toLowerCase();
-
-/** Whether the token is written in Thai script (so casing rules don't apply to it). */
-const isThai = (token: string): boolean => /\p{Script=Thai}/u.test(token);
 
 /**
  * Whitespace and invisible characters, and nothing else. This is the whole treatment for
@@ -117,35 +121,15 @@ function deSuffix(tokens: string[]): string[] {
 }
 
 /**
- * Keep the first and last token, drop what's between — middle names and initials.
+ * The full clean, for a person's name — and the only spelling of it that gets stored.
  *
- * This is the one lossy rule, and it *is* wrong for a two-word surname ("ณ อยุธยา") or a
- * Spanish double surname. Survivable only because the raw name is still stored: the clean
- * column is for matching and display, and the row this mangles is one query from its
- * original text. Don't reach for this function anywhere the raw name isn't kept.
- */
-function deMiddle(tokens: string[]): string[] {
-  return tokens.length <= 2 ? tokens : [tokens[0], tokens[tokens.length - 1]];
-}
-
-/** "SOMCHAI" / "somchai" → "Somchai". "McKinsey" and Thai are left alone — a name that
- *  already carries case information knows better than this function does. */
-function fixCase(token: string): string {
-  if (isThai(token) || !/\p{L}/u.test(token)) return token;
-  const letters = token.replace(/\P{L}/gu, "");
-  const shouted = letters === letters.toUpperCase();
-  const whispered = letters === letters.toLowerCase();
-  if (!shouted && !whispered) return token;
-
-  // Capitalise after each internal boundary too: o'brien → O'Brien, mary-jane → Mary-Jane.
-  return token
-    .toLowerCase()
-    .replace(/(^|[-'’.])(\p{L})/gu, (_m, sep: string, ch: string) => sep + ch.toUpperCase());
-}
-
-/**
- * The full clean, for a person's name. Returns null when nothing survives (a "name" that
- * was only a title) — the same "no value" the parser uses for an empty cell.
+ * Returns null when nothing survives (a "name" that was only a title) — the same "no value"
+ * the parser uses for an empty cell. A caller that treats null as "use the raw text instead"
+ * would be storing the very decoration this strips, so callers drop the row instead.
+ *
+ * Every token between the first and the last is kept. See the module header: without a raw
+ * column to fall back on, a rule that guesses which tokens matter is one that loses data it
+ * cannot return.
  */
 export function cleanPersonName(raw: string | null | undefined): string | null {
   const tidied = tidyText(raw);
@@ -154,14 +138,10 @@ export function cleanPersonName(raw: string | null | undefined): string | null {
   const decorated = deDecorate(tidied);
   if (decorated === "") return null;
 
-  const tokens = deMiddle(deSuffix(deTitle(decorated.split(" ").filter(Boolean))));
-  const cleaned = tokens.map(fixCase).join(" ").trim();
+  const tokens = deSuffix(deTitle(decorated.split(" ").filter(Boolean)));
+  const cleaned = tokens.join(" ").trim().toLowerCase();
   return cleaned === "" ? null : cleaned;
 }
 
-/** Whether cleaning actually changed anything — drives the "N names were cleaned" note. */
+/** Whether cleaning would change the text — drives the preview's "N names will be cleaned" note. */
 export const wasCleaned = (raw: string | null, clean: string | null): boolean => (raw ?? "") !== (clean ?? "");
-
-/** The name to *use* for a row that may predate cleaning (its clean column is still null). */
-export const effectiveName = (clean: string | null, raw: string | null): string | null =>
-  clean ?? cleanPersonName(raw);

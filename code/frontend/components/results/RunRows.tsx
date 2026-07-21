@@ -6,6 +6,7 @@ import {
   CheckCircle2,
   CircleDashed,
   CircleSlash,
+  GitMerge,
   TriangleAlert,
   Users,
 } from "lucide-react";
@@ -15,37 +16,59 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { ConfidenceBadge } from "@/components/confidence/ConfidenceBadge";
+import { useFullWidth } from "@/components/main-container";
 import { useRunRows } from "@/hooks/queries";
 import type { RunRowsParams } from "@/lib/api/client";
+import { parseExtra } from "@/lib/match";
 import { cn } from "@/lib/utils";
 
 /**
- * The rows of an import, and what the workflow has decided about each — updating as it decides.
+ * Every row a run looked at, and what it decided about each — the only table on this page.
  *
- * The progress panel above this says *how much* of a run is done. This says *which*, and it is the
- * thing someone watching their own import actually wants: a bar at 60% tells you to wait, a table
- * of names tells you what is happening to your data. Rows appear the moment they are imported, at
- * "Waiting", and their verdicts fill in underneath them.
+ * It used to be the second of two, under a results table that showed the same matches again with
+ * fewer facts on them. That table read `comparison_result`, this one reads the rows themselves, and
+ * on an import-driven run the first was a strict subset of the second: same friend, same contact,
+ * same score, minus the company and minus the verdict. Worse, they did not merely duplicate — a
+ * friend who matched several contacts was several rows up there and one row down here, and nothing
+ * on screen said which count to believe. One table, one answer.
  *
- * Held in insertion order, never re-sorted. The list is re-read every couple of seconds, and a
- * table that re-sorted as verdicts landed would move the line you were reading out from under you
- * on every tick. Still, a row's badge changes in place and you watch your file being decided —
- * which is the whole effect. Sorting *findings* by score is the results table's job, and it does
- * that once the run is over and the answer has stopped moving.
+ * All three kinds of run now feed it, and the differences between them are real but small:
  *
- * The two directions are NOT the same table with the words swapped, which is why `kind` reaches all
- * the way into the headers and the cells. A friends import asks "does anyone I know work there?" —
- * so each row is a friend, and the match is a contact, who has an English name, a Thai name and an
- * employer. A company import asks the reverse — each row is a contact, and the match is a friend,
- * who has one name and, far more usefully, *somebody who knows them*. Rendered as one generic
- * "name → name" table, both questions lose their answer.
+ *   · A friends import  — each row is a friend you uploaded; the match is a contact, and the fact
+ *                         worth knowing about the match is the company they work for.
+ *   · A company import  — each row is a contact you uploaded; the match is a friend, who has only a
+ *                         name, so the fact worth knowing is *whose* friend they are.
+ *   · A compare         — you picked a company and every friend on file was scored against it. Each
+ *                         row is a friend. Nothing was uploaded, so these are not "your rows".
+ *
+ * `kind` decides the first two, `origin` the third, and both arrive on the progress payload rather
+ * than being sniffed from `rows[0]` — the list is paged and filtered, and a page with no rows on it
+ * still has to draw the right headers.
+ *
+ * Order is the caller's business, not this table's: see `sort` below. Held in import order while
+ * the run is live, best-first once it stops.
  */
 
 const PAGE_SIZE = 25;
 
+/**
+ * Below this many rows, the table shows no filter tabs and no sort control.
+ *
+ * They are controls for a table you have to *navigate*, and a run with four rows in it is not
+ * navigated, it is read. Under that size they are worse than useless: "All 2 · Matches 1 · No
+ * match 1" is a third restatement of a headline two inches above it, and "Best first / File order"
+ * offers to reorder a list you can take in whole. Chrome that cannot do anything reads as chrome
+ * you have not understood yet.
+ *
+ * Ten because that is roughly where a table stops being a paragraph and starts being a list. It is
+ * a judgement, not a measurement.
+ */
+const CONTROLS_MIN_ROWS = 10;
+
 type Filter = NonNullable<RunRowsParams["filter"]>;
+type Sort = NonNullable<RunRowsParams["sort"]>;
 type Kind = RunRow["kind"];
+type Origin = ComparisonProgress["origin"];
 
 /** The four verdicts, as they read on screen. Keyed by the shared `RowVerdict`, so a bucket
  *  cannot be renamed in the contract and left stale here. */
@@ -77,28 +100,107 @@ const VERDICT: Record<
 };
 
 /**
- * What each side is called, in the reader's terms rather than the table's.
+ * The two sides a row is welded from, described once each.
  *
- * `source` names what you uploaded; `target` names what it was compared against. They swap, and
- * saying so in the column headers is most of the fix: "Friend → Matched contact" and
- * "Contact → Matched friend" each answer, before a single row is read, the question the screenshot
- * could not — *which of these two did I just import?*
+ * A row here is two records stapled together by a fuzzy score, and it reads as one — a Facebook
+ * name and a company name in adjacent columns, as if they had always belonged to the same record.
+ * They didn't. Naming the side per *block* rather than per column is what says so: the top tier of
+ * the header names the source and the table it physically came out of, the bottom names its fields,
+ * and a tint plus a rule down the left keeps the grouping visible once you are reading rows.
+ *
+ * Both sides are described symmetrically because both directions exist. A run's SOURCE side is its
+ * `kind` (a friends import scores friends) and its TARGET is the other one — so a company import is
+ * this same table with the blocks swapped, not a different table. Each side keeps its colour in
+ * both: Facebook is always cyan, company always indigo, whichever of them you happened to upload.
+ *
+ * The `context` column is the point of the whole layout. `uploaded_by` and `company_name` used to
+ * be small grey lines stacked under the names, styled identically — so "mint.w@lakeshore.demo" and
+ * "BANGKOK BANK" looked like the same kind of fact, when one is who knows this person and the other
+ * is where they work, from two different tables. They are columns now, under headers that name them.
  */
-const SIDES: Record<Kind, { icon: typeof Users; label: string; source: string; target: string }> = {
+type Side = "facebook" | "company";
+
+interface SideMeta {
+  /** The source, as the top tier announces it. */
+  eyebrow: string;
+  /** The table it physically came out of — the literal answer to "where is this from". */
+  table: string;
+  icon: typeof Users;
+  /** Header for the name column. */
+  name: string;
+  /** Header for the context column: who knows them, or where they work. */
+  context: string;
+  /** The block's wash. Deliberately faint — it groups columns, it does not highlight them. */
+  tint: string;
+  /** The rule under the top tier, in the side's own colour. */
+  rule: string;
+  /** How the panel header names a run of this kind. */
+  badge: string;
+}
+
+const SIDE: Record<Side, SideMeta> = {
   facebook: {
+    eyebrow: "Facebook",
+    table: "friend",
     icon: Users,
-    label: "Facebook friends",
-    source: "Friend",
-    target: "Matched contact",
+    name: "Friend",
+    context: "Uploaded by",
+    tint: "bg-brand-2/[0.07]",
+    rule: "border-b-brand-2",
+    badge: "Facebook friends",
   },
   company: {
+    eyebrow: "Company",
+    table: "company_contact",
     icon: Building2,
-    label: "Company contacts",
-    source: "Contact",
-    target: "Matched friend",
+    name: "Contact",
+    context: "Company",
+    tint: "bg-brand/[0.07]",
+    rule: "border-b-brand",
+    badge: "Company contacts",
   },
 };
 
+/** The vertical rule that opens each block — the grouping, once the header has scrolled away. */
+const DIVIDER = "border-l border-l-border-strong";
+
+/**
+ * The panel's title and subtitle.
+ *
+ * Split on `origin` and not on `kind`, because this is the one thing the two imports agree about
+ * and the compare does not: you handed over a file, so the rows are yours. A compare scored a
+ * friend list that was already on file and may have been uploaded by somebody else entirely —
+ * calling that "your rows" is a small lie that makes the whole panel read as someone else's data.
+ */
+function heading(
+  origin: Origin,
+  live: boolean,
+  company: string | null
+): { title: string; description: string } {
+  if (origin === "compare") {
+    return {
+      title: "Friends scored",
+      // Named only when the run picked one. A legacy whole-table run has no selected company, and
+      // "someone at this company" would point at a company the page has already said it doesn't
+      // have — the panel above it reads "All companies on file".
+      description: company
+        ? `Every friend on file, and how close they came to someone at ${company}.`
+        : "Every friend on file, and the closest contact each one has.",
+    };
+  }
+  return {
+    title: "Your rows",
+    description: live
+      ? "Each name you uploaded, and what the matcher has said about it so far."
+      : "Each name you uploaded, and what the matcher said about it.",
+  };
+}
+
+/**
+ * The row's outcome — the workflow's word on whether it is *done*, and our word on whether it
+ * *matched*. See `rowVerdict`: the split is deliberate, and it is what stops this badge and the
+ * count above it coming from two different definitions of "match".
+ */
 function VerdictBadge({ status }: { status: string | null }) {
   const verdict = rowVerdict(status);
   const { label, icon: Icon, className, spin } = VERDICT[verdict];
@@ -112,27 +214,20 @@ function VerdictBadge({ status }: { status: string | null }) {
 }
 
 /**
- * A person, in up to three lines: who they are, how else they are spelled, and where they belong.
+ * A person: who they are, and how else they are spelled.
  *
- * The second and third lines only exist when there is something to put in them, so a friend (one
- * name, one uploader) does not render two empty rows to keep a contact company. `lang="th"` on the
- * Thai line lets the browser pick a Thai face rather than falling back through a Latin one.
+ * The Thai line only exists when there is something to put in it, so a friend — who has one name —
+ * does not render an empty second row to keep a contact company. `lang="th"` lets the browser pick
+ * a Thai face rather than falling back through a Latin one.
+ *
+ * No third line. Where they belong is a column now, under a header that says which of the two kinds
+ * of "where" it is.
  */
-function Person({
-  name,
-  nameTh,
-  context,
-  contextIcon: ContextIcon,
-}: {
-  name: string | null;
-  nameTh: string | null;
-  context: string | null;
-  contextIcon?: typeof Users;
-}) {
-  if (!name && !nameTh && !context) return <span className="text-muted-foreground">—</span>;
+function Person({ name, nameTh }: { name: string | null; nameTh: string | null }) {
+  if (!name && !nameTh) return <span className="text-muted-foreground">—</span>;
 
   return (
-    <div className="min-w-0 max-w-[18rem] space-y-0.5">
+    <div className="min-w-0 max-w-[16rem] space-y-0.5">
       <span className="block truncate font-medium" title={name ?? undefined}>
         {name ?? <span className="font-normal text-muted-foreground">—</span>}
       </span>
@@ -142,17 +237,17 @@ function Person({
           {nameTh}
         </span>
       )}
-
-      {context && (
-        <span
-          className="flex items-center gap-1 truncate text-xs text-muted-foreground"
-          title={context}
-        >
-          {ContextIcon && <ContextIcon className="h-3 w-3 shrink-0" aria-hidden />}
-          <span className="truncate">{context}</span>
-        </span>
-      )}
     </div>
+  );
+}
+
+/** A context cell — the uploader, or the company. Its header says which. */
+function Context({ value }: { value: string | null }) {
+  if (!value) return <span className="text-muted-foreground">—</span>;
+  return (
+    <span className="block max-w-[14rem] truncate text-sm text-muted-foreground" title={value}>
+      {value}
+    </span>
   );
 }
 
@@ -168,8 +263,14 @@ function filterTabs(progress: ComparisonProgress | undefined) {
     { key: "all", label: "All", count: progress?.total },
     { key: "matched", label: "Matches", count: progress?.matched },
     { key: "unmatched", label: "No match", count: progress?.unmatched },
-    { key: "pending", label: "Waiting", count: progress?.pending },
   ];
+
+  // "Waiting" is not a state a compare-by-company run can be in — the matcher finished inside the
+  // request that created it, so a row exists only once it has been decided. The tab would be a
+  // permanent zero, which reads as "none waiting yet" rather than "this cannot happen".
+  if (!progress || progress.origin === "import") {
+    tabs.push({ key: "pending", label: "Waiting", count: progress?.pending });
+  }
 
   // Only offered once there is one. A "Failed (0)" tab on a healthy run is an invitation to worry
   // about nothing; a "Failed (3)" tab on a broken one is the most important control on the page.
@@ -182,23 +283,53 @@ function filterTabs(progress: ComparisonProgress | undefined) {
 
 interface Props {
   comparisonId: string;
-  /** The counts above the table — also what labels the filter tabs. */
+  /** The counts above the table — also what labels the filter tabs, and what says which way round
+   *  the run is. */
   progress?: ComparisonProgress;
   /** Keep polling. False for a run that has stopped moving; its rows are still worth reading. */
   live: boolean;
+  /** The company this run picked, if it picked one. Only used to name it in the subtitle. */
+  company?: string | null;
 }
 
-export function RunRows({ comparisonId, progress, live }: Props) {
+export function RunRows({ comparisonId, progress, live, company = null }: Props) {
   const [filter, setFilter] = React.useState<Filter>("all");
   const [page, setPage] = React.useState(1);
 
-  // Changing the filter re-pages from the top: page 4 of "all" is not page 4 of "matches", and
-  // landing on an empty page you didn't ask for reads as "there are none".
-  React.useEffect(() => setPage(1), [filter]);
+  /**
+   * The widest thing in the product, so it asks for the window.
+   *
+   * Here and not in `ResultsView`, because this table is also rendered bare — the Compare screen's
+   * live monitor has no verdict over it, and it would want the room just as much. The container's
+   * route list cannot see either case: the Compare screen is `/`, which is capped, and it renders
+   * this at both of them.
+   */
+  useFullWidth();
+
+  /**
+   * Null until the reader says otherwise, and that is the whole design.
+   *
+   * The default follows `live`, because the only reason to hold import order is that the table is
+   * moving: it re-reads every couple of seconds, and rows that re-sorted as verdicts landed would
+   * slide out from under the line you were reading. The moment the run stops, that reason is gone
+   * and import order becomes the problem instead — the four matches of a 320-row run are scattered
+   * across 13 pages, and the first screen is whichever names happened to be inserted first.
+   *
+   * So a run you are watching flips to matches-first the moment it finishes, which is exactly when
+   * your question changes from "is this working" to "what did it find". But an explicit choice is
+   * never overridden — if you went and asked for file order, finishing does not take it away.
+   */
+  const [sortOverride, setSortOverride] = React.useState<Sort | null>(null);
+  const sort: Sort = sortOverride ?? (live ? "row" : "status");
+
+  // Both re-page from the top: page 4 of "all" is not page 4 of "matches", and page 4 of file
+  // order is not page 4 of matches-first. Landing on an empty page you didn't ask for reads as
+  // "there are none".
+  React.useEffect(() => setPage(1), [filter, sort]);
 
   const params = React.useMemo<RunRowsParams>(
-    () => ({ page, limit: PAGE_SIZE, filter }),
-    [page, filter]
+    () => ({ page, limit: PAGE_SIZE, filter, sort }),
+    [page, filter, sort]
   );
   const q = useRunRows(comparisonId, params, live);
 
@@ -207,17 +338,41 @@ export function RunRows({ comparisonId, progress, live }: Props) {
   const totalPages = q.data?.pagination.totalPages ?? 0;
   const tabs = filterTabs(progress);
 
-  // Nothing to monitor: a run with no import behind it (the internal matcher scores in-request and
-  // stamps no rows). Say nothing rather than showing an empty table that implies the rows are late.
-  if (!q.isLoading && total === 0 && filter === "all") return null;
+  // From the run, not from `rows[0]`, which is only reachable when there is nothing to correct it:
+  // a company run filtered to a bucket with nothing in it would draw a friends run's headers.
+  const kind: Kind = progress?.kind ?? rows[0]?.kind ?? "facebook";
+  const origin: Origin = progress?.origin ?? "import";
+  const extraKeys = progress?.extraKeys ?? [];
 
-  // Every row of a run is the same kind — it is one file, from one source. Take it from the first
-  // row rather than threading it down from the page, which would have to fetch the run to know it.
-  const kind: Kind = rows[0]?.kind ?? "facebook";
-  const side = SIDES[kind];
-  const SideIcon = side.icon;
-  const ContextIcon = kind === "company" ? Building2 : Users;
-  const MatchedContextIcon = kind === "company" ? Users : Building2;
+  /**
+   * Are the controls worth their space?
+   *
+   * Measured on the run's own size (`progress.total`), never on the page's — the pagination total
+   * moves with the filter, so a table filtered down to two rows would hide the very tabs you would
+   * need to get back out of it.
+   *
+   * A failed row overrides the size test outright. On a 300-row run "Failed 3" is a tab; on a
+   * 4-row run it is the only thing on the screen that matters, and it is exactly the run where
+   * hiding it would look like a clean result.
+   */
+  const runSize = progress?.total ?? 0;
+  const showControls = runSize >= CONTROLS_MIN_ROWS || (progress?.failed ?? 0) > 0;
+
+  /**
+   * Which side is which.
+   *
+   * The run's `kind` IS its source side — a friends import scores friends — and the target is
+   * whatever the other one is. So a company import is this table with the two blocks swapped, and
+   * nothing else about it changes.
+   */
+  const src = SIDE[kind];
+  const tgt = SIDE[kind === "facebook" ? "company" : "facebook"];
+  const SrcIcon = src.icon;
+  const TgtIcon = tgt.icon;
+
+  const { title, description } = heading(origin, live, company);
+  // name + context, per side, then whatever the matcher sent, then the verdict.
+  const colCount = 4 + extraKeys.length + 1;
 
   return (
     <Card>
@@ -226,81 +381,113 @@ export function RunRows({ comparisonId, progress, live }: Props) {
           <div className="space-y-1.5">
             <div className="flex flex-wrap items-center gap-2">
               <h3 className="font-display text-lg font-semibold leading-none tracking-tight">
-                Your rows
+                {title}
               </h3>
-              {/* Which file this run is about. The screen used to be identical for a friends
+              {/* Which side this run is about. The screen used to be identical for a friends
                   import and a company import, so the only way to tell them apart was to remember
                   what you had uploaded a minute ago. */}
               <Badge variant="secondary" className="gap-1.5">
-                <SideIcon className="h-3 w-3 shrink-0" aria-hidden />
-                {side.label}
+                <SrcIcon className="h-3 w-3 shrink-0" aria-hidden />
+                {src.badge}
               </Badge>
             </div>
-            <p className="text-sm text-muted-foreground">
-              {live
-                ? "Each name you uploaded, and what the matcher has said about it so far."
-                : "Each name you uploaded, and what the matcher said about it."}
-            </p>
+            <p className="text-sm text-muted-foreground">{description}</p>
           </div>
 
-          <div className="flex flex-wrap gap-1" role="tablist" aria-label="Filter rows by outcome">
-            {tabs.map((t) => (
-              <Button
-                key={t.key}
-                role="tab"
-                aria-selected={filter === t.key}
-                variant={filter === t.key ? "secondary" : "ghost"}
-                size="sm"
-                onClick={() => setFilter(t.key)}
-                className="gap-1.5"
-              >
-                {t.label}
-                {t.count !== undefined && (
-                  <span className="tabular-nums text-muted-foreground">
-                    {t.count.toLocaleString()}
-                  </span>
-                )}
-              </Button>
-            ))}
-          </div>
+          {showControls && (
+            <div className="flex flex-wrap items-center gap-3">
+              <div className="flex flex-wrap gap-1" role="tablist" aria-label="Filter rows by outcome">
+                {tabs.map((t) => (
+                  <Button
+                    key={t.key}
+                    role="tab"
+                    aria-selected={filter === t.key}
+                    variant={filter === t.key ? "secondary" : "ghost"}
+                    size="sm"
+                    onClick={() => setFilter(t.key)}
+                    className="gap-1.5"
+                  >
+                    {t.label}
+                    {t.count !== undefined && (
+                      <span className="tabular-nums text-muted-foreground">
+                        {t.count.toLocaleString()}
+                      </span>
+                    )}
+                  </Button>
+                ))}
+              </div>
+
+              <SortToggle sort={sort} onChange={setSortOverride} />
+            </div>
+          )}
         </div>
 
         <div className="overflow-x-auto rounded-lg border">
           <Table>
             <TableHeader>
-              <TableRow>
-                {/* The headers name the two sides rather than saying "Name" and "Matched with",
-                    which were true of both directions and therefore told you nothing about either. */}
-                <TableHead>{side.source}</TableHead>
-                <TableHead>Outcome</TableHead>
-                <TableHead>{side.target}</TableHead>
-                <TableHead className="text-right">Score</TableHead>
+              {/* Tier one: where the columns beneath it came from, and out of which table. This is
+                  the whole answer to "which of these is my company data and which is Facebook" —
+                  the colour is the fast version of it, the name and the table are the exact one. */}
+              <TableRow className="hover:bg-transparent">
+                <TableHead colSpan={2} className={cn("border-b-2", src.rule, src.tint)}>
+                  <SourceLabel icon={SrcIcon} eyebrow={src.eyebrow} table={src.table} />
+                </TableHead>
+
+                <TableHead colSpan={2} className={cn("border-b-2", tgt.rule, tgt.tint, DIVIDER)}>
+                  <SourceLabel icon={TgtIcon} eyebrow={tgt.eyebrow} table={tgt.table} />
+                </TableHead>
+
+                {/* Not a source. The verdict and whatever the matcher sent are the only things on
+                    the row that neither table contributed — they are what the *comparison* made. */}
+                <TableHead
+                  colSpan={1 + extraKeys.length}
+                  className={cn("border-b-2 border-b-border-strong bg-muted/40", DIVIDER)}
+                >
+                  <span className="inline-flex items-center gap-1.5 text-foreground">
+                    <GitMerge className="h-3 w-3" aria-hidden /> Match
+                  </span>
+                </TableHead>
+              </TableRow>
+
+              <TableRow className="hover:bg-transparent">
+                <TableHead className={src.tint}>{src.name}</TableHead>
+                <TableHead className={src.tint}>{src.context}</TableHead>
+                <TableHead className={cn(tgt.tint, DIVIDER)}>{tgt.name}</TableHead>
+                <TableHead className={tgt.tint}>{tgt.context}</TableHead>
+                {/* The rule opens the Match block, so it belongs to whichever column comes first in
+                    it — the extras, when the matcher sent any. */}
+                {extraKeys.map((k, i) => (
+                  <TableHead key={k} className={cn(i === 0 && DIVIDER)}>
+                    {k.replace(/_/g, " ")}
+                  </TableHead>
+                ))}
+                <TableHead className={cn("text-right", extraKeys.length === 0 && DIVIDER)}>
+                  Outcome
+                </TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {q.isLoading ? (
                 Array.from({ length: 5 }, (_, i) => (
                   <TableRow key={i}>
-                    <TableCell colSpan={4}>
+                    <TableCell colSpan={colCount}>
                       <Skeleton className="h-5 w-full" />
                     </TableCell>
                   </TableRow>
                 ))
               ) : rows.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={4} className="py-8 text-center text-sm text-muted-foreground">
-                    No rows in this view{live ? " yet" : ""}.
+                  <TableCell
+                    colSpan={colCount}
+                    className="py-8 text-center text-sm text-muted-foreground"
+                  >
+                    {filter === "all"
+                      ? `This run has no rows${live ? " yet" : ""}.`
+                      : `No rows in this view${live ? " yet" : ""}.`}
                   </TableCell>
                 </TableRow>
               ) : (
-                rows.map((r) => (
-                  <Row
-                    key={r.id}
-                    row={r}
-                    contextIcon={ContextIcon}
-                    matchedContextIcon={MatchedContextIcon}
-                  />
-                ))
+                rows.map((r) => <Row key={r.id} row={r} extraKeys={extraKeys} src={src} tgt={tgt} />)
               )}
             </TableBody>
           </Table>
@@ -337,52 +524,133 @@ export function RunRows({ comparisonId, progress, live }: Props) {
   );
 }
 
+/**
+ * Matches first, or the order of the file.
+ *
+ * Both are legitimate readings and neither modifies the other, so a segmented control rather than
+ * a checkbox. File order is not a curiosity: it is the order your source file is in, which is what
+ * you want when you are checking this table against the thing you uploaded.
+ *
+ * "Matches first" was "Best first" while rows carried a score to rank by. It is a weaker sort now
+ * and the label says so — it brings the matches to the top but cannot order them among themselves,
+ * so within the matches you are still reading the file in its own order.
+ */
+function SortToggle({ sort, onChange }: { sort: Sort; onChange: (s: Sort) => void }) {
+  const options: { value: Sort; label: string }[] = [
+    { value: "status", label: "Matches first" },
+    { value: "row", label: "File order" },
+  ];
+
+  return (
+    <div
+      role="group"
+      aria-label="Row order"
+      className="inline-flex shrink-0 rounded-lg border bg-muted p-0.5"
+    >
+      {options.map((o) => {
+        const active = sort === o.value;
+        return (
+          <button
+            key={o.value}
+            type="button"
+            onClick={() => onChange(o.value)}
+            aria-pressed={active}
+            className={cn(
+              "inline-flex items-center rounded-md px-2.5 py-1 text-xs font-medium",
+              "transition-colors duration-fast ease-swift",
+              "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1 focus-visible:ring-offset-background",
+              active
+                ? "bg-card text-foreground shadow-xs"
+                : "text-muted-foreground hover:text-foreground"
+            )}
+          >
+            {o.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/** The top tier's label for one block: the source, and the table it physically came out of. */
+function SourceLabel({
+  icon: Icon,
+  eyebrow,
+  table,
+}: {
+  icon: typeof Users;
+  eyebrow: string;
+  table: string;
+}) {
+  return (
+    <span className="inline-flex items-center gap-1.5 text-foreground">
+      <Icon className="h-3 w-3 shrink-0" aria-hidden />
+      {eyebrow}
+      <code className="ml-1 font-mono text-2xs normal-case tracking-normal text-muted-foreground">
+        {table}
+      </code>
+    </span>
+  );
+}
+
 function Row({
   row,
-  contextIcon,
-  matchedContextIcon,
+  extraKeys,
+  src,
+  tgt,
 }: {
   row: RunRow;
-  contextIcon: typeof Users;
-  matchedContextIcon: typeof Users;
+  extraKeys: string[];
+  src: SideMeta;
+  tgt: SideMeta;
 }) {
-  const verdict = rowVerdict(row.status);
+  // Parsed per row rather than per run: `extra` is one blob per result, and a row that matched
+  // nobody has none at all.
+  const extras = extraKeys.length > 0 ? parseExtra(row.extras) : {};
 
   return (
     <TableRow>
-      <TableCell className="align-top">
-        <Person
-          name={row.name}
-          nameTh={row.nameTh}
-          context={row.context}
-          contextIcon={contextIcon}
-        />
+      {/* The side you uploaded (or, on a compare, the side that was already on file). */}
+      <TableCell className={cn("align-top", src.tint)}>
+        <Person name={row.name} nameTh={row.nameTh} />
+      </TableCell>
+      <TableCell className={cn("align-top", src.tint)}>
+        <Context value={row.context} />
       </TableCell>
 
-      <TableCell className="align-top">
+      {/* The side it was held up against. */}
+      <TableCell className={cn("align-top", tgt.tint, DIVIDER)}>
+        <Person name={row.matchedName} nameTh={row.matchedNameTh} />
+      </TableCell>
+      <TableCell className={cn("align-top", tgt.tint)}>
+        <Context value={row.matchedContext} />
+      </TableCell>
+
+      {extraKeys.map((k, i) => {
+        const v = extras[k];
+        return (
+          <TableCell
+            key={k}
+            className={cn("align-top text-sm text-muted-foreground", i === 0 && DIVIDER)}
+          >
+            {v === null || v === undefined || v === "" ? "—" : String(v)}
+          </TableCell>
+        );
+      })}
+
+      {/*
+        The verdict, on the right, and nothing beside it.
+
+        There used to be a score column here reading "97% High" next to a badge that said "Match" —
+        two answers to one question. The badge won that argument, and the column has since gone
+        entirely: `matching_score` is not stored, so the badge is not merely the clearer answer, it
+        is the only one. A matcher that sends a score anyway has it carried into `extra`, where it
+        shows up as an extra column like any other field we do not model.
+      */}
+      <TableCell
+        className={cn("text-right align-top", extraKeys.length === 0 && DIVIDER)}
+      >
         <VerdictBadge status={row.status} />
-      </TableCell>
-
-      <TableCell className="align-top">
-        <Person
-          name={row.matchedName}
-          nameTh={row.matchedNameTh}
-          context={row.matchedContext}
-          contextIcon={matchedContextIcon}
-        />
-      </TableCell>
-
-      {/* A null score is not a zero. The workflow need only write a result row for a name it
-          matched, so a finished row can legitimately have no score at all — printing 0% there
-          would invent a confident measurement of something that was never measured. */}
-      <TableCell className="text-right align-top">
-        {row.score !== null ? (
-          <ConfidenceBadge score={row.score} className="ml-auto" />
-        ) : (
-          <span className="text-sm text-muted-foreground">
-            {verdict === "pending" ? "—" : "No score"}
-          </span>
-        )}
       </TableCell>
     </TableRow>
   );

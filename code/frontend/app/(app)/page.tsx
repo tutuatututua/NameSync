@@ -23,15 +23,16 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { CompanyPicker } from "@/components/company-picker";
 import { LoadingButton } from "@/components/loading-button";
 import { ConfirmButton } from "@/components/confirm-button";
 import { PageHeader, SectionHeader } from "@/components/page-header";
 import { EmptyState } from "@/components/empty-state";
 import { ResultsView } from "@/components/results/ResultsView";
-import { RunOutcome } from "@/components/results/RunOutcome";
-import { RunProgress } from "@/components/results/RunProgress";
+// Rendered bare, without a Verdict over it, for the live monitor below: a run in flight has no
+// finding yet. Once it lands, `ResultsView` renders the same table with the answer above it.
 import { RunRows } from "@/components/results/RunRows";
+import { RunProgress } from "@/components/results/RunProgress";
 import { useComparisonSocket } from "@/hooks/useComparisonSocket";
 import { useCompareByCompany, useDeleteComparison } from "@/hooks/mutations";
 import {
@@ -43,8 +44,9 @@ import {
   useResults,
 } from "@/hooks/queries";
 import { qk } from "@/hooks/queryKeys";
-import { formatDate, runTitle } from "@/lib/format";
+import { formatCompanies, formatDate, runTitle } from "@/lib/format";
 import { fade, fadeUp } from "@/lib/motion";
+import { cn } from "@/lib/utils";
 
 /**
  * Compare — the app's one job, and the record of every time you've done it.
@@ -86,7 +88,9 @@ function CompareScreen() {
   // The run an import just started and sent us here to watch.
   const importedRun = searchParams.get("run");
 
-  const [company, setCompany] = React.useState("");
+  // A list, because one run can span several companies — every friend is scored against the union
+  // of their contacts and keeps its single closest match. See MatcherService.run.
+  const [selected, setSelected] = React.useState<string[]>([]);
   const [sessionId, setSessionId] = React.useState<string | null>(importedRun);
   const [mode, setMode] = React.useState<Mode>(importedRun ? "running" : "choose");
   const [socketProgress, setSocketProgress] = React.useState(0);
@@ -150,9 +154,9 @@ function CompareScreen() {
   }, [polled, mode, sessionId, qc]);
 
   async function compare() {
-    if (!company) return;
+    if (selected.length === 0) return;
     try {
-      const data = await compareMut.mutateAsync(company);
+      const data = await compareMut.mutateAsync(selected);
       setSessionId(data.sessionId);
 
       // The internal matcher runs inside the request, so by the time this resolves the results
@@ -225,32 +229,42 @@ function CompareScreen() {
             <Card>
               <CardContent className="space-y-4 p-5">
                 <div className="space-y-1.5">
-                  <Label htmlFor="company">Company</Label>
+                  <Label htmlFor="company">
+                    {/* Plural, because the field is. It reads as a mistake on a one-company run for
+                        about as long as it takes to notice you can pick a second. */}
+                    Companies
+                  </Label>
                   <div className="flex flex-col gap-2 sm:flex-row">
-                    <Select value={company} onValueChange={setCompany} disabled={!hasCompanies}>
-                      <SelectTrigger id="company" className="sm:flex-1">
-                        <SelectValue
-                          placeholder={hasCompanies ? "Select a company…" : "No companies yet"}
-                        />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {(companies.data ?? []).map((c) => (
-                          <SelectItem key={c} value={c}>
-                            {c}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
+                    <div className="min-w-0 sm:flex-1">
+                      <CompanyPicker
+                        id="company"
+                        companies={companies.data ?? []}
+                        selected={selected}
+                        onChange={setSelected}
+                        disabled={!hasCompanies}
+                        placeholder={hasCompanies ? "Select companies…" : "No companies yet"}
+                      />
+                    </div>
                     <LoadingButton
                       variant="gradient"
                       className="sm:w-36"
                       isLoading={compareMut.isPending}
-                      disabled={!company}
+                      disabled={selected.length === 0}
                       onClick={compare}
                     >
                       <GitCompareArrows className="h-4 w-4" /> Compare
                     </LoadingButton>
                   </div>
+                  {/* Says what several companies actually does, at the one moment it is in doubt:
+                      the first time you tick a second one. A run is one finding per friend — their
+                      closest match anywhere in the set — not a match per company, and the difference
+                      is the whole reason the results table has a Company column. */}
+                  {selected.length > 1 && (
+                    <p className="text-sm text-muted-foreground">
+                      One run. Each friend is matched to their closest contact across all{" "}
+                      {selected.length} companies.
+                    </p>
+                  )}
                 </div>
 
                 {!hasCompanies && !companies.isLoading && (
@@ -314,7 +328,9 @@ function CompareScreen() {
                 <Loader2 className="h-6 w-6 animate-spin text-primary" />
                 <div className="space-y-1 text-center">
                   <p className="font-medium">
-                    {company ? `Matching against ${company}…` : "Matching…"}
+                    {formatCompanies(selected, { conjunction: "and" })
+                      ? `Matching against ${formatCompanies(selected, { conjunction: "and" })}…`
+                      : "Matching…"}
                   </p>
                   <p className="text-sm text-muted-foreground">
                     This runs in the background — you&apos;ll see results here when it finishes.
@@ -350,18 +366,20 @@ function CompareScreen() {
               <ResultsSkeleton />
             ) : results.data ? (
               <>
-                <ResultsView
-                  results={results.data.results}
-                  scoredCount={results.data.scoredCount}
-                  selectedCompany={results.data.selectedCompany}
-                />
-
-                {/* The rows that did NOT match live only here. The results table above lists the
-                    matches, and for an import-driven run that is all it can list — the workflow
-                    need only write a result for a name it matched. Renders nothing for a
-                    compare-by-company run, which has no import and no row statuses. */}
+                {/* The same component the run's own page renders, with the same props — a finished
+                    run reads identically whether you are looking at it here or came back to it a
+                    week later. The rows that did NOT match are inside it now: they used to need a
+                    second table bolted on underneath, because the results table could only ever
+                    list winners. */}
                 {sessionId && (
-                  <RunRows comparisonId={sessionId} progress={progress.data} live={false} />
+                  <ResultsView
+                    comparisonId={sessionId}
+                    results={results.data.results}
+                    scoredCount={results.data.scoredCount}
+                    selectedCompanies={results.data.selectedCompanies}
+                    progress={progress.data}
+                    live={false}
+                  />
                 )}
 
                 {/* No "Save to history" button. The run was written to the database before
@@ -488,7 +506,10 @@ function PastRuns() {
   const needle = query.trim().toLowerCase();
   const shown = needle
     ? runs.filter((h) =>
-        [h.name, h.selectedCompany].some((v) => v?.toLowerCase().includes(needle))
+        // Every company, not just the first: on a multi-company run the title elides past the third,
+        // so filtering on what's rendered would refuse to find a run by a company it genuinely
+        // covers — and the run would sit there, matching, invisible.
+        [h.name, ...h.selectedCompanies].some((v) => v?.toLowerCase().includes(needle))
       )
     : runs;
 
@@ -552,41 +573,65 @@ function PastRuns() {
               key={h.id}
               className="group relative flex items-center gap-4 border-b p-4 transition-colors last:border-b-0 hover:bg-muted/40 focus-within:bg-muted/40"
             >
-              {/* The whole row is the click target, not just the title: `absolute inset-0`
-                  stretches this link over the line. Anything that must stay clickable on
-                  top of it (the delete button) needs its own stacking context. */}
-              <Link
-                href={`/comparisons/${h.id}`}
-                className="min-w-0 flex-1 outline-none after:absolute after:inset-0 after:content-[''] focus-visible:underline"
-              >
-                <p className="truncate font-medium">{runTitle(h)}</p>
-                {/* Matches, not rows. `rowCount` is the size of the friend list, so it is the
-                    same number on every run made against the same friends — this list used to
-                    print "320 rows" three times and leave you to click each one to find out
-                    which had found anything. */}
-                <p className="mt-0.5 text-sm tabular-nums text-muted-foreground">
+              {/*
+                Name on the left, what happened on the right.
+
+                There used to be a third thing: a confidence badge ("100% High") pinned to the right
+                edge, with the date and counts stacked under the title. It is gone, and the counts
+                have taken its place — which is a straight trade of a number for the sentence that
+                number was trying to summarise. The badge averaged the run's ten best scores, so on a
+                list where every completed run found *something* it printed "100% High" against
+                nearly all of them: a column of identical green pills, sorted by nothing, telling you
+                apart runs that had already told you apart one line to the left ("34 matches" vs "3
+                matches"). Two summaries of one run, and the louder one carried less.
+
+                Stacks under the title on a narrow screen, where there is no room for two columns and
+                a right-aligned block would just be a cramped second line anyway.
+              */}
+              <div className="flex min-w-0 flex-1 flex-col gap-x-4 gap-y-0.5 sm:flex-row sm:items-center sm:justify-between">
+                {/* The whole row is the click target, not just the title: `absolute inset-0`
+                    stretches this link over the line. Anything that must stay clickable on
+                    top of it (the delete button) needs its own stacking context. */}
+                <Link
+                  href={`/comparisons/${h.id}`}
+                  className="min-w-0 outline-none after:absolute after:inset-0 after:content-[''] focus-visible:underline"
+                >
+                  <p className="truncate font-medium">{runTitle(h)}</p>
+                </Link>
+
+                <p className="shrink-0 text-sm tabular-nums text-muted-foreground sm:text-right">
                   {formatDate(h.date)}
-                  {h.status === "completed" && (
+                  {" · "}
+                  {/* Matches, not rows. `rowCount` is the size of the friend list, so it is the
+                      same number on every run made against the same friends — this list used to
+                      print "320 rows" three times and leave you to click each one to find out
+                      which had found anything. */}
+                  {h.status === "completed" ? (
                     <>
-                      {" · "}
                       <span className={h.matchCount > 0 ? "font-medium text-foreground" : undefined}>
                         {h.matchCount.toLocaleString()}{" "}
                         {h.matchCount === 1 ? "match" : "matches"}
-                      </span>
-                      {" "}
+                      </span>{" "}
                       <span className="text-muted-foreground">
                         of {h.scoredCount.toLocaleString()} scored
                       </span>
                     </>
+                  ) : (
+                    /* The one thing the badge said that the counts cannot: a run that has no counts
+                       yet, or never will. Dropping the badge without this would leave a run in
+                       flight and a run that died both rendering as a bare date — the two states
+                       where the list has the most to tell you and would suddenly say nothing. */
+                    <span
+                      className={cn(
+                        "font-medium",
+                        h.status === "failed" ? "text-destructive" : "text-foreground"
+                      )}
+                    >
+                      {h.status === "failed" ? "Failed" : "Running"}
+                    </span>
                   )}
                 </p>
-              </Link>
-
-              <RunOutcome
-                status={h.status}
-                matchCount={h.matchCount}
-                topConfidence={h.topConfidence}
-              />
+              </div>
 
               {/* Hidden until the row is hovered or something inside it takes focus — a
                   delete button on every line is a column of little red targets you never

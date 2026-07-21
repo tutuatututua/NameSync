@@ -11,12 +11,20 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { LoadingButton } from "@/components/loading-button";
 import { Callout } from "@/components/callout";
 import { ApiError } from "@/lib/api/client";
 import { usePreviewUpload } from "@/hooks/mutations";
-import { useRunComparison, useSendWebhook } from "@/hooks/mutations";
-import { formatDate } from "@/lib/format";
+import { useRunComparison } from "@/hooks/mutations";
 
 /**
  * Step two of an import: show what the file actually contains, then commit it.
@@ -46,25 +54,39 @@ const fieldName = (source: ImportSource) => (source === "company" ? "companyFile
 /**
  * One sample cell.
  *
- * A name column shows the *cleaned* name — the value that will be matched and displayed —
- * with the original underneath whenever cleaning changed it. Showing only the clean name
- * would hide an edit to the user's data; showing only the raw one would be a lie about what
- * gets stored. Both are written to the database, so both are shown here.
+ * A name column shows the *cleaned* name — the value that will be stored, matched and displayed —
+ * with the file's original underneath whenever cleaning changed it. This is now the only place
+ * the two are ever visible together: the raw text is not written to the database, so a rule that
+ * mangles a name has to be caught on this screen or not at all.
  */
 const renderCell = (m: ColumnMapping, row: Record<string, string | null>) => {
   const value = row[m.target] ?? null;
   if (value === null || value === "") return <span className="text-muted-foreground">—</span>;
-  if (m.target === "source_timestamp") return <span className="whitespace-nowrap">{formatDate(value)}</span>;
+  if (!m.cleaned) return <span className="block max-w-[18rem] truncate" title={value}>{value}</span>;
 
-  const clean = m.cleaned ? row[`${m.target}_clean`] ?? null : null;
-  const changed = m.cleaned && clean !== value;
+  const clean = row[`${m.target}_clean`] ?? null;
+
+  // Cleaned away to nothing — the cell held only a title ("Mr", "คุณ") with no name behind it.
+  // This row will not be imported, and saying so is the entire job of this screen. It used to
+  // fall back to rendering the raw value here, which claimed the opposite: that the name was
+  // kept, unchanged, when in fact the row was about to be dropped.
+  if (clean === null) {
+    return (
+      <div className="max-w-[18rem]">
+        <span className="block text-xs font-medium text-destructive">Not imported</span>
+        <span className="block truncate text-xs text-muted-foreground line-through" title={value}>
+          {value}
+        </span>
+      </div>
+    );
+  }
 
   return (
     <div className="max-w-[18rem]">
-      <span className="block truncate" title={clean ?? value}>
-        {clean ?? value}
+      <span className="block truncate" title={clean}>
+        {clean}
       </span>
-      {changed && (
+      {clean !== value && (
         <span className="block truncate text-xs text-muted-foreground line-through" title={value}>
           {value}
         </span>
@@ -78,9 +100,18 @@ export function ImportReview({ source, file, onCancel, onComplete }: Props) {
   const router = useRouter();
   const [uploader, setUploader] = React.useState("");
 
+  /**
+   * The import landed but added nothing, so no run was opened and there is nowhere to go.
+   *
+   * Held in state because this is the one outcome that has to be *said*. Every other path
+   * either sends you to a run or leaves an obviously changed table behind it; this one looks
+   * exactly like a no-op, and a toast that fades after four seconds is not an explanation —
+   * it is the reason this case kept getting reported as "the button did nothing".
+   */
+  const [nothingNew, setNothingNew] = React.useState<{ duplicates: number } | null>(null);
+
   const preview = usePreviewUpload();
   const run = useRunComparison();
-  const send = useSendWebhook();
 
   const { mutate: runPreview } = preview;
 
@@ -95,7 +126,7 @@ export function ImportReview({ source, file, onCancel, onComplete }: Props) {
   // so a Facebook import can't do without one. Company rows dedupe on their own contents.
   const uploaderRequired = !isCompany;
   const data = preview.data;
-  const busy = run.isPending || send.isPending;
+  const busy = run.isPending;
   const canImport = !!data && data.totalRows > 0 && (!uploaderRequired || !!uploader.trim()) && !busy;
 
   async function commit() {
@@ -105,8 +136,10 @@ export function ImportReview({ source, file, onCancel, onComplete }: Props) {
     form.append("uploadPersonName", uploader.trim());
     form.set("name", file.name); // the upload's name is the file it came from
     try {
+      // One request does the whole job — the server forwards the new rows to the ingestion
+      // webhook itself before responding, so a closed tab can't strand a run that was
+      // imported but never sent.
       const result = await run.mutateAsync(form);
-      await send.mutateAsync(result.sessionId); // forward the new rows to the ingestion webhook
       const added = isCompany ? result.companyAdded : result.facebookAdded;
       const dupes = isCompany ? result.companyDuplicates : result.facebookDuplicates;
 
@@ -119,6 +152,20 @@ export function ImportReview({ source, file, onCancel, onComplete }: Props) {
           `Imported ${added.toLocaleString()} row${added === 1 ? "" : "s"} — matching now`
         );
         router.push(`/?run=${result.comparisonId}`);
+        return;
+      }
+
+      /**
+       * Nothing new landed — every row of this file was already on file.
+       *
+       * No run is opened for an import that adds nothing (there would be nothing for the
+       * matcher to look at), so unlike the branch above there is no run to send anyone to.
+       * Re-importing a file you have already imported is the ordinary way to reach this, and
+       * from the outside it is indistinguishable from a broken button: the screen resets and
+       * the app appears to have ignored you. Say what happened, on the page you said it on.
+       */
+      if (added === 0) {
+        setNothingNew({ duplicates: dupes });
         return;
       }
 
@@ -210,6 +257,31 @@ export function ImportReview({ source, file, onCancel, onComplete }: Props) {
           </div>
         </>
       )}
+
+      {/* Closing it returns to the file picker. The import is over — leaving the review up
+          with a live "Import 42 rows" button would only invite the same no-op a second time. */}
+      <AlertDialog
+        open={nothingNew !== null}
+        onOpenChange={(open) => {
+          if (open) return;
+          setNothingNew(null);
+          onComplete?.();
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Nothing new to import</AlertDialogTitle>
+            <AlertDialogDescription>
+              {nothingNew && nothingNew.duplicates > 0
+                ? `Every row in ${file.name} — all ${nothingNew.duplicates.toLocaleString()} of them — was already imported, so nothing was added and no matching run was started. Import a file with new rows to start one.`
+                : `${file.name} added no new rows, so no matching run was started.`}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogAction>Close</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
@@ -349,9 +421,9 @@ function SampleRows({ preview }: { preview: UploadPreview }) {
 
       {anyCleaned && (
         <p className="text-xs text-muted-foreground">
-          Names are cleaned on import — titles (Mr., นาย), suffixes, nicknames and middle names are removed. The{" "}
-          <span className="line-through">struck-through</span> value is what your file says; it is stored too, so
-          nothing is lost.
+          Names are cleaned on import — titles (Mr., นาย), suffixes and nicknames are removed and the name is
+          stored in lower case. The <span className="line-through">struck-through</span> value is what your file
+          says; only the cleaned name is stored, so check it here.
         </p>
       )}
     </div>

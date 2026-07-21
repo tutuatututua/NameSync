@@ -13,9 +13,9 @@ import { Callout } from "@/components/callout";
 import { ResultsView } from "@/components/results/ResultsView";
 import { RunOutcome } from "@/components/results/RunOutcome";
 import { RunProgress } from "@/components/results/RunProgress";
-import { RunRows } from "@/components/results/RunRows";
 import { useComparisonProgress, useResults } from "@/hooks/queries";
 import { qk } from "@/hooks/queryKeys";
+import { formatCompanies } from "@/lib/format";
 
 /**
  * One run — whether it finished a month ago or is finishing as you watch.
@@ -38,8 +38,6 @@ export default function ComparisonDetailPage() {
   const { data, isLoading } = useResults(id);
   const qc = useQueryClient();
 
-  const running = data?.status === "processing";
-
   /**
    * Asked for unconditionally, not only while the run is going.
    *
@@ -54,11 +52,33 @@ export default function ComparisonDetailPage() {
    */
   const progress = useComparisonProgress(id);
 
-  // The poll is what *completes* the run (server-side), so the moment it reports 'completed'
-  // the results endpoint has something new to say — and it is the only signal we get, since
-  // the workflow never talks to us. Without this the page would sit on a finished run still
-  // showing a progress bar until someone reloaded it.
-  const finished = progress.data?.status === "completed";
+  /**
+   * The run's status, from the one query that actually re-asks.
+   *
+   * `useResults` is fetched once and has no interval, so `data.status` is frozen at whatever was
+   * true when the page mounted — reading liveness from it meant a run that started as 'processing'
+   * stayed 'processing' on this page forever, no matter what it went on to do. That was survivable
+   * only for runs that complete, because the effect below refetches the results on completion and
+   * unfreezes it. A run that FAILED had nothing to unfreeze it: the progress poll stopped itself,
+   * `data.status` never moved off 'processing', and the page sat there claiming "Matching in
+   * progress…" — with the failure callout below never rendering, the Verdict permanently
+   * suppressed, and the row table polling a dead run every two seconds until the tab closed.
+   *
+   * `progress.data.status` is the same field from the endpoint that polls, so it is simply the
+   * current answer. Falling back to `data.status` covers the first frame, before the poll lands.
+   */
+  const status = progress.data?.status ?? data?.status ?? "processing";
+  const running = status === "processing" || status === "pending";
+
+  // The poll is what *completes* the run (server-side), so the moment it reaches a terminal state
+  // the results endpoint has something new to say — and it is the only signal we get, since the
+  // workflow never talks to us. Without this the page would sit on a finished run still showing a
+  // progress bar until someone reloaded it.
+  //
+  // Fires on 'failed' as well as 'completed'. Both are the end of the run, both leave this page
+  // holding a stale `results`, and a failed run is exactly the one whose reader most needs the
+  // page to stop pretending.
+  const finished = progress.data?.status === "completed" || progress.data?.status === "failed";
   React.useEffect(() => {
     if (!finished) return;
     qc.invalidateQueries({ queryKey: qk.results(id) });
@@ -96,70 +116,65 @@ export default function ComparisonDetailPage() {
       <PageHeader
         backHref="/"
         backLabel="Compare"
-        title={data.selectedCompany ?? `Run ${id}`}
-        /* "320 rows" was the same subtitle on every run against the same friend list. The
-           run's own finding goes here instead; Verdict says it again in full, but a header
-           that repeats the answer is better than one that withholds it. */
-        description={
-          data.status === "completed"
-            ? `${data.matchCount.toLocaleString()} ${
-                data.matchCount === 1 ? "match" : "matches"
-              } · ${data.scoredCount.toLocaleString()} names scored`
-            : running
-              ? // `rowCount` counts stored results, which is 0 until the workflow writes the
-                // first one — "0 friends scored" would be a false statement about a run that
-                // is scoring them right now. The progress panel below carries the real numbers.
-                "Matching in progress…"
-              : `${data.rowCount.toLocaleString()} friends scored`
-        }
+        /* Named "and", not "or": this identifies the run — the set of companies it was pointed at —
+           rather than making a claim about any one match. The Verdict below says "or", because
+           there it IS a claim about each matched friend, who works at one of them. */
+        title={formatCompanies(data.selectedCompanies, { conjunction: "and" }) ?? `Run ${id}`}
+        /*
+          The finding is NOT repeated here.
+
+          This used to read "1 match · 2 names scored", directly above a card reading "1 friend
+          matches a contact on file, out of 2 scored" — the same two numbers, twice, four lines
+          apart. The comment defending it said a header that repeats the answer beats one that
+          withholds it, which was true when the Verdict might have been below the fold. It is the
+          next thing on the page.
+
+          So the header identifies the run and the Verdict states the finding, once. The exception
+          is a run still going: the Verdict is deliberately not rendered then (it would read its
+          facts from an empty array and announce a confident zero), so this is the only line that
+          can say anything, and "Matching in progress…" is what there is to say.
+        */
+        description={running ? "Matching in progress…" : undefined}
         /* The same badge, from the same fields, as the row you clicked to get here — so a run
            cannot say one thing in the list and another on its own page. */
-        actions={
-          <RunOutcome
-            status={data.status ?? "processing"}
-            matchCount={data.matchCount}
-            topConfidence={data.topConfidence}
-          />
-        }
+        actions={<RunOutcome status={status} matchCount={data.matchCount} />}
       />
 
-      {data.status === "failed" && (
+      {status === "failed" && (
         <Callout tone="danger" title="This run failed — it never produced any results." />
       )}
 
-      {/* A run in flight gets the progress panel, not an empty results table. `progress.data`
-          may not have arrived on the first frame, so fall back to a neutral note rather than
-          flashing "no results" at someone whose run started two seconds ago. */}
-      {running ? (
-        progress.data ? (
+      {/* A run in flight gets the progress panel above its rows. `progress.data` may not have
+          arrived on the first frame, so fall back to a neutral note rather than flashing
+          anything at someone whose run started two seconds ago. */}
+      {running &&
+        (progress.data ? (
           <RunProgress progress={progress.data} />
         ) : (
           <Callout tone="info" title="This run is still going. Results appear as rows are matched." />
-        )
-      ) : data.results.length > 0 ? (
-        <ResultsView
-          results={data.results}
-          scoredCount={data.scoredCount}
-          selectedCompany={data.selectedCompany}
-        />
-      ) : (
-        <EmptyState icon={SearchX} title="No results" description="This run stored no matches." />
-      )}
+        ))}
 
       {/*
-        The import's own rows, in both states — and the reason it is not inside the branch above.
+        One block, in every state and for every kind of run — which is the point.
 
-        While the run goes, this is the monitor: names resolving from Waiting to Match one by one.
-        When it ends, it is the only view that shows the names that *didn't* match beside the ones
-        that did — `comparison_result` can't answer that, because a workflow is only obliged to
-        write a result row for a name it matched, so the results table above is a list of winners
-        with no record of who else ran. A run that matched 4 of 320 has 316 rows that exist nowhere
-        else on this page.
+        This used to be a branch: a results table for a finished run, an empty state for a finished
+        run that stored no matches, and a *second* table underneath for the run's own rows. The
+        second one was the honest view (it had the names that didn't match, which `comparison_result`
+        cannot answer for an import) and the first was a subset of it. Both rendered, both described
+        the same run, and they disagreed at the edges.
 
-        Renders nothing at all for a run with no import behind it (the internal matcher stamps no
-        row statuses), so the older compare-by-company runs are unaffected.
+        The empty state has gone with it: "this run stored no matches" was tested on `results`, so a
+        run that scored 320 friends and matched nobody replaced its own table — the one place those
+        320 rows are listed — with a sentence saying there was nothing to see.
       */}
-      <RunRows comparisonId={id} progress={progress.data} live={running} />
+      <ResultsView
+        comparisonId={id}
+        results={data.results}
+        scoredCount={data.scoredCount}
+        selectedCompanies={data.selectedCompanies}
+        progress={progress.data}
+        live={running}
+      />
     </div>
   );
 }

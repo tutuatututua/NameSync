@@ -30,7 +30,6 @@ import type {
   RunRow,
   RunRowsQuery,
   RenameComparisonBody,
-  SendWebhookData,
   DataStats,
   SourceType,
   CompaniesData,
@@ -54,11 +53,14 @@ export class ApiError extends Error {
 type Envelope<T> = { success: true; message?: string; data: T };
 type Paginated<T> = { success: true; data: T[]; pagination: Pagination };
 
-/** Which page of a run's rows, and which status bucket. Mirrors RunRowsQuerySchema. */
+/** Which page of a run's rows, which status bucket, and in what order. Mirrors RunRowsQuerySchema. */
 export type RunRowsParams = {
   page?: number;
   limit?: number;
   filter?: RunRowsQuery["filter"];
+  /** Server-side, because the list is paged: sorting 25 rows here would order the page, not the
+   *  run, and then call it "best first". See RunRowsQuerySchema. */
+  sort?: RunRowsQuery["sort"];
 };
 
 /** Search/filter params for the upload-history and upload-session tables. */
@@ -176,8 +178,6 @@ export const api = {
       request<Envelope<CreateComparisonData>>("/comparisons", { method: "POST", body: form }).then((r) => r.data),
     merge: (id: string, form: FormData) =>
       request<Envelope<CreateComparisonData>>(`/comparisons/${id}/merge`, { method: "POST", body: form }).then((r) => r.data),
-    sendWebhook: (id: string) =>
-      request<Envelope<SendWebhookData>>(`/comparisons/${id}/send-webhook`, { method: "POST" }).then((r) => r.data),
     /** How far the external workflow has got. Polled while a run is in flight; also what
      *  completes the run — see the route's comment. */
     progress: (id: string) =>
@@ -189,10 +189,12 @@ export const api = {
     trigger: (id: string) =>
       request<Envelope<TriggerCompareData>>(`/comparisons/${id}/compare`, { method: "POST" }).then((r) => r.data),
     companies: () => request<Envelope<CompaniesData>>(`/comparisons/companies`).then((r) => r.data),
-    compareByCompany: (company_name: string) =>
+    /** One run against one or more companies — every friend scored against the union of their
+     *  contacts, keeping each friend's single closest match. Not one run per company. */
+    compareByCompany: (company_names: string[]) =>
       request<Envelope<TriggerCompareData>>(`/comparisons/compare`, {
         method: "POST",
-        body: JSON.stringify({ company_name } satisfies CompareByCompanyBody),
+        body: JSON.stringify({ company_names } satisfies CompareByCompanyBody),
       }).then((r) => r.data),
     results: (id: string) =>
       request<Envelope<ResultsData>>(`/comparisons/${id}/results`).then((r) => r.data),

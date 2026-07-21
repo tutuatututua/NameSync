@@ -120,13 +120,6 @@ export function useMergeComparison() {
   });
 }
 
-export function useSendWebhook() {
-  return useMutation({
-    mutationFn: (id: string) => api.comparisons.sendWebhook(id),
-    onError: (e) => toast.error(errMsg(e, "Failed to send data to the processing service")),
-  });
-}
-
 export function useTriggerComparison() {
   return useMutation({
     mutationFn: (id: string) => api.comparisons.trigger(id),
@@ -134,10 +127,10 @@ export function useTriggerComparison() {
   });
 }
 
-/** Start a comparison against one selected company (no file upload). */
+/** Start one comparison against the selected companies (no file upload). */
 export function useCompareByCompany() {
   return useMutation({
-    mutationFn: (companyName: string) => api.comparisons.compareByCompany(companyName),
+    mutationFn: (companyNames: string[]) => api.comparisons.compareByCompany(companyNames),
     onError: (e) => toast.error(errMsg(e, "Failed to start the comparison")),
   });
 }

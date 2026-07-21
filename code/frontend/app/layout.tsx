@@ -16,7 +16,7 @@ const thai = Noto_Sans_Thai({
 
 export const metadata: Metadata = {
   title: "NameSync",
-  description: "Sync and compare Company and Facebook data with confidence-scored name matching.",
+  description: "Sync and compare Company and Facebook data with fuzzy name matching.",
 };
 
 export default function RootLayout({
