@@ -3,6 +3,8 @@ import { notifyUnauthorized } from "@/lib/auth/session";
 import type {
   AuthSessionData,
   AuthUser,
+  CenterLoginBody,
+  CenterLoginData,
   ChangePasswordBody,
   CreateUserBody,
   LoginBody,
@@ -127,9 +129,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
     // A 401 anywhere means the session is gone — expired, revoked, or the account was
     // disabled. Tell the auth layer once, from the one place every request passes through,
-    // rather than making every caller remember to handle it. The login endpoint is the
+    // rather than making every caller remember to handle it. The sign-in endpoints are the
     // exception: a 401 there is "wrong password", which the form shows inline.
-    if (res.status === 401 && path !== "/auth/login") notifyUnauthorized();
+    if (res.status === 401 && path !== "/auth/login" && path !== "/auth/center/login") {
+      notifyUnauthorized();
+    }
 
     throw new ApiError(message, res.status, json);
   }
@@ -154,6 +158,17 @@ export const api = {
       request<Envelope<AuthSessionData>>("/auth/login", { method: "POST", body: JSON.stringify(body) }).then(
         (r) => r.data.user
       ),
+    /**
+     * Sign in via Center — the production path. Returns either the signed-in user or a 2FA
+     * challenge (`twoFactorRequired`); the caller inspects which and, for a challenge, calls
+     * again with the same email+password plus the `code`. The session cookie, when it comes,
+     * is set by the API — never seen here.
+     */
+    centerLogin: (body: CenterLoginBody) =>
+      request<Envelope<CenterLoginData>>("/auth/center/login", {
+        method: "POST",
+        body: JSON.stringify(body),
+      }).then((r) => r.data),
     logout: () => request<{ success: true; message: string }>("/auth/logout", { method: "POST" }),
     /** 401s when signed out — that is how the AuthGuard asks "is anyone there?". */
     me: () => request<Envelope<AuthSessionData>>("/auth/me").then((r) => r.data.user),

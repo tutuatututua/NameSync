@@ -3,7 +3,7 @@
 import * as React from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { useQueryClient } from "@tanstack/react-query";
-import type { AuthUser } from "@extensions/contract";
+import type { AuthUser, TwoFactorMethod } from "@extensions/contract";
 import { api, ApiError } from "@/lib/api/client";
 import { setUnauthorizedHandler } from "@/lib/auth/session";
 
@@ -15,11 +15,28 @@ import { setUnauthorizedHandler } from "@/lib/auth/session";
  * for, and why there is a loading state at all: on first paint we genuinely do not know.
  */
 
+/** A Center sign-in either completes, or Center asks for a second factor. */
+export type CenterSignInOutcome =
+  | { status: "signed-in" }
+  | { status: "2fa"; method: TwoFactorMethod; ref: string | null };
+
+/** What the login form hands to `signInWithCenter`, including the 2FA fields on step two. */
+export interface CenterSignInArgs {
+  email: string;
+  password: string;
+  code?: string;
+  method?: TwoFactorMethod;
+  ref?: string | null;
+}
+
 interface AuthState {
   user: AuthUser | null;
   /** True until the first /me answers. Render nothing decisive while it is. */
   loading: boolean;
+  /** Local password sign-in — dev only; the API refuses it in production. */
   signIn: (email: string, password: string) => Promise<void>;
+  /** Center sign-in — the production path. Resolves to a 2FA challenge or a completed session. */
+  signInWithCenter: (args: CenterSignInArgs) => Promise<CenterSignInOutcome>;
   signOut: () => Promise<void>;
 }
 
@@ -87,6 +104,26 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     []
   );
 
+  const signInWithCenter = React.useCallback(
+    async (args: CenterSignInArgs): Promise<CenterSignInOutcome> => {
+      const result = await api.auth.centerLogin({
+        email: args.email,
+        password: args.password,
+        code: args.code,
+        method: args.method,
+        ref: args.ref ?? undefined,
+      });
+      // The response is either a completed session (`{ user }`) or a 2FA challenge.
+      if ("twoFactorRequired" in result) {
+        return { status: "2fa", method: result.method, ref: result.ref };
+      }
+      setUser(result.user);
+      setLoading(false);
+      return { status: "signed-in" };
+    },
+    []
+  );
+
   const signOut = React.useCallback(async () => {
     try {
       await api.auth.logout();
@@ -102,8 +139,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [queryClient, router]);
 
   const value = React.useMemo<AuthState>(
-    () => ({ user, loading, signIn, signOut }),
-    [user, loading, signIn, signOut]
+    () => ({ user, loading, signIn, signInWithCenter, signOut }),
+    [user, loading, signIn, signInWithCenter, signOut]
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

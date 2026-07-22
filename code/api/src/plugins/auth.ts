@@ -17,7 +17,7 @@ declare module "fastify" {
 
 /**
  * Routes reachable without signing in:
- *  - POST /api/auth/login, because that is where a session comes from
+ *  - POST /api/auth/login and /api/auth/center/login, because that is where a session comes from
  *  - health, so a load balancer can probe the app
  *  - the OpenAPI docs
  *  - the matcher callback, which is machine-to-machine and carries its own shared secret
@@ -30,7 +30,14 @@ declare module "fastify" {
  * because it only ever emits comparison-progress events, and closing it is a behaviour
  * change worth making on its own rather than smuggling into this one. See docs/AUTH.md.
  */
-const PUBLIC_PATHS = [/^\/api\/auth\/login$/, /^\/api\/health/, /^\/docs/, /^\/api\/callbacks\//, /^\/ws/];
+const PUBLIC_PATHS = [
+  /^\/api\/auth\/login$/,
+  /^\/api\/auth\/center\/login$/,
+  /^\/api\/health/,
+  /^\/docs/,
+  /^\/api\/callbacks\//,
+  /^\/ws/,
+];
 
 const isPublic = (url: string): boolean => {
   const path = url.split("?")[0];
