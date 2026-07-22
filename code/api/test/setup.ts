@@ -40,5 +40,10 @@ process.env.DB_SKIP_MIGRATE = "1";
 process.env.AUTH_DISABLED = "1";
 // Keep the SQL console's timeout test fast (the default is 5s).
 process.env.SQL_CONSOLE_TIMEOUT_MS = "2000";
+// Center sign-in points at a URL that is never really dialled: center-auth.test.ts stubs
+// global fetch. It must be present *here*, before config/env.ts parses process.env once at
+// import, because lib/center.ts reads the frozen `env.CENTER_PLAYME_URL`, not process.env.
+process.env.CENTER_PLAYME_URL = "http://127.0.0.1:59999/center/";
+process.env.CENTER_GROUP_IAM2_ID = "test-group";
 
 export const MOCK_PORT = 8199;

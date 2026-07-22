@@ -5,16 +5,20 @@ import {
   ApiMessageSchema,
   AuthSessionDataSchema,
   AuthUserSchema,
+  CenterLoginBodySchema,
+  CenterLoginDataSchema,
   ChangePasswordBodySchema,
   CreateUserBodySchema,
   LoginBodySchema,
   type AuthUser,
 } from "@extensions/contract";
+import { isProduction } from "../config/env";
 import { Forbidden, Unauthorized } from "../lib/errors";
 import { ok } from "../lib/http";
 import { bearerToken, clearSessionCookie, SESSION_COOKIE, setSessionCookie } from "../lib/session";
 import { readCookie } from "../lib/cookies";
 import { changePassword, createUser, login, logout } from "../services/auth.service";
+import { signInWithCenter } from "../services/center-auth.service";
 import type { SessionUser } from "../lib/session";
 
 /**
@@ -45,11 +49,42 @@ const ipOf = (req: FastifyRequest): string | undefined => req.ip;
 export default async function authRoutes(fastify: FastifyInstance): Promise<void> {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
 
-  // ── Sign in ───────────────────────────────────────────────────────────────
+  // ── Sign in with Center ───────────────────────────────────────────────────
+  // The production path. One endpoint, two steps: the first call carries email+password; if
+  // Center wants a second factor the response is a challenge (no cookie) and the client calls
+  // again with `code`. On success we mint NameSync's own session — Center's token never
+  // touches the browser. See services/center-auth.service.ts.
+  app.post(
+    "/center/login",
+    { schema: { body: CenterLoginBodySchema, response: { 200: apiSuccess(CenterLoginDataSchema) } } },
+    async (req, reply) => {
+      const result = await signInWithCenter({
+        email: req.body.email,
+        password: req.body.password,
+        code: req.body.code,
+        method: req.body.method,
+        ref: req.body.ref,
+        meta: { userAgent: req.headers["user-agent"], ip: ipOf(req) },
+      });
+
+      if (result.kind === "twoFactor") return ok(result.challenge);
+
+      setSessionCookie(reply, result.session.token);
+      return ok({ user: toAuthUser(result.session.user) });
+    }
+  );
+
+  // ── Sign in with a local password (dev only) ──────────────────────────────
+  // Retained for local development against a database of your own accounts. Refused in
+  // production, where Center is the only identity source — so a prod deploy cannot be entered
+  // with a NameSync-local password even if one somehow exists on a row.
   app.post(
     "/login",
     { schema: { body: LoginBodySchema, response: { 200: apiSuccess(AuthSessionDataSchema) } } },
     async (req, reply) => {
+      if (isProduction) {
+        throw new Forbidden("Password sign-in is disabled here. Sign in with Center.");
+      }
       const { token, user } = await login(req.body.email, req.body.password, {
         userAgent: req.headers["user-agent"],
         ip: ipOf(req),

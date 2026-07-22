@@ -75,6 +75,19 @@ const EnvSchema = z.object({
   // Refused in production.
   AUTH_DISABLED: z.string().optional(),
 
+  // ── Center sign-in (centerapp.io) ──────────────────────────────────────────
+  // The production identity source. NameSync forwards email+password to Center's auth API,
+  // and on success mints its own session (lib/center.ts, services/center-auth.service.ts).
+  // Required in production — with it unset there is no way to sign in to a prod deploy, since
+  // the local password path is dev-only (see the login route). See docs/AUTH.md.
+  //
+  // The base URL of Center's "PlayMe" auth API, e.g. https://centerapp.io/center/ — a trailing
+  // slash is added if missing. `auth/login`, `auth/me`, `auth/sendcode` hang off it.
+  CENTER_PLAYME_URL: optionalUrl,
+  // The IAM2 group id Center expects on a login/sendcode call (the closest thing to a client
+  // id in Center's model). Optional — sent when set. Comes from ticket 07 (client registration).
+  CENTER_GROUP_IAM2_ID: z.string().optional(),
+
   // Optional read-only connection for the SQL console. Falls back to DATABASE_URL,
   // which is still safe (read-only transaction), but a role that physically cannot
   // write is the stronger guarantee.
@@ -120,6 +133,11 @@ function loadEnv(): Env {
   if (isProd && isAuthDisabled(env)) {
     missing.push('AUTH_DISABLED must not be set in production (it turns auth off entirely)');
   }
+  // Center is the only way into a production deploy (the local password path is dev-only), so
+  // an unset CENTER_PLAYME_URL there is a locked-out deploy. Fail at boot, not at first login.
+  if (isProd && !env.CENTER_PLAYME_URL) {
+    missing.push('CENTER_PLAYME_URL (required in production — it is the only sign-in path)');
+  }
   // A SameSite=None cookie without Secure is silently DROPPED by every current browser —
   // so this misconfiguration would present as "login succeeds, then nothing is signed in".
   // Fail at boot with the reason instead of at 2am with the symptom.
@@ -151,6 +169,9 @@ export const corsOrigins: string[] = (env.CORS_ORIGIN ?? '')
 
 export const isProduction = env.NODE_ENV === 'production';
 export const isTest = env.NODE_ENV === 'test';
+
+/** Is Center sign-in wired up? Always true in production (env refuses to boot otherwise). */
+export const isCenterConfigured = (): boolean => !!env.CENTER_PLAYME_URL;
 
 /**
  * Is the external workflow the matcher?

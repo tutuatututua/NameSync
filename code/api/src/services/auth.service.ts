@@ -109,6 +109,22 @@ export async function login(
 
   attempts.delete(key); // a success clears the slate
 
+  return issueSession(user, meta);
+}
+
+/**
+ * Mint a session for an already-authenticated user: a fresh token, its hash stored as a
+ * row, the last-login stamp bumped. The single place a session comes into being — the local
+ * password path (above) and the Center path (services/center-auth.service.ts) both end here,
+ * so there is exactly one kind of session no matter how the user proved who they are.
+ *
+ * It takes an authenticated user as a given; deciding *whether* to trust them is the caller's
+ * job, done before this is ever reached.
+ */
+export async function issueSession(
+  user: AppUser,
+  meta: { userAgent?: string; ip?: string } = {}
+): Promise<LoginResult> {
   const token = newSessionToken();
   const expiresAt = sessionExpiry();
   await AuthSessionModel.create({
