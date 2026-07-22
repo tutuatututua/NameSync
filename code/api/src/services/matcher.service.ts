@@ -26,9 +26,11 @@ import { ROW_MATCH, ROW_UNMATCH } from "@extensions/contract";
  * transliterations still score ~0.45, close enough to the bar that noise starts crossing it.
  * Trigram overlap sends them to ~0.05.
  *
- * The score itself is not stored. `comparison_result` records a verdict and not a number, so what
- * leaves this file is `match` or `unmatch` — the arithmetic is real, but it is this matcher's own
- * and nothing downstream can see, re-check or re-judge it.
+ * The score is stored alongside the verdict, in `comparison_result.similarity` — but ONLY as a sort
+ * key and a display value. The verdict this file writes (`match` / `unmatch`) is still the whole
+ * answer: nothing downstream re-derives it from the stored number, so moving `MATCH_THRESHOLD` never
+ * re-grades a past run. Storing the score buys ranking ("best match first") back; it does not bring
+ * back the authority the dropped `matching_score` column had. See `similarity` in schema-redesign.sql.
  */
 
 /** Titles carried by company rows but never by a Facebook name. Left in, they would drag
@@ -165,9 +167,14 @@ export class MatcherService {
         // can name three there is nothing downstream that could work it back out — two companies
         // employing one name is common enough that guessing by name is a coin toss.
         company_name: best.company_name,
-        // The verdict, decided here and now, because there is nowhere to defer it to: the score
-        // is not stored, so this is the only moment anything will ever know what `bestScore` was.
+        // The verdict, decided here and now against the threshold — the whole answer, and the only
+        // thing any reader consults to know match vs no-match.
         status: bestScore >= MATCH_THRESHOLD ? ROW_MATCH : ROW_UNMATCH,
+        // The same number, kept beside the verdict for sorting and display — not to re-derive the
+        // verdict from (that is `status`'s job, decided just above and never recomputed). `bestScore`
+        // is -1 only when a friend had no candidate to score against, and those rows never reach here
+        // (`if (!best) continue`), so what is stored is always a real similarity in [0, 1].
+        similarity: bestScore,
         // We know exactly who uploaded this friend, so fill it rather than leaning on the
         // results view's name-based fallback (which guesses when two uploads share a name).
         upload_name: friend.uploaded_by,

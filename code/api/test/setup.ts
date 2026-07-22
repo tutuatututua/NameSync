@@ -4,8 +4,8 @@
 process.env.NODE_ENV = "test";
 process.env.DB_ENGINE = "postgres";
 process.env.DATABASE_URL =
-  process.env.TEST_DATABASE_URL || "postgres://namesync:namesync@localhost:55432/namesync_test";
-// NameSync tables live in the `lakeshore` schema (globalSetup applies the schema there).
+  process.env.TEST_DATABASE_URL || "postgres://networkintel:networkintel@localhost:55432/networkintel_test";
+// Network Intel tables live in the `lakeshore` schema (globalSetup applies the schema there).
 process.env.DB_SCHEMA = "lakeshore";
 process.env.CORS_ORIGIN = "http://localhost:3000";
 // Ingestion only. There is no COMPARE_WEBHOOK_URL: the comparison is computed against

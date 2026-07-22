@@ -1,4 +1,4 @@
-import { sql, type RawBuilder } from "kysely";
+import { sql, type Expression, type RawBuilder, type SqlBool } from "kysely";
 import {
   ROW_QUEUED,
   ROW_PENDING,
@@ -13,7 +13,7 @@ import {
  * Counting the external workflow's verdicts — the progress mechanism itself.
  *
  * `friend` and `company_contact` carry the same `status` column for the same reason: the workflow
- * stamps each row it finishes, and NameSync learns that an import is done by finding none of its
+ * stamps each row it finishes, and Network Intel learns that an import is done by finding none of its
  * rows still unstamped. There is no callback and no event — this counting *is* how progress is
  * known (docs/EXTERNAL-MATCHER.md).
  *
@@ -133,6 +133,85 @@ export function matchedFirstSql(statusColumn: string): RawBuilder<number> {
   const s = sql`lower(trim(coalesce(${sql.ref(statusColumn)}, '')))`;
   const matched = sql.join(ROW_MATCHED_VALUES.map((v) => sql.val(v)));
   return sql<number>`case when ${s} in (${matched}) then 0 else 1 end`;
+}
+
+/**
+ * "Does this status column read as a match?" — the matched test on its own, as a boolean.
+ *
+ * Split out of `rowVerdictSql` so an import reader can ask it of a *different* table than the one it
+ * is folding. An import's source row (`friend` / `company_contact`) owns whether it is *finished*;
+ * whether it *matched* is a fact recorded on its `comparison_result` pair. Same trim/lower/coalesce
+ * as everywhere else, for the same reason — the column is unconstrained and written by another system.
+ */
+export function isMatchedSql(statusColumn: string): RawBuilder<SqlBool> {
+  const s = sql`lower(trim(coalesce(${sql.ref(statusColumn)}, '')))`;
+  const matched = sql.join(ROW_MATCHED_VALUES.map((v) => sql.val(v)));
+  return sql<SqlBool>`${s} in (${matched})`;
+}
+
+/**
+ * `rowVerdictSql`, for an import's source row whose match may live on its `comparison_result` pair
+ * rather than on the row itself.
+ *
+ * The source row owns one fact for certain: whether it is *finished*. An external workflow stamps
+ * it, and the completion poll reads `pending` / `processing` straight off it — so unfinished and
+ * failed are still decided by the column, exactly as `rowVerdictSql` does, and are checked first so
+ * a row still being worked on cannot be pulled forward to `matched` by a pair that has already landed.
+ *
+ * Whether the row *matched* is a separate fact. A workflow following the contract stamps the column
+ * `match` too, but some record the verdict *only* as a `comparison_result` pair and stamp the source
+ * row with a bare done-marker like `complete` — a spelling this vocabulary does not know, which then
+ * falls through to `unmatched` (docs/EXTERNAL-MATCHER.md §2c). So matched-ness is
+ * `stamp-says-match OR has-a-matched-pair`, and `hasMatch` carries the second half: an EXISTS over
+ * this row's matched pairs, built by the caller because only it knows the join.
+ *
+ * A clause-for-clause mirror of `rowVerdictSql` — read that first; this adds exactly one disjunct.
+ */
+export function rowVerdictWithMatchSql(
+  statusColumn: string,
+  hasMatch: Expression<SqlBool>
+): RawBuilder<RowVerdict> {
+  const s = sql`lower(trim(coalesce(${sql.ref(statusColumn)}, '')))`;
+  const failed = sql.join(ROW_FAILED_VALUES.map((v) => sql.val(v)));
+  const unfinished = sql.join(ROW_UNFINISHED_VALUES.map((v) => sql.val(v)));
+  const matched = sql.join(ROW_MATCHED_VALUES.map((v) => sql.val(v)));
+
+  return sql<RowVerdict>`case
+    when ${s} in (${unfinished}) then ${sql.val<RowVerdict>("pending")}
+    when ${s} in (${failed}) then ${sql.val<RowVerdict>("failed")}
+    when ${s} in (${matched}) or ${hasMatch} then ${sql.val<RowVerdict>("matched")}
+    else ${sql.val<RowVerdict>("unmatched")}
+  end`;
+}
+
+/**
+ * The status string a run-row should carry, once its match may come from its pair.
+ *
+ * `RunRow.status` is read by exactly one thing — `rowVerdict`, to draw the badge — and shown
+ * verbatim by nothing (see the contract). So this returns the raw stamp untouched for every verdict
+ * the stamp already carries (pending / processing / failed / an explicit unmatch), and substitutes
+ * `match` *only* when the verdict lives on the pair and the stamp is a bare done-marker. Fed back
+ * through `rowVerdict` it yields exactly the verdict `rowVerdictWithMatchSql` counts — so the badge
+ * on a row and the tally above it cannot disagree, which is the whole reason the two are built from
+ * the same constants.
+ */
+export function effectiveStatusSql(
+  statusColumn: string,
+  hasMatch: Expression<SqlBool>
+): RawBuilder<string | null> {
+  const s = sql`lower(trim(coalesce(${sql.ref(statusColumn)}, '')))`;
+  const failed = sql.join(ROW_FAILED_VALUES.map((v) => sql.val(v)));
+  const unfinished = sql.join(ROW_UNFINISHED_VALUES.map((v) => sql.val(v)));
+  const matched = sql.join(ROW_MATCHED_VALUES.map((v) => sql.val(v)));
+  const raw = sql.ref(statusColumn);
+
+  return sql<string | null>`case
+    when ${s} in (${unfinished}) then ${raw}
+    when ${s} in (${failed}) then ${raw}
+    when ${s} in (${matched}) then ${raw}
+    when ${hasMatch} then ${sql.val(ROW_MATCH)}
+    else ${raw}
+  end`;
 }
 
 /**

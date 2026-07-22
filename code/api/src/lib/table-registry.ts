@@ -216,6 +216,8 @@ const TABLES: RegistryTable[] = [
       c("person_name_th", "string", { label: "Thai name" }),
       c("batch_number", "number", { label: "Batch" }),
       c("status", "string", { label: "Status", nullable: false, enumValues: RESULT_STATUS }),
+      // Sort/display only — in [0, 1], NULL when unrecorded. Never the verdict; `status` is.
+      c("similarity", "number", { label: "Similarity" }),
       c("upload_name", "string", { label: "Upload" }),
       c("company_name", "string", { label: "Company" }),
       c("extra", "json", { label: "Extra" }),

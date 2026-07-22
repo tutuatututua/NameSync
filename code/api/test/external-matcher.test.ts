@@ -4,7 +4,7 @@ import { sql } from "kysely";
 import { DBModel } from "@extensions/sqldb";
 
 /**
- * The external-matcher path: an import starts a run, the workflow finishes it, and NameSync
+ * The external-matcher path: an import starts a run, the workflow finishes it, and Network Intel
  * finds out by counting rows.
  *
  * `vi.hoisted` runs before this file's imports are evaluated, which is the only place this
@@ -84,7 +84,7 @@ async function importAndForward(names: string[]) {
  * worth anything if it does exactly what the document tells the workflow to do.
  *
  * `score` is gone from the verdict fixture along with the column. It used to be the interesting
- * half — a workflow could stamp 'match' at 0.7 and NameSync would overrule it — and there is no
+ * half — a workflow could stamp 'match' at 0.7 and Network Intel would overrule it — and there is no
  * overruling left to test: `matched` is now the entire input and the entire output.
  */
 async function workflowStamps(
@@ -212,7 +212,7 @@ describe("external matcher — an import starts a run", () => {
    *
    * This test used to assert the opposite, and was called "counts a run's matches at OUR
    * threshold, not at the workflow's". A workflow could stamp `match` on a row it scored 0.7,
-   * and NameSync counted it as a non-match because 0.7 was under MATCH_THRESHOLD: the workflow
+   * and Network Intel counted it as a non-match because 0.7 was under MATCH_THRESHOLD: the workflow
    * owned "is this row finished", we owned "is this a match".
    *
    * There is no score stored to overrule anything with, so that half is gone. What is pinned here
@@ -251,6 +251,49 @@ describe("external matcher — an import starts a run", () => {
     expect((await rowsOf(comparisonId, "?filter=matched")).data.map((r) => r.name)).toEqual([
       stored("Somchai"),
       stored("Malee"),
+    ]);
+  });
+
+  /**
+   * A workflow may record the verdict ONLY on the pair.
+   *
+   * The contract asks a workflow to stamp `friend.status` = 'match'/'unmatch' AND write the pair.
+   * A real one (run 6) instead stamped every source row with a bare 'complete' — a done-marker
+   * outside this vocabulary, which reads as *unmatched* — and put the actual verdict only in
+   * `comparison_result.status`. The result was a row showing its matched contact next to an Outcome
+   * of "No match", and a run reporting 0 matches over 7 real ones.
+   *
+   * So matched-ness is now recovered from the pair when the stamp does not carry it: the row's own
+   * stamp still decides *finished* (a 'complete' row is done, so the run completes), and its match
+   * comes from `comparison_result`. All four readers agree again.
+   */
+  it("reads a match from its comparison_result pair when the stamp is a bare done-marker", async () => {
+    const { comparisonId } = await importAndForward(["Somchai", "Anong"]);
+
+    const conn = await db();
+    // Every source row stamped 'complete' — finished, but not a spelling that means "match".
+    await sql`UPDATE lakeshore.friend SET status = 'complete'`.execute(conn);
+    // The verdict lives only here: a match pair for Somchai, none for Anong.
+    await sql`
+      INSERT INTO lakeshore.comparison_result
+        (comparison_id, friend_name, person_name_en, person_name_th,
+         batch_number, status, upload_name)
+      VALUES (${comparisonId}, ${stored("Somchai")}, ${stored("Somchai")}, ${"ชื่อ"},
+              1, ${"match"}, ${"Alex"})
+    `.execute(conn);
+
+    // 'complete' is finished, so the poll completes the run — and the tally reads the match off the
+    // pair: 1 matched, 1 unmatched, none left pending.
+    const p = await progress(comparisonId);
+    expect(p).toMatchObject({ status: "completed", pending: 0, matched: 1, unmatched: 1 });
+
+    // And the row filter (over the same verdict the badge draws) puts Somchai in Matches and Anong
+    // in No match — the outcome the source stamp alone could never have shown.
+    expect((await rowsOf(comparisonId, "?filter=matched")).data.map((r) => r.name)).toEqual([
+      stored("Somchai"),
+    ]);
+    expect((await rowsOf(comparisonId, "?filter=unmatched")).data.map((r) => r.name)).toEqual([
+      stored("Anong"),
     ]);
   });
 
@@ -537,6 +580,37 @@ describe("external matcher — watching the rows", () => {
       matchedName: stored("Somchai Jaidee"), // the friend
       matchedNameTh: null, // a friend has no Thai twin
       matchedContext: "Nadhee", // …and *whose* friend they are, which is the route in
+    });
+  });
+
+  it("fills a matched friend's uploader from the friend on file when the workflow leaves it null", async () => {
+    // The friend is already on file — Nok imported them — and `upload_name` is optional on the
+    // contract, so a workflow may match a friend and never say whose. NameSync knows anyway: it has
+    // the friend row. Without the fallback a company import that found a match showed the friend's
+    // name beside an empty "Uploaded by" — the one column that turns a match into an introduction.
+    await importFacebook(app, { friends: friendRows(["Somchai Jaidee"]), uploader: "Nok" });
+
+    const res = await importCompany(app, { csv: CO_CSV, uploader: "Alex" });
+    const { comparisonId } = res.json().data;
+
+    const conn = await db();
+    await sql`
+      UPDATE lakeshore.company_contact SET status='match' WHERE person_name_en = ${stored("Somchai")}
+    `.execute(conn);
+    // No upload_name written — the workflow matched the friend but didn't say whose.
+    await sql`
+      INSERT INTO lakeshore.comparison_result
+        (comparison_id, friend_name, person_name_en, person_name_th, batch_number, status)
+      VALUES (${comparisonId}, ${stored("Somchai Jaidee")}, ${stored("Somchai")}, ${"สมชาย"}, 1, ${"match"})
+    `.execute(conn);
+
+    const row = (await rows(comparisonId)).data.find(
+      (r: { name: string }) => r.name === stored("Somchai")
+    );
+    // Recovered from the friend row, not the (null) result field.
+    expect(row).toMatchObject({
+      matchedName: stored("Somchai Jaidee"),
+      matchedContext: "Nok",
     });
   });
 

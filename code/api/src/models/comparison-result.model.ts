@@ -59,6 +59,14 @@ export interface ComparisonResultInput {
    * one's.
    */
   status: string;
+  /**
+   * How close the match was, in [0, 1] — stored for sorting and display, deciding nothing.
+   *
+   * Optional and nullable: the internal matcher has this number in hand (it scored the row to
+   * decide it), an external matcher need not send one, and neither this nor any reader derives the
+   * verdict from it — `status` is the verdict. See `rowVerdict`.
+   */
+  similarity?: number | null;
   upload_name?: string | null;
   /** Where the matched contact works. Optional: an external matcher posts results through the
    *  callback route and is not obliged to say. */
@@ -77,6 +85,7 @@ export class ComparisonResultModel extends DBModel {
       person_name_th: r.person_name_th,
       batch_number: r.batch_number,
       status: r.status,
+      similarity: r.similarity ?? null,
       upload_name: r.upload_name ?? null,
       company_name: r.company_name ?? null,
       // Object -> jsonb (node-postgres serializes); null stays null.
@@ -90,11 +99,10 @@ export class ComparisonResultModel extends DBModel {
    * that, the uploader of the matching friend row (scalar subquery, so a shared
    * name never multiplies rows). `extra` is cast back to a JSON string.
    *
-   * Matches first, then insertion order — the whole point of a run is "who do we most likely
-   * know", and batch order alone is just the order rows happened to be written in, which tells
-   * you nothing. This used to rank by similarity, which ordered the matches among themselves as
-   * well; it cannot now, so `id` carries far more of the ordering than it did. It is still what
-   * keeps the result stable between two reads of the same run.
+   * Matches first, then closest similarity, then insertion order — the whole point of a run is
+   * "who do we most likely know". Similarity ranks the matches among themselves again (it went with
+   * `matching_score` and is back as a display-only sort key); `id` is the final tie-break, and what
+   * keeps the result stable between two reads of a run whose rows scored equally or carry no score.
    *
    * Note that the same company person can legitimately appear on more than one row: two
    * uploaders who each have that friend is the connection this app exists to surface, so
@@ -111,6 +119,7 @@ export class ComparisonResultModel extends DBModel {
         "comparison_result.person_name_th",
         "comparison_result.batch_number",
         "comparison_result.status",
+        "comparison_result.similarity",
         "comparison_result.comparison_id as session_id",
         // Raw, with no by-name fallback behind it — unlike `upload_name` below and unlike the run
         // table's version of this column. The fallback is a correlated subquery per row and this
@@ -136,6 +145,7 @@ export class ComparisonResultModel extends DBModel {
       ])
       .where("comparison_id", "=", comparisonId)
       .orderBy(matchedFirstSql("comparison_result.status"))
+      .orderBy(sql`comparison_result.similarity desc nulls last`)
       .orderBy("comparison_result.id", "asc")
       .execute() as Promise<ComparisonResultRow[]>;
   }
@@ -225,6 +235,7 @@ export class ComparisonResultModel extends DBModel {
           ])
           .as("context"),
         "comparison_result.status",
+        "comparison_result.similarity",
         "comparison_result.person_name_en as matchedName",
         "comparison_result.person_name_th as matchedNameTh",
         // The row's own answer first; the by-name lookup only for rows that never recorded one.
@@ -239,12 +250,22 @@ export class ComparisonResultModel extends DBModel {
     // See FriendModel.findRunRows. These runs are never live — the matcher finishes inside the
     // request — so `status` is what anyone reading one actually wants; `row` stays reachable
     // because insertion order is still the order the friend list was read in.
+    //
+    // Unlike the import readers, these rows carry a `similarity`, so both score-aware sorts are real
+    // here: `similarity` ranks every row by closeness (NULLs last), and `status` — matches first —
+    // now tie-breaks on similarity too, so within the matches the closest comes first rather than
+    // whichever was inserted first. `id` is the final, stable tie-break in every case.
     const ordered =
-      sort === "status"
+      sort === "similarity"
         ? selected
-            .orderBy(matchedFirstSql("comparison_result.status"))
+            .orderBy(sql`comparison_result.similarity desc nulls last`)
             .orderBy("comparison_result.id", "asc")
-        : selected.orderBy("comparison_result.id", "asc");
+        : sort === "status"
+          ? selected
+              .orderBy(matchedFirstSql("comparison_result.status"))
+              .orderBy(sql`comparison_result.similarity desc nulls last`)
+              .orderBy("comparison_result.id", "asc")
+          : selected.orderBy("comparison_result.id", "asc");
 
     const [data, countResult] = await Promise.all([
       ordered.limit(limit).offset(offset).execute(),

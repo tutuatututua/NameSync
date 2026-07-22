@@ -8,7 +8,7 @@ import { serializeCookie, type CookieOptions } from "./cookies";
  *
  * A JWT is a bearer claim the server can only ever *verify*: it cannot be withdrawn, so a
  * stolen one stays valid until it expires, and "sign out" is a lie the client tells itself.
- * NameSync now issues its own sessions instead, and they are just rows (auth_session), so
+ * Network Intel now issues its own sessions instead, and they are just rows (auth_session), so
  * signing out — or disabling an account — takes effect on the very next request.
  *
  * The token is 32 random bytes. It is handed to the browser once and never stored: the

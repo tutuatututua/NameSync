@@ -76,6 +76,51 @@ export function useCompanies() {
 }
 
 /**
+ * Network Overview — one roster's connections across every company, from stored results.
+ * `uploader` null means "everyone". `placeholderData` holds the last roster on screen while the
+ * next one loads, so switching rosters doesn't blank the tiles.
+ */
+export function useNetworkOverview(uploader: string | null) {
+  return useQuery({
+    queryKey: qk.networkOverview(uploader),
+    queryFn: () => api.network.overview(uploader ?? undefined),
+    placeholderData: keepPreviousData,
+  });
+}
+
+/**
+ * Network Search — company people matching a free-text name (`q`) OR everyone at an exact company
+ * (`company`, for the company popup). Each row carries who knows them and who reaches their company.
+ * Disabled until there's something to look up, so an empty box costs no request.
+ */
+export function useNetworkSearch(params: { q?: string; company?: string; page: number; limit: number }) {
+  const enabled = !!params.company || (params.q?.trim().length ?? 0) > 0;
+  return useQuery({
+    queryKey: qk.networkSearch(params),
+    queryFn: () => api.network.search(params),
+    enabled,
+    placeholderData: keepPreviousData,
+  });
+}
+
+/** Every uploader with a roster, and their matched / no-match tallies — the Uploaders tab. */
+export function useNetworkUploaders() {
+  return useQuery({ queryKey: qk.networkUploaders(), queryFn: () => api.network.uploaders() });
+}
+
+/**
+ * One uploader's matched / no-match names in full — the uploader detail page. Disabled until a
+ * name is in hand, so the shell renders without a wasted request.
+ */
+export function useNetworkUploader(name: string) {
+  return useQuery({
+    queryKey: qk.networkUploader(name),
+    queryFn: () => api.network.uploader(name),
+    enabled: name.trim().length > 0,
+  });
+}
+
+/**
  * Upload sessions (imports) with search/filter — the rollback-able history.
  *
  * Refetches itself while any import on the page is still 'processing'. With the external
@@ -124,7 +169,7 @@ const POLL_MS = 2_000;
 /**
  * Watch a run the external workflow is working on.
  *
- * Polling, not a socket, because the workflow doesn't talk to NameSync at all — it writes its
+ * Polling, not a socket, because the workflow doesn't talk to Network Intel at all — it writes its
  * verdicts straight into Postgres and moves on. The only way to learn that a run has finished
  * is to keep counting its unstamped rows until there are none, which is exactly what the
  * endpoint does.

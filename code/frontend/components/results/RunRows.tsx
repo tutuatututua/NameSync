@@ -306,6 +306,19 @@ export function RunRows({ comparisonId, progress, live, company = null }: Props)
    */
   useFullWidth();
 
+  // Where the run came from. Derived from the poll (a prop) up here, because the default sort below
+  // depends on it. `kind` is derived lower down, where it can also fall back to `rows[0]`.
+  const origin: Origin = progress?.origin ?? "import";
+
+  /**
+   * Whether this run carries a per-row similarity to rank and show.
+   *
+   * Only a compare-by-company run does: its rows are `comparison_result` rows the internal matcher
+   * scored. An import-driven run reads its rows from `friend` / `company_contact`, which have no
+   * score, so the column would be all "—" and the "Best match" sort a no-op — both hidden there.
+   */
+  const showSimilarity = origin === "compare";
+
   /**
    * Null until the reader says otherwise, and that is the whole design.
    *
@@ -315,12 +328,13 @@ export function RunRows({ comparisonId, progress, live, company = null }: Props)
    * and import order becomes the problem instead — the four matches of a 320-row run are scattered
    * across 13 pages, and the first screen is whichever names happened to be inserted first.
    *
-   * So a run you are watching flips to matches-first the moment it finishes, which is exactly when
-   * your question changes from "is this working" to "what did it find". But an explicit choice is
-   * never overridden — if you went and asked for file order, finishing does not take it away.
+   * So a finished run defaults to its best ordering: "Best match" (similarity) when it has scores to
+   * rank by — a compare run — and "Matches first" otherwise. Watching a run holds import order until
+   * it stops, which is exactly when your question turns from "is this working" to "what did it find".
+   * An explicit choice is never overridden — asking for file order survives the run finishing.
    */
   const [sortOverride, setSortOverride] = React.useState<Sort | null>(null);
-  const sort: Sort = sortOverride ?? (live ? "row" : "status");
+  const sort: Sort = sortOverride ?? (live ? "row" : showSimilarity ? "similarity" : "status");
 
   // Both re-page from the top: page 4 of "all" is not page 4 of "matches", and page 4 of file
   // order is not page 4 of matches-first. Landing on an empty page you didn't ask for reads as
@@ -341,7 +355,6 @@ export function RunRows({ comparisonId, progress, live, company = null }: Props)
   // From the run, not from `rows[0]`, which is only reachable when there is nothing to correct it:
   // a company run filtered to a bucket with nothing in it would draw a friends run's headers.
   const kind: Kind = progress?.kind ?? rows[0]?.kind ?? "facebook";
-  const origin: Origin = progress?.origin ?? "import";
   const extraKeys = progress?.extraKeys ?? [];
 
   /**
@@ -371,8 +384,9 @@ export function RunRows({ comparisonId, progress, live, company = null }: Props)
   const TgtIcon = tgt.icon;
 
   const { title, description } = heading(origin, live, company);
-  // name + context, per side, then whatever the matcher sent, then the verdict.
-  const colCount = 4 + extraKeys.length + 1;
+  // name + context, per side, then whatever the matcher sent, then similarity (compare runs only),
+  // then the verdict.
+  const colCount = 4 + extraKeys.length + (showSimilarity ? 1 : 0) + 1;
 
   return (
     <Card>
@@ -417,7 +431,7 @@ export function RunRows({ comparisonId, progress, live, company = null }: Props)
                 ))}
               </div>
 
-              <SortToggle sort={sort} onChange={setSortOverride} />
+              <SortToggle sort={sort} onChange={setSortOverride} showSimilarity={showSimilarity} />
             </div>
           )}
         </div>
@@ -437,10 +451,11 @@ export function RunRows({ comparisonId, progress, live, company = null }: Props)
                   <SourceLabel icon={TgtIcon} eyebrow={tgt.eyebrow} table={tgt.table} />
                 </TableHead>
 
-                {/* Not a source. The verdict and whatever the matcher sent are the only things on
-                    the row that neither table contributed — they are what the *comparison* made. */}
+                {/* Not a source. The similarity, the verdict and whatever the matcher sent are the
+                    only things on the row that neither table contributed — they are what the
+                    *comparison* made. */}
                 <TableHead
-                  colSpan={1 + extraKeys.length}
+                  colSpan={1 + extraKeys.length + (showSimilarity ? 1 : 0)}
                   className={cn("border-b-2 border-b-border-strong bg-muted/40", DIVIDER)}
                 >
                   <span className="inline-flex items-center gap-1.5 text-foreground">
@@ -455,13 +470,20 @@ export function RunRows({ comparisonId, progress, live, company = null }: Props)
                 <TableHead className={cn(tgt.tint, DIVIDER)}>{tgt.name}</TableHead>
                 <TableHead className={tgt.tint}>{tgt.context}</TableHead>
                 {/* The rule opens the Match block, so it belongs to whichever column comes first in
-                    it — the extras, when the matcher sent any. */}
+                    it — the extras if the matcher sent any, else similarity, else the verdict. */}
                 {extraKeys.map((k, i) => (
                   <TableHead key={k} className={cn(i === 0 && DIVIDER)}>
                     {k.replace(/_/g, " ")}
                   </TableHead>
                 ))}
-                <TableHead className={cn("text-right", extraKeys.length === 0 && DIVIDER)}>
+                {showSimilarity && (
+                  <TableHead className={cn("text-right", extraKeys.length === 0 && DIVIDER)}>
+                    Similarity
+                  </TableHead>
+                )}
+                <TableHead
+                  className={cn("text-right", extraKeys.length === 0 && !showSimilarity && DIVIDER)}
+                >
                   Outcome
                 </TableHead>
               </TableRow>
@@ -487,7 +509,16 @@ export function RunRows({ comparisonId, progress, live, company = null }: Props)
                   </TableCell>
                 </TableRow>
               ) : (
-                rows.map((r) => <Row key={r.id} row={r} extraKeys={extraKeys} src={src} tgt={tgt} />)
+                rows.map((r) => (
+                  <Row
+                    key={r.id}
+                    row={r}
+                    extraKeys={extraKeys}
+                    src={src}
+                    tgt={tgt}
+                    showSimilarity={showSimilarity}
+                  />
+                ))
               )}
             </TableBody>
           </Table>
@@ -525,18 +556,28 @@ export function RunRows({ comparisonId, progress, live, company = null }: Props)
 }
 
 /**
- * Matches first, or the order of the file.
+ * Best match, matches first, or the order of the file.
  *
- * Both are legitimate readings and neither modifies the other, so a segmented control rather than
- * a checkbox. File order is not a curiosity: it is the order your source file is in, which is what
- * you want when you are checking this table against the thing you uploaded.
+ * Each is a legitimate reading and none modifies another, so a segmented control rather than a
+ * checkbox. File order is not a curiosity: it is the order your source file is in, which is what you
+ * want when you are checking this table against the thing you uploaded.
  *
- * "Matches first" was "Best first" while rows carried a score to rank by. It is a weaker sort now
- * and the label says so — it brings the matches to the top but cannot order them among themselves,
- * so within the matches you are still reading the file in its own order.
+ * "Best match" (similarity) is only offered when the run has scores to rank by — a compare run.
+ * It ranks *within* the matches, which "Matches first" cannot: that one brings the matches to the
+ * top and, on a compare run, orders them by similarity too, but on an import (no score) it stops at
+ * matched-vs-not and leaves the file's order inside each group.
  */
-function SortToggle({ sort, onChange }: { sort: Sort; onChange: (s: Sort) => void }) {
+function SortToggle({
+  sort,
+  onChange,
+  showSimilarity,
+}: {
+  sort: Sort;
+  onChange: (s: Sort) => void;
+  showSimilarity: boolean;
+}) {
   const options: { value: Sort; label: string }[] = [
+    ...(showSimilarity ? [{ value: "similarity" as const, label: "Best match" }] : []),
     { value: "status", label: "Matches first" },
     { value: "row", label: "File order" },
   ];
@@ -593,16 +634,27 @@ function SourceLabel({
   );
 }
 
+/** A similarity in [0, 1] as a whole-number percent, or "—" when the row kept no score. */
+function SimilarityCell({ value, className }: { value: number | null; className?: string }) {
+  return (
+    <TableCell className={cn("text-right align-top tabular-nums text-sm text-muted-foreground", className)}>
+      {value === null || value === undefined ? "—" : `${Math.round(value * 100)}%`}
+    </TableCell>
+  );
+}
+
 function Row({
   row,
   extraKeys,
   src,
   tgt,
+  showSimilarity,
 }: {
   row: RunRow;
   extraKeys: string[];
   src: SideMeta;
   tgt: SideMeta;
+  showSimilarity: boolean;
 }) {
   // Parsed per row rather than per run: `extra` is one blob per result, and a row that matched
   // nobody has none at all.
@@ -639,16 +691,23 @@ function Row({
       })}
 
       {/*
-        The verdict, on the right, and nothing beside it.
+        Similarity, then the verdict — but only on a compare run, which is the only kind that keeps a
+        per-row score.
 
-        There used to be a score column here reading "97% High" next to a badge that said "Match" —
-        two answers to one question. The badge won that argument, and the column has since gone
-        entirely: `matching_score` is not stored, so the badge is not merely the clearer answer, it
-        is the only one. A matcher that sends a score anyway has it carried into `extra`, where it
-        shows up as an extra column like any other field we do not model.
+        This once said the score column was gone for good ("the badge won that argument"), and for an
+        import that is still true: those rows have no score, and a matcher that sends one on the
+        callback has it carried into `extra` as before. What is back is `comparison_result.similarity`
+        — display and sort only, beside the badge rather than instead of it. The badge is still the
+        verdict; the percent only says how close, and never overrules it.
       */}
+      {showSimilarity && (
+        <SimilarityCell value={row.similarity} className={cn(extraKeys.length === 0 && DIVIDER)} />
+      )}
       <TableCell
-        className={cn("text-right align-top", extraKeys.length === 0 && DIVIDER)}
+        className={cn(
+          "text-right align-top",
+          extraKeys.length === 0 && !showSimilarity && DIVIDER
+        )}
       >
         <VerdictBadge status={row.status} />
       </TableCell>

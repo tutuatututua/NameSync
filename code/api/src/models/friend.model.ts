@@ -1,9 +1,33 @@
 import { DBModel } from "@extensions/sqldb";
-import { sql, type SqlBool } from "kysely";
+import { sql, type RawBuilder, type SqlBool } from "kysely";
 import type { PaginatedResult, FacebookDataRow, RunRow } from "@extensions/contract";
 import { isExternalMatcher } from "../config/env";
-import { matchedFirstSql, rowVerdictSql, tallyVerdicts, type StatusCounts } from "./row-status";
+import {
+  effectiveStatusSql,
+  isMatchedSql,
+  matchedFirstSql,
+  rowVerdictWithMatchSql,
+  tallyVerdicts,
+  type StatusCounts,
+} from "./row-status";
 import { rowFilterWhere, toRunRow, type RawRunRow, type RunRowFilter, type RunRowSort } from "./run-rows";
+
+/**
+ * "This friend has a match in the run" — an EXISTS over its matched `comparison_result` pairs.
+ *
+ * The verdict a workflow reaches lives in two places that need not agree: it stamps `friend.status`,
+ * and it writes the pair here. When a workflow records the match *only* as a pair — stamping the
+ * source row with a bare done-marker like `complete` — this is what still lets the row read as
+ * matched. Joined on the name (`comparison_result` has no FK back to the row — see findRunRows) and
+ * scoped to the run, since a friend may have been scored by several. Correlated to
+ * `friend.friend_name`, so it only makes sense inside a query rooted at `friend`.
+ */
+const friendHasMatch = (comparisonId: string): RawBuilder<SqlBool> => sql<SqlBool>`exists (
+  select 1 from comparison_result as cr
+  where cr.comparison_id = ${comparisonId}
+    and cr.friend_name = friend.friend_name
+    and ${isMatchedSql("cr.status")}
+)`;
 
 /**
  * `friend` — social contacts, stacked upload by upload. Every row is tagged with its
@@ -135,7 +159,7 @@ export class FriendModel extends DBModel {
       .selectFrom((eb) =>
         eb
           .selectFrom("friend")
-          .select(rowVerdictSql("friend.status").as("verdict"))
+          .select(rowVerdictWithMatchSql("friend.status", friendHasMatch(comparisonId)).as("verdict"))
           .where("friend.upload_id", "=", uploadId)
           .as("verdicts")
       )
@@ -181,7 +205,12 @@ export class FriendModel extends DBModel {
   ): Promise<PaginatedResult<RunRow>> {
     const db = await this.getKyselyDB();
     const offset = (page - 1) * limit;
-    const where = rowFilterWhere(rowVerdictSql("friend.status"), filter);
+    // Matched-ness may come from the row's `comparison_result` pair, not its own stamp — so the
+    // filter, the returned status and the sort are all derived from the same pair-aware expression,
+    // built once here so the three cannot drift.
+    const hasMatch = friendHasMatch(comparisonId);
+    const verdict = rowVerdictWithMatchSql("friend.status", hasMatch);
+    const where = rowFilterWhere(verdict, filter);
 
     let rows = db.selectFrom("friend").where("friend.upload_id", "=", uploadId);
     if (where) rows = rows.where(where);
@@ -231,7 +260,7 @@ export class FriendModel extends DBModel {
         // inventing an empty column for it here would imply the export was missing something.
         sql<string | null>`null`.as("nameTh"),
         "upload.uploaded_by as context",
-        sql<string | null>`friend.status`.as("status"),
+        effectiveStatusSql("friend.status", hasMatch).as("status"),
         "best.person_name_en as matchedName",
         "best.person_name_th as matchedNameTh",
         // The result row's own answer first; the by-name lookup only for rows that never recorded
@@ -259,7 +288,9 @@ export class FriendModel extends DBModel {
      */
     const ordered =
       sort === "status"
-        ? selected.orderBy(matchedFirstSql("friend.status")).orderBy("friend.id", "asc")
+        ? selected
+            .orderBy(sql`case when ${verdict} = ${sql.val("matched")} then 0 else 1 end`)
+            .orderBy("friend.id", "asc")
         : selected.orderBy("friend.id", "asc");
 
     const [data, countResult] = await Promise.all([

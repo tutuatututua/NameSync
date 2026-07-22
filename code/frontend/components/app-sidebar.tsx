@@ -16,7 +16,7 @@ export function AppSidebar() {
         className="flex h-14 items-center gap-2.5 px-4 outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
       >
         <span className="h-6 w-6 rounded-md bg-gradient-brand shadow-xs" aria-hidden />
-        <span className="font-display text-md font-semibold tracking-tight">NameSync</span>
+        <span className="font-display text-md font-semibold tracking-tight">Network Intel</span>
       </Link>
 
       <nav className="flex-1 space-y-0.5 px-2 py-2">

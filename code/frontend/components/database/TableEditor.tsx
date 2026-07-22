@@ -2,9 +2,10 @@
 
 import * as React from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { Plus, Pencil, Table2, Trash2 } from "lucide-react";
+import { Plus, Pencil, Search, Table2, Trash2, X } from "lucide-react";
 import type { DbColumn, DbRow, DbTable, TableQueryBody } from "@extensions/contract";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { ConfirmButton } from "@/components/confirm-button";
@@ -25,6 +26,17 @@ import { cn } from "@/lib/utils";
  */
 
 const LIMIT = 20;
+
+/** Hold a value still for `delay` ms — so typing in the search box doesn't refetch the
+ *  grid on every keystroke. Mirrors the same hook on the Uploads page. */
+function useDebounced<T>(value: T, delay = 300): T {
+  const [debounced, setDebounced] = React.useState(value);
+  React.useEffect(() => {
+    const t = setTimeout(() => setDebounced(value), delay);
+    return () => clearTimeout(t);
+  }, [value, delay]);
+  return debounced;
+}
 
 /** Render a cell according to its declared type — a jsonb column would otherwise
  *  stringify to "[object Object]". */
@@ -124,12 +136,18 @@ export function TableEditor() {
 function TableGrid({ table }: { table: DbTable }) {
   const [page, setPage] = React.useState(1);
   const [spec, setSpec] = React.useState<QuerySpec>({ filters: [] });
+  const [searchInput, setSearchInput] = React.useState("");
   const [editing, setEditing] = React.useState<DbRow | null>(null);
   const [formOpen, setFormOpen] = React.useState(false);
 
+  // Debounced so the grid doesn't refetch mid-word; a new search invalidates the page
+  // you were on, exactly like a new filter does.
+  const search = useDebounced(searchInput.trim());
+  React.useEffect(() => setPage(1), [search]);
+
   const body: TableQueryBody = React.useMemo(
-    () => ({ page, limit: LIMIT, filters: spec.filters, sort: spec.sort }),
-    [page, spec]
+    () => ({ page, limit: LIMIT, filters: spec.filters, sort: spec.sort, search: search || undefined }),
+    [page, spec, search]
   );
 
   const rowsQ = useDbRows(table.name, body);
@@ -191,6 +209,29 @@ function TableGrid({ table }: { table: DbTable }) {
             <Plus className="h-4 w-4" /> Insert row
           </Button>
         </div>
+      </div>
+
+      {/* One box across every text column — the quick path, next to the column-by-column
+          FilterBar below it. */}
+      <div className="relative max-w-sm">
+        <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+        <Input
+          value={searchInput}
+          onChange={(e) => setSearchInput(e.target.value)}
+          placeholder={`Search ${table.label.toLowerCase()}…`}
+          className="pl-9 pr-9"
+          aria-label={`Search ${table.label}`}
+        />
+        {searchInput && (
+          <button
+            type="button"
+            onClick={() => setSearchInput("")}
+            aria-label="Clear search"
+            className="absolute right-2.5 top-1/2 -translate-y-1/2 rounded-sm text-muted-foreground outline-none transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        )}
       </div>
 
       <FilterBar

@@ -15,7 +15,7 @@ const thai = Noto_Sans_Thai({
 });
 
 export const metadata: Metadata = {
-  title: "NameSync",
+  title: "Network Intel",
   description: "Sync and compare Company and Facebook data with fuzzy name matching.",
 };
 

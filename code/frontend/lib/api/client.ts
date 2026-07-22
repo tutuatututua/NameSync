@@ -36,6 +36,12 @@ import type {
   CompareByCompanyBody,
   UploadSessionRow,
   RollbackData,
+  NetworkOverviewData,
+  NameSearchRow,
+  UploadersData,
+  UploaderDetailData,
+  RenameContactBody,
+  ContactRow,
 } from "@extensions/contract";
 
 /** Error carrying HTTP status + parsed body, thrown by every failed request. */
@@ -211,8 +217,32 @@ export const api = {
       request<Envelope<never>>(`/comparisons/company-data/${uuid}`, { method: "DELETE" }),
     deleteFacebookRecord: (uuid: string) =>
       request<Envelope<never>>(`/comparisons/facebook-data/${uuid}`, { method: "DELETE" }),
+    /** Rename a company contact (or move their employer). The server cleans the name so the edit
+     *  stays matchable, and returns the row as it was actually stored. */
+    renameCompanyRecord: (uuid: string, body: RenameContactBody) =>
+      request<Envelope<ContactRow>>(`/comparisons/company-data/${uuid}`, {
+        method: "PATCH",
+        body: JSON.stringify(body satisfies RenameContactBody),
+      }).then((r) => r.data),
     clearCompany: () => request<Envelope<{ deleted: number }>>(`/comparisons/company-data/all`, { method: "DELETE" }),
     clearFacebook: () => request<Envelope<{ deleted: number }>>(`/comparisons/facebook-data/all`, { method: "DELETE" }),
+  },
+  /**
+   * The Network workspace's read side — Overview (a roster's connections across companies) and
+   * Search (find a person, see their company and its connections). Both read stored results; the
+   * matcher is never re-run here.
+   */
+  network: {
+    overview: (uploader?: string) =>
+      request<Envelope<NetworkOverviewData>>(`/network/overview${qs({ uploader })}`).then((r) => r.data),
+    /** Search by free text (`q`) OR by an exact company name (`company`, for the company page). */
+    search: (params: { q?: string; company?: string; page: number; limit: number }) =>
+      request<Paginated<NameSearchRow>>(`/network/search${qs({ ...params })}`),
+    /** Every uploader with a roster, and their matched / no-match tallies — the Uploaders tab. */
+    uploaders: () => request<Envelope<UploadersData>>(`/network/uploaders`).then((r) => r.data),
+    /** One uploader's matched and no-match names in full — the uploader detail page. */
+    uploader: (name: string) =>
+      request<Envelope<UploaderDetailData>>(`/network/uploader${qs({ name })}`).then((r) => r.data),
   },
   sessions: {
     list: () => request<Envelope<SessionSummary[]>>("/sessions").then((r) => r.data),

@@ -9,6 +9,10 @@ import { z } from 'zod';
  * `matching_score` is no longer read. A matcher that still sends one is not rejected — the
  * passthrough carries it into `extra` with the rest of its unrecognised fields — but it decides
  * nothing: `status` is the verdict now. See `rowVerdict`.
+ *
+ * `similarity` (below) is the one number we now store in a column of its own, for sorting and
+ * display. It still decides nothing — `status` is the verdict either way — so a matcher sending
+ * `matching_score` instead is unchanged: that field keeps flowing to `extra`, uninterpreted.
  */
 export const ComparisonResultItemSchema = z
   .object({
@@ -30,6 +34,15 @@ export const ComparisonResultItemSchema = z
      * answer — "decided, and not one of the spellings meaning matched" — is the safe one.
      */
     status: z.string().nullish(),
+    /**
+     * How close the match was, in [0, 1] — stored for sorting and display, deciding nothing.
+     *
+     * Optional: a matcher owes us a verdict (`status`), not a score. When it sends one it lands in
+     * the `similarity` column and the results table can rank by it; when it doesn't, the row sorts
+     * last and shows "—". Coerced and clamped server-side — a value outside [0, 1] is a matcher bug,
+     * not a reason to reject the batch.
+     */
+    similarity: z.coerce.number().nullish(),
   })
   .passthrough();
 export type ComparisonResultItem = z.infer<typeof ComparisonResultItemSchema>;

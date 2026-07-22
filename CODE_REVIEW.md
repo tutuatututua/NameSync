@@ -1,4 +1,4 @@
-# NameSync — Code Review
+# Network Intel — Code Review
 
 Full static audit of the API, frontend, and `sqldb` extension. Findings are grouped **High / Medium / Low**. Line references use `path:line`.
 

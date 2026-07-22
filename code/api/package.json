@@ -10,6 +10,7 @@
     "mock:row-status": "tsx src/scripts/mock-row-status.ts",
     "create-user": "tsx src/scripts/create-user.ts",
     "reset-password": "tsx src/scripts/reset-password.ts",
+    "seed:test-user": "tsx src/scripts/seed-test-user.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "sync-db-types": "npx kysely-codegen --dialect postgres --out-file src/db.types.ts"
@@ -17,7 +18,7 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": "NameSync API",
+  "description": "Network Intel API",
   "dependencies": {
     "@extensions/contract": "^1.0.0",
     "@extensions/sqldb": "^1.0.0",

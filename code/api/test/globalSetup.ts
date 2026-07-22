@@ -3,7 +3,7 @@ import path from "node:path";
 import { Client } from "pg";
 
 const DATABASE_URL =
-  process.env.TEST_DATABASE_URL || "postgres://namesync:namesync@localhost:55432/namesync_test";
+  process.env.TEST_DATABASE_URL || "postgres://networkintel:networkintel@localhost:55432/networkintel_test";
 const SCHEMA = process.env.DB_SCHEMA || "lakeshore";
 
 /** Create the test database if it doesn't exist yet (CREATE DATABASE can't run in a tx). */

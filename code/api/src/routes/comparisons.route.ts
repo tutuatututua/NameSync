@@ -21,6 +21,8 @@ import {
   RunRowSchema,
   RunRowsQuerySchema,
   RenameComparisonBodySchema,
+  RenameContactBodySchema,
+  ContactRowSchema,
   rowVerdict,
   paginated,
 } from "@extensions/contract";
@@ -788,6 +790,22 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
       const deleted = await FriendModel.deleteAll();
       await UploadModel.deleteImportsBySource("facebook");
       return ok({ deleted }, "All Facebook data cleared");
+    }
+  );
+
+  // PATCH /api/comparisons/company-data/:uuid — rename a company contact (or move their employer).
+  //
+  // A dedicated endpoint rather than the generic DB console, because renaming a contact has a
+  // domain rule the console lacks: the name is cleaned exactly as an import cleans it, so the edit
+  // stays matchable (the console writes the raw string and quietly breaks name matching). See
+  // CompanyContactModel.renameContact — it does not touch historical results, on purpose.
+  app.patch(
+    "/company-data/:uuid",
+    { schema: { params: UuidParamSchema, body: RenameContactBodySchema, response: { 200: apiSuccess(ContactRowSchema) } } },
+    async (req) => {
+      const row = await CompanyContactModel.renameContact(req.params.uuid, req.body);
+      if (!row) throw new NotFound("Company record not found");
+      return ok(row, "Contact updated");
     }
   );
 

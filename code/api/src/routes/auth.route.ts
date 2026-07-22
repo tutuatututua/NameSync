@@ -91,7 +91,7 @@ export default async function authRoutes(fastify: FastifyInstance): Promise<void
   );
 
   // ── Create a user ─────────────────────────────────────────────────────────
-  // Admins only. There is no public sign-up, by design: NameSync is an internal tool, so
+  // Admins only. There is no public sign-up, by design: Network Intel is an internal tool, so
   // an open /register would let anyone on the internet into the data. The FIRST admin is
   // created out-of-band with `npm run create-user` — see docs/AUTH.md.
   app.post(

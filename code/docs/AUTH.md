@@ -1,9 +1,9 @@
 # Authentication
 
-NameSync **signs people in itself**. It owns the users, the passwords and the sessions.
+Network Intel **signs people in itself**. It owns the users, the passwords and the sessions.
 
 It used to do the opposite: it sat behind a website that logged the user in and handed over
-a JWT, and NameSync only ever *verified* one — no login page, no password, no session store.
+a JWT, and Network Intel only ever *verified* one — no login page, no password, no session store.
 That inverted when the app became the thing people actually visit. There is no external
 issuer any more, so there is nothing to agree with it about: **no secret, no issuer, no
 audience, no JWKS URL**. An entire class of deploy-time misconfiguration went with them.
@@ -14,7 +14,7 @@ audience, no JWKS URL**. An entire class of deploy-time misconfiguration went wi
 | --- | --- |
 | **Users** | `app_user`. Passwords hashed with scrypt (`api/src/lib/password.ts`). |
 | **Sessions** | `auth_session`. A 32-byte random token; the table stores only its SHA-256. |
-| **Transport** | An `httpOnly` cookie (`namesync_session`), set by `POST /api/auth/login`. |
+| **Transport** | An `httpOnly` cookie (`networkintel_session`), set by `POST /api/auth/login`. |
 | **The guard** | A global `onRequest` hook — `api/src/plugins/auth.ts`. |
 
 Two properties are worth stating plainly, because they are the reasons for the design:
@@ -31,7 +31,7 @@ by itself (`credentials: "include"`).
 
 ## Creating the first account
 
-There is **no public sign-up**, deliberately: NameSync is an internal tool, and an open
+There is **no public sign-up**, deliberately: Network Intel is an internal tool, and an open
 `/register` would put the data behind nothing at all. So the first account is made from the
 command line, and it must be an admin — otherwise no one can create the second one.
 
@@ -103,7 +103,7 @@ Nothing is required for auth to work. What exists is cookie policy and session l
 | `AUTH_COOKIE_SAMESITE` | `lax` | See below. |
 | `AUTH_COOKIE_SECURE` | `true` in production | Refused as `false` in production. |
 | `AUTH_COOKIE_DOMAIN` | — | Only to share the cookie across subdomains (`.example.com`). |
-| `AUTH_COOKIE_NAME` | `namesync_session` | |
+| `AUTH_COOKIE_NAME` | `networkintel_session` | |
 
 **SameSite.** `lax` is correct whenever the site and the API share a registrable domain —
 including `localhost:3000` → `localhost:4000`, because the port is *not* part of the "site".

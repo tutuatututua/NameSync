@@ -23,10 +23,14 @@ export interface MatchRow {
    * The merge itself, raw as the matcher wrote it. Read through `rowVerdict`, never compared
    * directly — the column has no CHECK constraint and an external matcher spells it how it likes.
    *
-   * This replaced a `score`, and the loss is real: a row said how *good* its match was, and now
-   * says only that there was one. Nothing here can rank two matches against each other.
+   * This is the verdict, and the whole of it. `similarity` beside it says how *good* the match was,
+   * for ranking and display — but it never decides match vs no-match; that is this field's job.
    */
   status: string | null;
+
+  /** How close the match was, in [0, 1] — for sorting and display, never the verdict. Null when the
+   *  matcher recorded none (an external matcher, or a row from before the column existed). */
+  similarity: number | null;
 
   /** Whatever an external matcher put in `extra`. The internal matcher writes none, but the
    *  callback route stuffs an external one's unrecognised fields in there, and the results
@@ -63,6 +67,7 @@ export interface MatchRowInput {
   personEn: string | null;
   personTh: string | null;
   status: string | null;
+  similarity?: number | null;
   /** The raw `extra` blob — a JSON string on the wire, an object once saved to history. */
   extra?: unknown;
 }
@@ -75,6 +80,7 @@ export function buildMatchRow(input: MatchRowInput): MatchRow {
     personEn: input.personEn,
     personTh: input.personTh,
     status: input.status,
+    similarity: input.similarity ?? null,
     extras: parseExtra(input.extra),
   };
 }
@@ -87,6 +93,7 @@ export function fromResultRow(r: ComparisonResultRow): MatchRow {
     personEn: r.person_name_en,
     personTh: r.person_name_th,
     status: r.status,
+    similarity: r.similarity,
     extra: r.extra,
   });
 }

@@ -104,7 +104,7 @@ export default function ComparisonDetailPage() {
         description="It may have been deleted, or the link may be wrong."
         action={
           <Button asChild variant="outline">
-            <Link href="/">Back to Compare</Link>
+            <Link href="/">Back to Network</Link>
           </Button>
         }
       />
@@ -115,7 +115,7 @@ export default function ComparisonDetailPage() {
     <div className="space-y-8">
       <PageHeader
         backHref="/"
-        backLabel="Compare"
+        backLabel="Network"
         /* Named "and", not "or": this identifies the run — the set of companies it was pointed at —
            rather than making a claim about any one match. The Verdict below says "or", because
            there it IS a claim about each matched friend, who works at one of them. */

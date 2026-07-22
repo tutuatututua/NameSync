@@ -1,7 +1,7 @@
 {
   "name": "@extensions/contract",
   "version": "1.0.0",
-  "description": "Shared Zod schemas + inferred types for the NameSync API/WS contract, consumed by both the api and the frontend.",
+  "description": "Shared Zod schemas + inferred types for the Network Intel API/WS contract, consumed by both the api and the frontend.",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "scripts": {

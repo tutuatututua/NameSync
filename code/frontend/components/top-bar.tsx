@@ -40,7 +40,7 @@ export function TopBar() {
           <SheetTitle className="sr-only">Navigation</SheetTitle>
           <div className="flex h-14 items-center gap-2.5 border-b px-4">
             <span className="h-6 w-6 rounded-md bg-gradient-brand" aria-hidden />
-            <span className="font-display text-md font-semibold tracking-tight">NameSync</span>
+            <span className="font-display text-md font-semibold tracking-tight">Network Intel</span>
           </div>
           <nav className="space-y-0.5 px-2 py-2">
             {NAV_ITEMS.map(({ href, label, icon: Icon }) => (
@@ -59,7 +59,7 @@ export function TopBar() {
 
       <Link href="/" className="flex items-center gap-2">
         <span className="h-5 w-5 rounded bg-gradient-brand" aria-hidden />
-        <span className="font-display font-semibold tracking-tight">NameSync</span>
+        <span className="font-display font-semibold tracking-tight">Network Intel</span>
       </Link>
 
       <div className="flex-1" />

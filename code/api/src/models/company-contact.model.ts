@@ -1,9 +1,36 @@
 import { DBModel } from "@extensions/sqldb";
-import { sql, type SqlBool } from "kysely";
+import { sql, type RawBuilder, type SqlBool } from "kysely";
 import type { PaginatedResult, CompanyDataRow, RunRow } from "@extensions/contract";
 import { isExternalMatcher } from "../config/env";
-import { matchedFirstSql, rowVerdictSql, tallyVerdicts, type StatusCounts } from "./row-status";
+import { BadRequest } from "../lib/errors";
+import { cleanPersonName, tidyText } from "../services/name-cleaner.service";
+import {
+  effectiveStatusSql,
+  isMatchedSql,
+  matchedFirstSql,
+  rowVerdictWithMatchSql,
+  tallyVerdicts,
+  type StatusCounts,
+} from "./row-status";
 import { rowFilterWhere, toRunRow, type RawRunRow, type RunRowFilter, type RunRowSort } from "./run-rows";
+
+/**
+ * "This contact has a match in the run" — an EXISTS over its matched `comparison_result` pairs.
+ *
+ * The company side of `friendHasMatch` (friend.model.ts), and there for the same reason: a workflow
+ * may record the verdict only as a pair while stamping the source row with a bare done-marker. A
+ * contact carries two spellings and a result may name either, so the join is on person_name_en OR
+ * person_name_th. Correlated to `company_contact`, so it only makes sense inside a query rooted there.
+ */
+const contactHasMatch = (comparisonId: string): RawBuilder<SqlBool> => sql<SqlBool>`exists (
+  select 1 from comparison_result as cr
+  where cr.comparison_id = ${comparisonId}
+    and (
+      cr.person_name_en = company_contact.person_name_en
+      or cr.person_name_th = company_contact.person_name_th
+    )
+    and ${isMatchedSql("cr.status")}
+)`;
 
 /**
  * `company_contact` — company people, stacked upload by upload (upload_id FK), so
@@ -176,7 +203,9 @@ export class CompanyContactModel extends DBModel {
       .selectFrom((eb) =>
         eb
           .selectFrom("company_contact")
-          .select(rowVerdictSql("company_contact.status").as("verdict"))
+          .select(
+            rowVerdictWithMatchSql("company_contact.status", contactHasMatch(comparisonId)).as("verdict")
+          )
           .where("company_contact.upload_id", "=", uploadId)
           .as("verdicts")
       )
@@ -214,7 +243,10 @@ export class CompanyContactModel extends DBModel {
   ): Promise<PaginatedResult<RunRow>> {
     const db = await this.getKyselyDB();
     const offset = (page - 1) * limit;
-    const where = rowFilterWhere(rowVerdictSql("company_contact.status"), filter);
+    // Pair-aware, so the filter, the returned status and the sort all agree — see FriendModel.findRunRows.
+    const hasMatch = contactHasMatch(comparisonId);
+    const verdict = rowVerdictWithMatchSql("company_contact.status", hasMatch);
+    const where = rowFilterWhere(verdict, filter);
 
     let rows = db.selectFrom("company_contact").where("company_contact.upload_id", "=", uploadId);
     if (where) rows = rows.where(where);
@@ -250,13 +282,26 @@ export class CompanyContactModel extends DBModel {
         "company_contact.person_name_en as name",
         "company_contact.person_name_th as nameTh",
         "company_contact.company_name as context",
-        sql<string | null>`company_contact.status`.as("status"),
+        effectiveStatusSql("company_contact.status", hasMatch).as("status"),
         "best.friend_name as matchedName",
         // A friend has one name — there is no Thai twin to show.
         sql<string | null>`null`.as("matchedNameTh"),
-        // Not another name: the person who uploaded that friend. Who they are is the match;
-        // whose they are is what you can act on.
-        "best.upload_name as matchedContext",
+        // Not another name: the person who uploaded that matched friend. Who they are is the
+        // match; whose they are is what you can act on.
+        //
+        // The matcher's own value first, then the friend row it names — the same coalesce
+        // ComparisonResultModel uses, and needed for the same reason: `upload_name` is optional on
+        // the contract, and a workflow that leaves it null still matched a friend NameSync has on
+        // file and knows the uploader of. Without the fallback a company import that found a match
+        // showed the friend's name beside an empty "Uploaded by", which is the one column that
+        // makes the match actionable. Scalar subquery, so a name two people share never multiplies
+        // the row; `friend`/`upload` are fresh aliases here (the outer query has neither).
+        sql<string | null>`coalesce(best.upload_name, (
+          select u.uploaded_by from friend f
+          join upload u on u.id = f.upload_id
+          where f.friend_name = best.friend_name and u.uploaded_by is not null
+          order by u.created_at asc limit 1
+        ))`.as("matchedContext"),
         sql<string | null>`best.extra::text`.as("extras"),
       ]);
 
@@ -264,7 +309,7 @@ export class CompanyContactModel extends DBModel {
     const ordered =
       sort === "status"
         ? selected
-            .orderBy(matchedFirstSql("company_contact.status"))
+            .orderBy(sql`case when ${verdict} = ${sql.val("matched")} then 0 else 1 end`)
             .orderBy("company_contact.id", "asc")
         : selected.orderBy("company_contact.id", "asc");
 
@@ -406,5 +451,59 @@ export class CompanyContactModel extends DBModel {
     const db = await this.getKyselyDB();
     const result = await db.deleteFrom("company_contact").where("id", "=", id).executeTakeFirst();
     return Number(result?.numDeletedRows ?? 0);
+  }
+
+  /**
+   * Rename a contact — a person left the company, or a director changed their name.
+   *
+   * Only the fields the caller passed are touched. Person names go through the SAME cleaner an
+   * import uses (`cleanPersonName`: lower-cased, honorifics/suffixes stripped), because the stored
+   * name IS the matcher's join key — a hand-typed "Somchai Jaidee" that skipped it would silently
+   * stop matching the imported "somchai jaidee", and the generic DB-console editor has exactly that
+   * bug. The company name is only `tidyText`'d, never de-titled, like the parser (a company keeps
+   * its case and its "Mr").
+   *
+   * This is deliberately NOT cascaded to `comparison_result`. A run is a frozen snapshot — its rows
+   * store names as text with no FK back — so a rename governs what a *future* comparison finds and
+   * leaves past runs reading as they did when they ran. That is the same immutability the rest of
+   * the app relies on (see comparisons.route.ts "a run is already immutable").
+   *
+   * Returns the row as actually stored (cleaned), or null if no such contact. Throws 400 if the
+   * edit would leave the contact with neither a Thai nor an English name — a nameless contact can
+   * never be matched or displayed.
+   */
+  static async renameContact(
+    id: string,
+    fields: { person_name_en?: string; person_name_th?: string; company_name?: string }
+  ): Promise<{ id: string; company_name: string | null; person_name_en: string | null; person_name_th: string | null } | null> {
+    if (!/^\d+$/.test(id)) return null;
+    const db = await this.getKyselyDB();
+
+    const existing = await db
+      .selectFrom("company_contact")
+      .select(["id", "company_name", "person_name_th", "person_name_en"])
+      .where("id", "=", id)
+      .executeTakeFirst();
+    if (!existing) return null;
+
+    const set: Record<string, string | null> = {};
+    if (fields.person_name_en !== undefined) set.person_name_en = cleanPersonName(fields.person_name_en);
+    if (fields.person_name_th !== undefined) set.person_name_th = cleanPersonName(fields.person_name_th);
+    if (fields.company_name !== undefined) set.company_name = tidyText(fields.company_name);
+
+    // The resulting names, taking each from the edit if it was in it and from the row if not.
+    const en = "person_name_en" in set ? set.person_name_en : (existing.person_name_en as string | null);
+    const th = "person_name_th" in set ? set.person_name_th : (existing.person_name_th as string | null);
+    if (!en && !th) {
+      throw new BadRequest("A contact needs a Thai or English name — it can't be blank");
+    }
+
+    if (Object.keys(set).length > 0) {
+      await db.updateTable("company_contact").set(set).where("id", "=", id).execute();
+    }
+
+    const company =
+      "company_name" in set ? set.company_name : (existing.company_name as string | null);
+    return { id: String(existing.id), company_name: company, person_name_en: en, person_name_th: th };
   }
 }

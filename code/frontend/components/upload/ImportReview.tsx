@@ -2,7 +2,7 @@
 
 import * as React from "react";
 import { useRouter } from "next/navigation";
-import { ArrowRight, ChevronDown, FileText, Upload, X } from "lucide-react";
+import { ArrowRight, ChevronLeft, ChevronRight, FileText, Upload, X } from "lucide-react";
 import { toast } from "sonner";
 import type { ColumnMapping, UploadPreview } from "@extensions/contract";
 import { Button } from "@/components/ui/button";
@@ -145,13 +145,13 @@ export function ImportReview({ source, file, onCancel, onComplete }: Props) {
 
       // With the external matcher on, the import *started a run* — the API says so by handing
       // back the run's id. The import is not the end of the story, so neither is this screen:
-      // go to Compare, which is where a run is watched and where every past run is listed, and
-      // hand it the run to follow. The run is already saved, so leaving here loses nothing.
+      // go to the run's own page, the one canonical place a run is watched (live or historical).
+      // The run is already saved, so leaving here loses nothing.
       if (result.comparisonId) {
         toast.success(
           `Imported ${added.toLocaleString()} row${added === 1 ? "" : "s"} — matching now`
         );
-        router.push(`/?run=${result.comparisonId}`);
+        router.push(`/comparisons/${result.comparisonId}`);
         return;
       }
 
@@ -251,7 +251,7 @@ export function ImportReview({ source, file, onCancel, onComplete }: Props) {
             <LoadingButton variant="gradient" isLoading={busy} disabled={!canImport} onClick={commit}>
               <Upload className="h-4 w-4" />
               {data.totalRows > 0
-                ? `Import ${data.totalRows.toLocaleString()} row${data.totalRows === 1 ? "" : "s"}`
+                ? `Upload&Run ${data.totalRows.toLocaleString()} row${data.totalRows === 1 ? "" : "s"}`
                 : "Nothing to import"}
             </LoadingButton>
           </div>
@@ -339,7 +339,7 @@ function ColumnMap({ preview }: { preview: UploadPreview }) {
   );
 }
 
-/** How many sample rows are on screen at first, and how many each "Show 10 more" adds. */
+/** How many sample rows fit on one page of the preview. */
 const SAMPLE_PAGE = 10;
 
 /**
@@ -348,18 +348,20 @@ const SAMPLE_PAGE = 10;
  * Shown a page at a time rather than all at once. The preview's job is to catch a bad export
  * before it lands, and the top ten rows of a file are the ten least likely to be wrong: a
  * column that slips, a footer row, an encoding that fails halfway are all things you only see
- * by reading *on*. So the rows are there to be asked for, without a wall of them by default.
+ * by reading *on*. So the rows are paged through rather than piled up in a wall by default.
  */
 function SampleRows({ preview }: { preview: UploadPreview }) {
   const total = preview.sampleRows.length;
-  const [shown, setShown] = React.useState(SAMPLE_PAGE);
+  const pageCount = Math.max(1, Math.ceil(total / SAMPLE_PAGE));
+  const [page, setPage] = React.useState(0);
 
-  // A new file means a new preview — start the next one from the top rather than inheriting
-  // however far the reader had scrolled into the last.
-  React.useEffect(() => setShown(SAMPLE_PAGE), [preview]);
+  // A new file means a new preview — start back at the first page rather than inheriting
+  // however far the reader had paged into the last.
+  React.useEffect(() => setPage(0), [preview]);
 
-  const visible = preview.sampleRows.slice(0, shown);
-  const remaining = total - visible.length;
+  const start = page * SAMPLE_PAGE;
+  const visible = preview.sampleRows.slice(start, start + SAMPLE_PAGE);
+  const onLastPage = page >= pageCount - 1;
 
   if (total === 0) return null;
 
@@ -371,7 +373,8 @@ function SampleRows({ preview }: { preview: UploadPreview }) {
   return (
     <div className="space-y-2">
       <p className="text-sm font-medium">
-        First {visible.length.toLocaleString()} row{visible.length === 1 ? "" : "s"}{" "}
+        Row{visible.length === 1 ? "" : "s"} {(start + 1).toLocaleString()}
+        {visible.length > 1 && `–${(start + visible.length).toLocaleString()}`}{" "}
         <span className="font-normal text-muted-foreground">
           of {preview.totalRows.toLocaleString()}
         </span>
@@ -397,26 +400,45 @@ function SampleRows({ preview }: { preview: UploadPreview }) {
         </Table>
       </div>
 
-      {remaining > 0 ? (
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          onClick={() => setShown((n) => n + SAMPLE_PAGE)}
-        >
-          <ChevronDown className="h-4 w-4" />
-          Show {Math.min(SAMPLE_PAGE, remaining)} more
-        </Button>
-      ) : (
-        // The pool is finite and smaller than the file. Saying so is the difference between
-        // "there are no more rows" and "there are no more rows *here*" — the second is true.
-        preview.totalRows > total && (
+      {pageCount > 1 && (
+        <div className="flex items-center justify-between gap-2">
           <p className="text-xs text-muted-foreground">
-            That&apos;s the whole sample. The other{" "}
-            {(preview.totalRows - total).toLocaleString()} rows aren&apos;t previewed — they
-            import the same way these do.
+            Page {(page + 1).toLocaleString()} of {pageCount.toLocaleString()}
           </p>
-        )
+          <div className="flex gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={page === 0}
+              onClick={() => setPage((p) => Math.max(0, p - 1))}
+            >
+              <ChevronLeft className="h-4 w-4" />
+              Previous
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={onLastPage}
+              onClick={() => setPage((p) => Math.min(pageCount - 1, p + 1))}
+            >
+              Next
+              <ChevronRight className="h-4 w-4" />
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {/* The pool is finite and smaller than the file. Saying so is the difference between
+          "there are no more rows" and "there are no more rows *here*" — the second is true.
+          Shown once the reader reaches the last page, so it lands after the whole sample. */}
+      {onLastPage && preview.totalRows > total && (
+        <p className="text-xs text-muted-foreground">
+          That&apos;s the whole sample. The other{" "}
+          {(preview.totalRows - total).toLocaleString()} rows aren&apos;t previewed — they
+          import the same way these do.
+        </p>
       )}
 
       {anyCleaned && (

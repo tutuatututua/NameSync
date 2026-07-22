@@ -291,6 +291,68 @@ describe("row CRUD", () => {
   });
 });
 
+// ── free-text search ─────────────────────────────────────────────────────────
+//
+// One box, matched as a case-insensitive substring against every text column at once —
+// the quick alternative to building a column-by-column filter.
+
+describe("free-text search", () => {
+  it("matches a substring across any text column, case-insensitively", async () => {
+    const upload = await seedUpload();
+    await insertRow("company_contact", { upload_id: upload.id, company_name: "Acme Co", person_name_en: "Somchai" });
+    await insertRow("company_contact", { upload_id: upload.id, company_name: "Globex", person_name_en: "Malee" });
+
+    // Hits person_name_en on the first row (and the term is lower-cased against a mixed-case value).
+    const byName = await queryRows("company_contact", { search: "somchai" });
+    expect(byName.json().pagination.total).toBe(1);
+    expect(byName.json().data[0].company_name).toBe("Acme Co");
+
+    // A different term hits company_name on the other row instead.
+    const byCompany = await queryRows("company_contact", { search: "glob" });
+    expect(byCompany.json().pagination.total).toBe(1);
+    expect(byCompany.json().data[0].person_name_en).toBe("Malee");
+  });
+
+  it("searches the joined columns too", async () => {
+    const a = await insertRow("upload", { kind: "company", uploaded_by: "Dana" });
+    const b = await insertRow("upload", { kind: "company", uploaded_by: "Sam" });
+    await insertRow("company_contact", { upload_id: a.id, company_name: "Acme" });
+    await insertRow("company_contact", { upload_id: b.id, company_name: "Globex" });
+
+    // "Dana" is only on the joined upload.uploaded_by column — the search has to reach it.
+    const res = await queryRows("company_contact", { search: "dana" });
+    expect(res.json().pagination.total).toBe(1);
+    expect(res.json().data[0].company_name).toBe("Acme");
+  });
+
+  it("ANDs the search with an active filter (and the count agrees)", async () => {
+    const upload = await seedUpload();
+    await insertRow("company_contact", { upload_id: upload.id, company_name: "Acme", person_name_en: "Somchai" });
+    await insertRow("company_contact", { upload_id: upload.id, company_name: "Acme", person_name_en: "Malee" });
+    await insertRow("company_contact", { upload_id: upload.id, company_name: "Globex", person_name_en: "Somchai" });
+
+    // "acme" narrows to the two Acme rows; the filter narrows those to person_name_en = Somchai.
+    const res = await queryRows("company_contact", {
+      search: "acme",
+      filters: [{ column: "person_name_en", op: "eq", value: "Somchai" }],
+    });
+    expect(res.json().pagination.total).toBe(1);
+    expect(res.json().data[0].company_name).toBe("Acme");
+    expect(res.json().data[0].person_name_en).toBe("Somchai");
+  });
+
+  it("treats % and _ as literals, not wildcards", async () => {
+    const upload = await seedUpload();
+    await insertRow("company_contact", { upload_id: upload.id, company_name: "50% off" });
+    await insertRow("company_contact", { upload_id: upload.id, company_name: "50 baht" });
+
+    // Unescaped, "%50%%" matches any row containing "50"; escaped, only the literal "50%".
+    const res = await queryRows("company_contact", { search: "50%" });
+    expect(res.json().pagination.total).toBe(1);
+    expect(res.json().data[0].company_name).toBe("50% off");
+  });
+});
+
 // ── the SQL console must not be able to write ────────────────────────────────
 
 describe("SQL console", () => {
@@ -435,7 +497,7 @@ describe("saved queries", () => {
 
 // ── Session auth ─────────────────────────────────────────────────────────────
 //
-// NameSync signs people in itself now — there is no external JWT to verify. These build a
+// Network Intel signs people in itself now — there is no external JWT to verify. These build a
 // SECOND app with AUTH_DISABLED unset, so auth is on here while the suite's other app
 // (built under setup.ts's AUTH_DISABLED=1) still has it off.
 
@@ -462,7 +524,7 @@ describe("session auth", () => {
   function sessionCookie(setCookie: string | string[] | undefined): string | undefined {
     const headers = Array.isArray(setCookie) ? setCookie : setCookie ? [setCookie] : [];
     for (const header of headers) {
-      const match = /^namesync_session=([^;]*)/.exec(header);
+      const match = /^networkintel_session=([^;]*)/.exec(header);
       if (match && match[1]) return decodeURIComponent(match[1]);
     }
     return undefined;
@@ -472,7 +534,7 @@ describe("session auth", () => {
     secured.inject({
       method: "GET",
       url,
-      ...(token ? { headers: { cookie: `namesync_session=${encodeURIComponent(token)}` } } : {}),
+      ...(token ? { headers: { cookie: `networkintel_session=${encodeURIComponent(token)}` } } : {}),
     });
 
   beforeAll(async () => {
@@ -520,7 +582,7 @@ describe("session auth", () => {
     expect(res.json().data.user.email).toBe(EMAIL);
     // The token must never be readable by script — that is the whole reason it isn't a JWT
     // in localStorage any more.
-    expect(res.body).not.toContain("namesync_session");
+    expect(res.body).not.toContain("networkintel_session");
     const header = ([] as string[]).concat(res.headers["set-cookie"] as string).join(";");
     expect(header).toMatch(/HttpOnly/i);
     expect(header).toMatch(/SameSite=Lax/i);
@@ -547,7 +609,7 @@ describe("session auth", () => {
     const res = await secured.inject({
       method: "POST",
       url: "/api/db/saved-queries",
-      headers: { cookie: `namesync_session=${token}` },
+      headers: { cookie: `networkintel_session=${token}` },
       payload: { name: "Mine", kind: "sql", sql_text: "select 1" },
     });
     expect(res.statusCode, res.body).toBe(200);
@@ -585,7 +647,7 @@ describe("session auth", () => {
     const out = await secured.inject({
       method: "POST",
       url: "/api/auth/logout",
-      headers: { cookie: `namesync_session=${token}` },
+      headers: { cookie: `networkintel_session=${token}` },
     });
     expect(out.statusCode).toBe(200);
     // The exact same token is now worthless — the row backing it is gone.

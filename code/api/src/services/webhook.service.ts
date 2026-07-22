@@ -86,7 +86,7 @@ async function postCSV(
     "X-Row-Count": String(rowCount),
   };
   // Absent when the internal matcher is running: there is no run for the workflow to write
-  // into, because NameSync scored the names itself. Sending an empty header would look like
+  // into, because Network Intel scored the names itself. Sending an empty header would look like
   // a run whose id happened to be "".
   if (comparisonId) headers["X-Comparison-ID"] = comparisonId;
 

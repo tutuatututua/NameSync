@@ -1,8 +1,8 @@
 # The external matcher workflow
 
-How NameSync hands an import to the workflow, and what the workflow must do with it.
+How Network Intel hands an import to the workflow, and what the workflow must do with it.
 
-This is a **contract between two systems that share one database**. NameSync does not receive
+This is a **contract between two systems that share one database**. Network Intel does not receive
 the results over HTTP — it reads them out of Postgres, by polling. So every promise below is
 about a table, not an endpoint.
 
@@ -12,7 +12,7 @@ about a table, not an endpoint.
 
 Nothing in this document takes effect until **`EXTERNAL_MATCHER=1`** is set on the API.
 
-With the flag off (the default), NameSync behaves exactly as it always has: pressing
+With the flag off (the default), Network Intel behaves exactly as it always has: pressing
 **Compare** scores the names itself, in Postgres, and returns the run immediately. That path
 is untouched and still works — the flag chooses which matcher runs, and both remain.
 
@@ -35,7 +35,7 @@ drift migrations in [`migrations/`](migrations/) applied by hand — the app nev
 > the duration and apply both together.
 >
 > The same migration collapses the `_clean` name columns into one column per name — see
-> [§1](#1-what-namesync-sends). A workflow reading `person_name_th_clean`, `fb_name_clean` or the
+> [§1](#1-what-networkintel-sends). A workflow reading `person_name_th_clean`, `fb_name_clean` or the
 > `timestamp` column out of the CSV stops finding them at the same moment.
 >
 > This does **not** affect the `is_complete` field on the HTTP callback body, which is a different
@@ -54,7 +54,7 @@ means the import isn't forwarded anywhere.
 user imports a file
         │
         ▼
-NameSync  ─── writes rows to friend / company_contact, each status='processing'
+Network Intel  ─── writes rows to friend / company_contact, each status='processing'
           ─── creates one `comparison` row (status='processing')  ← this is the run
           ─── POSTs the rows to the webhook, carrying the comparison id
         │
@@ -64,7 +64,7 @@ workflow  ─── matches each row against the opposite table
           ─── stamps each source row  status = 'match' | 'unmatch'
         │
         ▼
-NameSync  ─── polls: "does this upload still have unfinished rows?"
+Network Intel  ─── polls: "does this upload still have unfinished rows?"
                      ('pending' or 'processing' — both mean no verdict yet)
           ─── when none do: upload → 'completed', comparison → 'completed'
           ─── the user, who has been watching the Compare page, sees the results
@@ -76,7 +76,7 @@ A **company** import is matched against every friend in `friend`.
 
 ---
 
-## 1. What NameSync sends
+## 1. What Network Intel sends
 
 `POST` to `FACEBOOK_WEBHOOK_URL` (social imports) or `COMPANY_WEBHOOK_URL` (company imports),
 as `multipart/form-data` with a single `file` part — a CSV, exactly as today.
@@ -112,7 +112,7 @@ back against. `status` will read `processing` on every row, because that is what
 **There is one column per name, and it is already cleaned.** Titles, suffixes and nicknames are
 stripped and the result is **lower-cased**, at import, before the row is stored — so
 `Mr. Somchai Jaidee` arrives as `somchai jaidee` and `นายสมชาย ใจดี` as `สมชาย ใจดี`. **Match on the
-column you are handed**: it is the only spelling NameSync stores, and it is exactly what the
+column you are handed**: it is the only spelling Network Intel stores, and it is exactly what the
 internal matcher matches on. Middle names are **kept** (`Somchai J. Jaidee` → `somchai j. jaidee`).
 
 There are no `_clean` columns any more, and no `timestamp` column — both were dropped on
@@ -226,14 +226,14 @@ UPDATE lakeshore.friend           -- or lakeshore.company_contact
 | `fail` / `failed` / `error` / `errored` | You gave up on this row. | failed |
 
 **A row must never be left unfinished.** That is the single hard requirement here. `pending` and
-`processing` *both* mean "no verdict yet", and NameSync decides an import is finished by asking
+`processing` *both* mean "no verdict yet", and Network Intel decides an import is finished by asking
 whether any of its rows are still at either — so one row left behind means the import never
 completes, the Compare page spins forever, and the user is told a job is running that is not.
 
 The two unfinished spellings exist so you can distinguish a row you have accepted from a row you
 are working on. Nothing downstream branches on which one it is; both keep the import open.
 
-There is no CHECK constraint on the column: an unexpected value will be stored, and NameSync
+There is no CHECK constraint on the column: an unexpected value will be stored, and Network Intel
 will read it as **finished** rather than rejecting your write. Only the spellings above carry
 meaning — `pending` / `processing` hold the import open, the four failure spellings mark the row
 failed, and anything else, including a value you invent, falls through to the score. Values are
@@ -299,7 +299,7 @@ Two things follow from that last row, and they are the ones to get right:
   lower-cased), but `MATCHED_OK` or `hit` reads as *unmatched* — no error, no warning, just a
   finding that quietly does not appear. There is no CHECK constraint to catch it, by design: an
   unexpected value has to be storable rather than fatal.
-- **A row left at the default is a row NameSync is still waiting on**, and the import will never
+- **A row left at the default is a row Network Intel is still waiting on**, and the import will never
   complete. If you insert a row you have already decided, stamp it.
 
 #### What to write, and how much of it
@@ -307,7 +307,7 @@ Two things follow from that last row, and they are the ones to get right:
 `comparison_result` is the evidence behind the run: the pair, and how close it was. It is what
 the results table renders and what the app counts matches from.
 
-**Writing a row only for matches is supported, and is the minimum.** NameSync will still be
+**Writing a row only for matches is supported, and is the minimum.** Network Intel will still be
 correct: it takes the denominator ("5 of 12 matched") from the import's own rows, not from this
 table, so a run that only stores its winners cannot report a 100% hit rate.
 
@@ -334,7 +334,7 @@ because the only thing stored is the verdict itself.
 
 Two obligations come with that:
 
-- **Your threshold is now the product's threshold.** Loosening it moves every number NameSync
+- **Your threshold is now the product's threshold.** Loosening it moves every number Network Intel
   reports, immediately and invisibly. Nothing here will notice or warn.
 - **A verdict, once written, is permanent.** Verdicts used to be recomputed on every read, so
   moving one constant re-judged the entire history. Now a run is judged when it is written. Getting
@@ -342,7 +342,7 @@ Two obligations come with that:
 
 ---
 
-## 3. What NameSync does not do
+## 3. What Network Intel does not do
 
 - **It does not call you back.** There is no callback for this path. (The
   `POST /api/callbacks/comparison-results` endpoint is for the *other*, HTTP-push matcher —
@@ -364,7 +364,7 @@ Two obligations come with that:
 ## 4. The HTTP callback path
 
 The other matcher. Instead of writing to `comparison_result` yourself, you `POST` batches of
-results to `/api/callbacks/comparison-results` and NameSync writes them. It is a separate path
+results to `/api/callbacks/comparison-results` and Network Intel writes them. It is a separate path
 with a separate audience; if you are here for the direct-DB contract above, everything in this
 section is somebody else's problem.
 

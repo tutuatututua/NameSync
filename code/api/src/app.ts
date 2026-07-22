@@ -20,6 +20,7 @@ import authRoutes from "./routes/auth.route";
 import dbRoutes from "./routes/db.route";
 import healthRoutes from "./routes/health.route";
 import comparisonsRoutes from "./routes/comparisons.route";
+import networkRoutes from "./routes/network.route";
 import callbacksRoutes from "./routes/callbacks.route";
 import sessionsRoutes from "./routes/sessions.route";
 import uploadSessionsRoutes from "./routes/upload-sessions.route";
@@ -57,7 +58,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(multipart, { limits: { fileSize: 500 * 1024 * 1024, files: 4 } });
   await app.register(websocket);
   await app.register(swagger, {
-    openapi: { info: { title: "NameSync API", version: "1.0.0" } },
+    openapi: { info: { title: "Network Intel API", version: "1.0.0" } },
     transform: jsonSchemaTransform,
   });
   await app.register(swaggerUI, { routePrefix: "/docs" });
@@ -69,7 +70,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   });
 
   // Global session guard (public allowlist inside). Registered before the routes so it
-  // covers all of them. NameSync issues its own sessions now — there is no external JWT
+  // covers all of them. Network Intel issues its own sessions now — there is no external JWT
   // to verify — so this is on by default and only AUTH_DISABLED (dev/test) turns it off.
   registerAuth(app);
 
@@ -95,6 +96,9 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(healthRoutes, { prefix: "/api" });
   await app.register(authRoutes, { prefix: "/api/auth" });
   await app.register(comparisonsRoutes, { prefix: "/api/comparisons" });
+  // The Network workspace's read side — Overview + Search over stored results. Renaming a contact
+  // lives with the other company-data routes under /api/comparisons.
+  await app.register(networkRoutes, { prefix: "/api/network" });
   await app.register(callbacksRoutes, { prefix: "/api/callbacks" });
   await app.register(sessionsRoutes, { prefix: "/api/sessions" });
   // /api/history is gone: "Past runs" now lists the runs themselves (GET /api/comparisons).

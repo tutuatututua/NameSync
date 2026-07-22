@@ -1,5 +1,5 @@
 -- ============================================================================
--- NameSync — add authentication to an EXISTING database
+-- Network Intel — add authentication to an EXISTING database
 -- ============================================================================
 -- Run this against a live database. It is purely additive and fully idempotent:
 -- it creates two tables and their indexes, drops nothing, and touches no existing

@@ -74,6 +74,9 @@ export interface ComparisonResult {
   /** This row's verdict, and the whole of it — same vocabulary as Friend.status. Defaults to
    *  'pending' in the database, so a row written ahead of its verdict reads as unfinished. */
   status: string;
+  /** How close the match was, in [0, 1] — for sorting and display only, never the verdict. Null
+   *  when the matcher didn't record one (an external matcher, or a row predating the column). */
+  similarity: number | null;
   upload_name: string | null;
   /** Where the matched contact works. Null when the matcher didn't say — see the contract. */
   company_name: string | null;

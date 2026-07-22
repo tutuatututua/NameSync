@@ -164,7 +164,7 @@ function LoginShell({ children }: { children: React.ReactNode }) {
       <div className="w-full max-w-sm">
         <div className="mb-8 flex flex-col items-center text-center">
           <span className="mb-3 h-10 w-10 rounded-xl bg-gradient-brand shadow-xs" aria-hidden />
-          <h1 className="font-display text-2xl font-semibold tracking-tight">Sign in to NameSync</h1>
+          <h1 className="font-display text-2xl font-semibold tracking-tight">Sign in to Network Intel</h1>
           <p className="mt-1.5 text-sm text-muted-foreground">Name matching, synced.</p>
         </div>
 

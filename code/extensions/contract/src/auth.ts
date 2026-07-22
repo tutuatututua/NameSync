@@ -1,7 +1,7 @@
 import { z } from 'zod';
 
 /**
- * Authentication. NameSync signs people in itself — there is no external issuer and no
+ * Authentication. Network Intel signs people in itself — there is no external issuer and no
  * JWT any more; the API mints an opaque session token and puts it in an httpOnly cookie.
  * See api/src/lib/session.ts for why, and docs/AUTH.md for the deploy story.
  */

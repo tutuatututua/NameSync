@@ -5,7 +5,7 @@
  *   cd code/api && npm run mock:row-status -- --dry     # show the tally, write nothing
  *   cd code/api && npm run mock:row-status -- --settled # leave no row unfinished
  *
- * The real workflow decides `friend.status` / `company_contact.status` per row and NameSync
+ * The real workflow decides `friend.status` / `company_contact.status` per row and Network Intel
  * only ever reads them (docs/EXTERNAL-MATCHER.md). Until that workflow is wired up, every row
  * sits at the column's default — 'processing' — and the Database console is a wall of one
  * value. This fills it in with plausible ones so the column can actually be looked at.
@@ -23,7 +23,7 @@
  *     counts as one, all the way up to the headline — with no pair on screen to show for it. The
  *     match rate you read off a mocked table is this script's weights, not a matcher's judgement.
  *   · Rows it leaves unfinished are indistinguishable from a live import that is still running:
- *     NameSync finishes an upload by counting rows that are *not* unfinished, so a mocked
+ *     Network Intel finishes an upload by counting rows that are *not* unfinished, so a mocked
  *     'pending'/'processing' row keeps its upload spinning forever. That is what --settled is for.
  *
  * Requires the `status` column on both tables — declared in docs/schema-redesign.sql

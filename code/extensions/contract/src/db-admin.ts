@@ -96,6 +96,11 @@ export type DbSort = z.infer<typeof DbSortSchema>;
 export const TableQueryBodySchema = PaginationQuerySchema.extend({
   filters: z.array(DbFilterSchema).max(20).default([]),
   sort: DbSortSchema.optional(),
+  /**
+   * Free-text search — one box the server matches as a case-insensitive substring against
+   * every text column at once. Independent of `filters`: a search narrows within them.
+   */
+  search: z.string().trim().max(200).optional(),
 });
 export type TableQueryBody = z.infer<typeof TableQueryBodySchema>;
 

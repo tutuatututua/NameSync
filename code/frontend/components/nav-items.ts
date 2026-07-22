@@ -18,7 +18,7 @@ export interface NavItem {
  *                            /database?table=<name>.
  */
 export const NAV_ITEMS: NavItem[] = [
-  { href: "/", label: "Compare", icon: GitCompareArrows },
+  { href: "/", label: "Network", icon: GitCompareArrows },
   { href: "/uploads", label: "Uploads", icon: UploadCloud },
   { href: "/database", label: "Data", icon: Database },
 ];

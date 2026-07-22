@@ -14,8 +14,9 @@ import type { RowVerdict, RunRow } from "@extensions/contract";
 /** `all` is not a verdict, it is the absence of a filter. */
 export type RunRowFilter = RowVerdict | "all";
 
-/** See RunRowsQuerySchema — `row` is import order, `status` is matches-first. */
-export type RunRowSort = "row" | "status";
+/** See RunRowsQuerySchema — `row` is import order, `status` is matches-first, `similarity` is
+ *  best-match-first (only meaningful for a compare run, whose rows carry a score). */
+export type RunRowSort = "row" | "status" | "similarity";
 
 /**
  * The WHERE for one verdict bucket, or null for "no filter".
@@ -49,6 +50,9 @@ export interface RawRunRow {
   matchedName: string | null;
   matchedNameTh: string | null;
   matchedContext: string | null;
+  /** In [0, 1], or null/absent. Only the `comparison_result` reader selects a real value; the
+   *  import readers (friend / company_contact) have no score column and don't select it at all. */
+  similarity?: number | null;
   extras: string | null;
 }
 
@@ -69,6 +73,9 @@ export function toRunRow(kind: "company" | "facebook", r: RawRunRow): RunRow {
     matchedName: r.matchedName,
     matchedNameTh: r.matchedNameTh,
     matchedContext: r.matchedContext,
+    // `?? null` because the import readers don't select it — an absent property reads as null,
+    // which is exactly "this run kept no score" and what the table renders as "—".
+    similarity: r.similarity ?? null,
     extras: r.extras ?? null,
   };
 }

@@ -30,13 +30,13 @@ const EnvSchema = z.object({
   FACEBOOK_WEBHOOK_URL: optionalUrl,
 
   // ── Which matcher runs ────────────────────────────────────────────────────
-  // Off (the default): NameSync scores names itself, in Postgres (matcher.service), and a
+  // Off (the default): Network Intel scores names itself, in Postgres (matcher.service), and a
   // compare run finishes inside the request that started it. An import is just an import.
   //
   // On: the external workflow is the matcher. An import also *starts a run* — its rows land
   // at status='processing', a `comparison` is opened for them, and the workflow stamps each
   // row 'match'/'unmatch' and writes the pairs into comparison_result directly in Postgres.
-  // NameSync finds out by polling its own tables; there is no callback. See docs/EXTERNAL-MATCHER.md.
+  // Network Intel finds out by polling its own tables; there is no callback. See docs/EXTERNAL-MATCHER.md.
   //
   // A flag rather than a replacement because the two matchers disagree about *when* an
   // answer exists — one returns it, the other is waited on — and that difference reaches all
@@ -50,7 +50,7 @@ const EnvSchema = z.object({
   CALLBACK_TOKEN: z.string().optional(),
 
   // ── Auth ──────────────────────────────────────────────────────────────────
-  // NameSync signs people in itself: a password against `app_user`, then an opaque
+  // Network Intel signs people in itself: a password against `app_user`, then an opaque
   // session token in an httpOnly cookie (lib/session.ts). There is nothing to configure
   // for it to work — no secret, no issuer, no JWKS — because there is no external issuer
   // to agree with any more. What is left is cookie policy and how long a session lasts.
@@ -58,7 +58,7 @@ const EnvSchema = z.object({
   // How long a session survives without activity. It slides on use, so this is an
   // idle timeout, not a hard cap. 168h = 7 days.
   SESSION_TTL_HOURS: z.coerce.number().positive().max(8760).default(168),
-  AUTH_COOKIE_NAME: z.string().default('namesync_session'),
+  AUTH_COOKIE_NAME: z.string().default('networkintel_session'),
   // `lax` is right whenever the site and the API share a registrable domain — including
   // localhost:3000 -> localhost:4000, because the port is not part of the "site". Only a
   // genuinely cross-site deployment needs `none`, and the browser then requires Secure.

@@ -2,12 +2,11 @@
 
 import * as React from "react";
 import Link from "next/link";
-import { ArrowUpRight, Building2, Loader2, RotateCcw, Users } from "lucide-react";
+import { ArrowUpRight, Building2, Loader2, Users } from "lucide-react";
 import type { UploadSessionRow } from "@extensions/contract";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { DataManager, type Column } from "@/components/data-table/DataManager";
-import { ConfirmButton } from "@/components/confirm-button";
 import { PageHeader, SectionHeader } from "@/components/page-header";
 import { UploadPanel } from "@/components/upload/UploadPanel";
 import { ImportReview, type ImportSource } from "@/components/upload/ImportReview";
@@ -18,7 +17,6 @@ import {
   type UploadFilterState,
 } from "@/components/uploads/UploadFilters";
 import { useUploadSessions } from "@/hooks/queries";
-import { useRollbackSession } from "@/hooks/mutations";
 import { formatDate } from "@/lib/format";
 
 /**
@@ -215,7 +213,6 @@ function SessionsList() {
   React.useEffect(() => setPage(1), [filters.type, filters.dateFrom, filters.dateTo, search]);
 
   const q = useUploadSessions(params);
-  const rollback = useRollbackSession();
 
   const columns: Column<UploadSessionRow>[] = [
     {
@@ -251,27 +248,6 @@ function SessionsList() {
     },
     { key: "status", header: "Status", render: (r) => statusBadge(r.status) },
     { key: "comparison_id", header: "Run", render: (r) => runCell(r) },
-    {
-      key: "actions",
-      header: "",
-      className: "text-right",
-      // Undo is the reason this table exists; it doesn't get to scroll off the edge.
-      stickyRight: true,
-      render: (r) =>
-        r.status === "rolled_back" ? null : (
-          <ConfirmButton
-            variant="outline"
-            size="sm"
-            title="Undo this import?"
-            description="Permanently deletes exactly the rows this import added. Data already forwarded to the external service can't be recalled. This cannot be undone."
-            confirmLabel="Undo import"
-            isLoading={rollback.isPending}
-            onConfirm={() => rollback.mutateAsync(r.id)}
-          >
-            <RotateCcw className="h-3.5 w-3.5" /> Delete
-          </ConfirmButton>
-        ),
-    },
   ];
 
   return (

@@ -2,7 +2,7 @@
 
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import type { CreateSavedQueryBody, DbRow, SourceType } from "@extensions/contract";
+import type { CreateSavedQueryBody, DbRow, RenameContactBody, SourceType } from "@extensions/contract";
 import { api, ApiError } from "@/lib/api/client";
 import { qk } from "./queryKeys";
 
@@ -172,6 +172,30 @@ export function useRenameComparison() {
       toast.success("Renamed");
     },
     onError: (e) => toast.error(errMsg(e, "Failed to rename")),
+  });
+}
+
+/**
+ * Rename a company contact (Feature 3) — someone left, or a director changed their name.
+ *
+ * Invalidates the Network views (a rename changes who a company connects to) and the DB console
+ * grid + company list, since the same row is visible there. The server cleans the name, so the
+ * cache is refetched rather than optimistically patched — the stored value may differ from what
+ * was typed.
+ */
+export function useRenameContact() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ uuid, body }: { uuid: string; body: RenameContactBody }) =>
+      api.comparisons.renameCompanyRecord(uuid, body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.networkSearchAll() });
+      qc.invalidateQueries({ queryKey: qk.networkOverviewAll() });
+      qc.invalidateQueries({ queryKey: qk.dbRowsAll() });
+      qc.invalidateQueries({ queryKey: qk.companies() });
+      toast.success("Contact updated");
+    },
+    onError: (e) => toast.error(errMsg(e, "Failed to update the contact")),
   });
 }
 

@@ -4,31 +4,31 @@
 # NOTE: the app now runs on PostgreSQL (not SQLite). The api-2.0 / frontend-2.0 images
 # must be built from this repo and pushed before this file will work:
 #   docker compose -f docker-compose.yml build
-#   docker tag <built-api> tuadocker/namesync:api-2.0 && docker push tuadocker/namesync:api-2.0
-#   docker tag <built-frontend> tuadocker/namesync:frontend-2.0 && docker push ...
-# The repo tuadocker/namesync is PRIVATE, so first run: docker login
+#   docker tag <built-api> tuadocker/networkintel:api-2.0 && docker push tuadocker/networkintel:api-2.0
+#   docker tag <built-frontend> tuadocker/networkintel:frontend-2.0 && docker push ...
+# The repo tuadocker/networkintel is PRIVATE, so first run: docker login
 services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_USER: namesync
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-namesync}
-      POSTGRES_DB: namesync
+      POSTGRES_USER: networkintel
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-networkintel}
+      POSTGRES_DB: networkintel
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U namesync -d namesync"]
+      test: ["CMD-SHELL", "pg_isready -U networkintel -d networkintel"]
       interval: 5s
       timeout: 5s
       retries: 10
     restart: unless-stopped
 
   api:
-    image: tuadocker/namesync:api-2.0
+    image: tuadocker/networkintel:api-2.0
     environment:
       NODE_ENV: production
       DB_ENGINE: postgres
-      DATABASE_URL: postgres://namesync:${POSTGRES_PASSWORD:-namesync}@postgres:5432/namesync
+      DATABASE_URL: postgres://networkintel:${POSTGRES_PASSWORD:-networkintel}@postgres:5432/networkintel
       UPLOAD_DIR: /data/uploads
       CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3000}
       # Hand the matching to the external workflow (docs/EXTERNAL-MATCHER.md). Needs
@@ -54,7 +54,7 @@ services:
     restart: unless-stopped
 
   frontend:
-    image: tuadocker/namesync:frontend-2.0
+    image: tuadocker/networkintel:frontend-2.0
     ports:
       - "3000:3000"
     depends_on:

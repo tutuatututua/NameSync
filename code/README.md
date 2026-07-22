@@ -1,8 +1,23 @@
-# NameSync
+# Network Intel
 
 Upload **Company data** and **Facebook friends** (both `.xlsx`), forward both to an external
 name-matching service, watch progress live over WebSocket, and review the **name matches** it
 found — with history and saved comparisons.
+
+The home page is the **Network** workspace, two tabs over the same stored data (a run is created by
+importing — the external matcher matches each import against everything on file — so there is no
+manual "compare" step in the everyday flow):
+
+- **Overview** — per roster (an uploader, or everyone): how many **friends** they uploaded, how
+  many of those **matched** vs **no match**, and how many **companies** they reach ("known"), plus
+  the history of every comparison run (`GET /api/network/overview?uploader=`). Clicking a reached
+  company opens the Search tab, prefiltered to it. A secondary "Find connections" action covers the
+  ad-hoc case (`POST /api/comparisons/compare`), handing off to the run's own page.
+- **Search** — look a person up by name to see which company they're in, **who knows them**, and
+  **which uploaders reach that company** (`GET /api/network/search?q=`). Rename a contact inline
+  when someone leaves or a name changes (`PATCH /api/comparisons/company-data/:uuid`); the rename is
+  cleaned the same way an import is, so it stays matchable, and past runs are frozen snapshots left
+  unchanged.
 
 ## Architecture
 
@@ -79,13 +94,13 @@ so changing them needs `docker compose build frontend`, not just a restart.
 ## Tests
 
 The suite needs a **real Postgres you provide** — there is no `postgres` compose service to start.
-By default it looks for one at `postgres://namesync:namesync@localhost:55432/namesync_test`
+By default it looks for one at `postgres://networkintel:networkintel@localhost:55432/networkintel_test`
 (override with `TEST_DATABASE_URL`). Any Postgres reachable at that URL will do; one way to get
 one, if you have no other:
 
 ```bash
-docker run -d --name namesync-pg -p 55432:5432 \
-  -e POSTGRES_USER=namesync -e POSTGRES_PASSWORD=namesync -e POSTGRES_DB=namesync \
+docker run -d --name networkintel-pg -p 55432:5432 \
+  -e POSTGRES_USER=networkintel -e POSTGRES_PASSWORD=networkintel -e POSTGRES_DB=networkintel \
   postgres:16
 ```
 
@@ -97,7 +112,7 @@ npm --prefix api run test              # Vitest: integration (buildApp + inject 
                                        # a mock external service) + unit tests
 ```
 
-The suite creates the `namesync_test` database if it is missing and applies
+The suite creates the `networkintel_test` database if it is missing and applies
 `api/docs/schema-redesign.sql` to it on every run (`api/test/globalSetup.ts`) — which is also what
 keeps that file honest. It simulates the external matcher by posting batches to the callback
 endpoint.

@@ -47,6 +47,15 @@ export const ComparisonResultRowSchema = z.object({
    * turn a row we merely don't understand into a response nobody can load.
    */
   status: z.string().nullable(),
+  /**
+   * How close the match was, in [0, 1] — for sorting and display only, never the verdict.
+   *
+   * The number the internal matcher used to decide the row, kept this time instead of thrown away.
+   * It ranks and describes a match; it does not judge one — `status` is the verdict, and no reader
+   * derives that from this. Null when the matcher didn't record it (an external matcher that sent
+   * none, or a row from before the column existed).
+   */
+  similarity: z.number().nullable(),
   session_id: z.string().nullable(),
   // The uploader with a potential connection (webhook-provided or joined from
   // facebook_data at read time). `extra` holds any additional matcher fields as JSON.
@@ -138,10 +147,10 @@ export type SendWebhookData = z.infer<typeof SendWebhookDataSchema>;
  * GET /api/comparisons/:id/progress — how far the external workflow has got.
  *
  * There is no callback and no event: the workflow writes its verdict onto each uploaded row
- * (`friend.status` / `company_contact.status`) directly in Postgres, and NameSync finds out
+ * (`friend.status` / `company_contact.status`) directly in Postgres, and Network Intel finds out
  * by counting the rows it has not stamped yet. This endpoint *is* the progress mechanism.
  *
- * It is also where a run gets completed. Polling is the only moment NameSync looks, so the
+ * It is also where a run gets completed. Polling is the only moment Network Intel looks, so the
  * poll is what notices the last row landing and closes the run — a run does not finish
  * because time passed, it finishes because someone counted.
  */
@@ -246,13 +255,30 @@ export const RunRowSchema = z.object({
   /** What tells this name apart from another like it: the employer (contact), the uploader (friend). */
   context: z.string().nullable(),
 
-  /** Raw, as the workflow wrote it. Read through `rowVerdict`, never shown verbatim. */
+  /**
+   * The row's verdict in the status vocabulary. Read through `rowVerdict`, never shown verbatim.
+   *
+   * Usually the workflow's own stamp, verbatim — but for an import whose workflow records a match
+   * only as a `comparison_result` pair (stamping the source row with a bare done-marker), the server
+   * substitutes `match` so the row badge agrees with the tally above it. See `effectiveStatusSql`.
+   */
   status: z.string().nullable(),
 
   /** The counterpart's name — a contact's English name, or a friend's name. */
   matchedName: z.string().nullable(),
   /** The counterpart's Thai name. Only a contact has one, so this is null on a company import. */
   matchedNameTh: z.string().nullable(),
+
+  /**
+   * How close this match was, in [0, 1] — for sorting and display, never the verdict.
+   *
+   * Only ever set on a compare-by-company run, whose rows are `comparison_result` rows the internal
+   * matcher scored. An import-driven run reads its rows from `friend` / `company_contact`, which
+   * carry no score, so this is null there — and the table hides the column and the "Best match" sort
+   * for those runs (see `origin`). Null within a compare run too, for a row an external matcher
+   * posted without one.
+   */
+  similarity: z.number().nullable(),
   /**
    * Who the counterpart is.
    *
@@ -288,21 +314,24 @@ export type RunRow = z.infer<typeof RunRowSchema>;
  * client-side and calling it "best first" would give you the best of the 25 *oldest* rows, and
  * label it as the best of the run. Only the database can see all of them.
  *
- *   · `row`    — the order the file was imported in. Stable, and the only safe order while the run
- *                is live: the table re-reads every couple of seconds, and rows that re-sorted as
- *                verdicts landed would move out from under the reader on every tick.
- *   · `status` — matches first, everything else after, import order within each. What you want the
- *                moment the run stops moving, because row order buries the four matches of a
- *                320-row import somewhere across 13 pages.
+ *   · `row`        — the order the file was imported in. Stable, and the only safe order while the
+ *                    run is live: the table re-reads every couple of seconds, and rows that re-sorted
+ *                    as verdicts landed would move out from under the reader on every tick.
+ *   · `status`     — matches first, everything else after; within each, best similarity first, then
+ *                    import order. What you want the moment the run stops moving, because row order
+ *                    buries the four matches of a 320-row import somewhere across 13 pages.
+ *   · `similarity` — closest match first, regardless of verdict, NULLs last. The real "Best match":
+ *                    it ranks *within* the matches, which `status` alone cannot. Only meaningful for
+ *                    a compare-by-company run, whose rows carry a similarity; on an import-driven run
+ *                    (rows from `friend` / `company_contact`, no score) it degrades to import order.
  *
- * `status` replaces the old `score` (best-first over `matching_score`), which went with the column.
- * It is a coarser sort — every match ties, and the tie is broken by import order — where the old
- * one ranked *within* the matches. Nothing can rank them any more: the row records that it matched,
- * not how well.
+ * `similarity` restores the old `score` sort that went with `matching_score` — but as a display-only
+ * ranking, not the authoritative verdict the old column was. `status` no longer stands alone as
+ * "best available": with a score back to tie-break on, it ranks within the matches too.
  */
 export const RunRowsQuerySchema = PaginationQuerySchema.extend({
   filter: z.enum(['all', 'pending', 'matched', 'unmatched', 'failed']).default('all'),
-  sort: z.enum(['row', 'status']).default('row'),
+  sort: z.enum(['row', 'status', 'similarity']).default('row'),
 });
 export type RunRowsQuery = z.infer<typeof RunRowsQuerySchema>;
 

@@ -8,7 +8,7 @@ import { hashPassword } from "../lib/password";
  *
  *   npm run create-user -- you@example.com 'a long passphrase' --name "Your Name" --admin
  *
- * This exists because there is no public sign-up — NameSync is an internal tool, and an
+ * This exists because there is no public sign-up — Network Intel is an internal tool, and an
  * open /register would put the data behind nothing at all. So the first account has to be
  * made out-of-band, and it has to be an admin, or nobody can ever create the second one.
  *

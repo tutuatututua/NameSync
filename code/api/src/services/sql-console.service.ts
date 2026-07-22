@@ -40,7 +40,7 @@ function getPool(): Pool {
   const schema = process.env.DB_SCHEMA?.trim();
   const options = [
     ...(schema ? [`-c search_path=${schema}`] : []),
-    "-c application_name=namesync-sql-console",
+    "-c application_name=networkintel-sql-console",
   ].join(" ");
 
   pool = new Pool({ connectionString: url, max: 3, options });

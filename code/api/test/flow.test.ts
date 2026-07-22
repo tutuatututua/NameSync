@@ -526,6 +526,43 @@ describe("company-selection compare", () => {
     expect(rows.find((r) => r.name === "thana")!.matchedContext).toBe("BLUEBIK");
   });
 
+  /**
+   * The score the matcher used to decide each row is now kept beside the verdict — for sorting and
+   * display, never to re-derive the verdict. An exact name is 1.0; a near-miss is stored too, even
+   * though it did not clear the bar. `sort=similarity` is the "Best match" order the results table
+   * offers on a compare run.
+   */
+  it("stores a per-row similarity and ranks rows best-first by it", async () => {
+    await importCompany(app, { csv: CO_CSV, uploader: "Alex" });
+    // Noppamas is MCKINSEY's contact exactly; "Thanaphon" is only close to BLUEBIK's "Thana". The
+    // near one is imported FIRST, so import order and best-first order disagree — which is the point.
+    await importFacebook(app, {
+      friends: [["Thanaphon", 1700000000], ["Noppamas", 1700000100]],
+      uploader: "Alex",
+    });
+
+    const id = await startCompare(app, ["MCKINSEY", "BLUEBIK"]);
+
+    const results = (await app.inject({ method: "GET", url: `/api/comparisons/${id}/results` }))
+      .json().data.results as { fb_name: string; status: string; similarity: number }[];
+    const nop = results.find((r) => r.fb_name === "noppamas")!;
+    const thn = results.find((r) => r.fb_name === "thanaphon")!;
+    expect(nop.similarity).toBe(1); // exact name → identical trigram sets
+    expect(nop.status).toBe("match");
+    // The near-miss is stored even though it fell short of the bar — similarity describes, status decides.
+    expect(thn.similarity).toBeGreaterThan(0);
+    expect(thn.similarity).toBeLessThan(1);
+    expect(thn.status).toBe("unmatch");
+
+    // sort=similarity is best-first regardless of import order: the exact match leads.
+    const rows = (await app.inject({
+      method: "GET",
+      url: `/api/comparisons/${id}/rows?page=1&limit=25&sort=similarity`,
+    })).json().data as { name: string; similarity: number }[];
+    expect(rows.map((r) => r.name)).toEqual(["noppamas", "thanaphon"]);
+    expect(rows[0].similarity).toBeGreaterThanOrEqual(rows[1].similarity);
+  });
+
   it("deduplicates a repeated company rather than double-weighting it", async () => {
     await importCompany(app, { csv: CO_CSV, uploader: "Alex" });
     await importFacebook(app, { friends: [["Noppamas", 1700000000]], uploader: "Alex" });
@@ -682,6 +719,35 @@ describe("past runs (GET /api/comparisons)", () => {
 
     const detail = (await app.inject({ method: "GET", url: `/api/comparisons/${id}/results` })).json().data;
     expect(JSON.parse(detail.results[0].extra)).toMatchObject({ matching_score: 0.95 });
+  });
+
+  /**
+   * A callback's `similarity` is a known field now: it lands in the column of its own, for sorting
+   * and display, and is kept out of `extra`. The legacy `matching_score` is unchanged — no column,
+   * so it still flows to `extra`, and `similarity` stays null. Neither decides the verdict.
+   */
+  it("stores a callback's `similarity` in its column, while a legacy score stays in extra", async () => {
+    const id = await createComparison();
+    await postCallback(app, {
+      session_id: id,
+      batch_number: 1,
+      total_batches: 1,
+      is_complete: true,
+      results: [
+        { fb_name: "A", person_name_en: "A", person_name_th: "ก", status: "match", similarity: 0.9 },
+        { fb_name: "B", person_name_en: "B", person_name_th: "ข", status: "match", matching_score: 0.7 },
+      ],
+    });
+
+    const results = (await app.inject({ method: "GET", url: `/api/comparisons/${id}/results` }))
+      .json().data.results as { fb_name: string; similarity: number | null; extra: string | null }[];
+    const a = results.find((r) => r.fb_name === "A")!;
+    const b = results.find((r) => r.fb_name === "B")!;
+
+    expect(a.similarity).toBeCloseTo(0.9, 5); // real(float4), so not bit-exact
+    expect(a.extra).toBeNull(); // every field it sent is known — nothing left for extra
+    expect(b.similarity).toBeNull(); // matching_score is not the similarity field
+    expect(JSON.parse(b.extra!)).toMatchObject({ matching_score: 0.7 });
   });
 
   it("reports zero matches for a run whose every row is a stranger", async () => {

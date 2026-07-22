@@ -1,5 +1,5 @@
 -- ============================================================================
--- NameSync — demo seed for the TOR (Terms of Reference) walkthrough
+-- Network Intel — demo seed for the TOR (Terms of Reference) walkthrough
 -- ============================================================================
 -- Populates lakeshore.* with a believable end-to-end story so every screen has
 -- something real to show:
@@ -176,7 +176,7 @@ VALUES
 -- ══════════════════════════════════════════════════════════════════════════
 -- Facebook's "friends since" date used to be seeded here. The column is gone: import ignores
 -- the 'timestamp' / 'added' / 'date' headers now, so a friend row's only date is created_at —
--- when NameSync saw it, which is the one date NameSync can actually vouch for.
+-- when Network Intel saw it, which is the one date Network Intel can actually vouch for.
 INSERT INTO lakeshore.friend (upload_id, source, friend_name, created_at, updated_at)
 VALUES
   (up_social_main, 'facebook', 'pochara arayakarnkul',    now() - interval '20 days', now() - interval '19 days'),

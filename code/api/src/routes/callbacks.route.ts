@@ -35,15 +35,17 @@ export default async function callbacksRoutes(fastify: FastifyInstance): Promise
       if (!alreadyReceived && payload.results.length > 0) {
         // Standard fields we map to columns; anything else is preserved in `extra`.
         //
-        // `matching_score` is deliberately NOT known any more. It has no column to go to, and
-        // dropping it from this set is what routes it into `extra` instead of discarding it — a
-        // matcher that still sends a score keeps it visible as an extra column in the results
-        // table, it just no longer decides anything.
+        // `similarity` is known: it has a column of its own now (sorting + display), so it is mapped
+        // there rather than left in `extra`. `matching_score` is deliberately still NOT known — it
+        // keeps flowing into `extra` as before, so a matcher sending the legacy field is unchanged
+        // and its score stays visible as an extra column. Neither decides anything: `status` is the
+        // verdict.
         const KNOWN = new Set([
           "fb_name",
           "person_name_en",
           "person_name_th",
           "status",
+          "similarity",
           "upload_name",
           "upload_person_name",
         ]);
@@ -54,12 +56,20 @@ export default async function callbacksRoutes(fastify: FastifyInstance): Promise
             (typeof rec.upload_person_name === "string" && rec.upload_person_name) ||
             null;
           const extraEntries = Object.entries(rec).filter(([k]) => !KNOWN.has(k));
+          // Clamp to [0, 1]: the column is a pg_trgm similarity, and a matcher reporting 1.4 or -0.2
+          // is buggy, not a reason to drop the whole batch. Out of range or unparseable → null, which
+          // sorts last and shows "—", the same as a matcher that sent nothing.
+          const similarity =
+            typeof item.similarity === "number" && item.similarity >= 0 && item.similarity <= 1
+              ? item.similarity
+              : null;
           return {
             comparison_id: payload.session_id,
             fb_name: item.fb_name,
             person_name_en: item.person_name_en ?? null,
             person_name_th: item.person_name_th ?? null,
             batch_number: payload.batch_number,
+            similarity,
             // The ROW's verdict, which is the item's to give — not `payload.is_complete`, which is
             // the BATCH's transport flag and says only "no more batches after this one". Stamping
             // that onto rows is what the old `is_complete` column did: identical, fully-decided

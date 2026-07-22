@@ -4,7 +4,7 @@ import type { FastifyInstance } from "fastify";
 /**
  * No ingestion webhook configured, internal matcher (the compose default).
  *
- * The webhook is an optional mirror in this mode — NameSync scores the names itself — so an
+ * The webhook is an optional mirror in this mode — Network Intel scores the names itself — so an
  * unconfigured URL must mean "don't forward", not "every import fails 503". This suite exists
  * because the import used to do exactly that the moment /run started forwarding its own rows.
  *

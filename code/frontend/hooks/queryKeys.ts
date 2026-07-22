@@ -18,6 +18,18 @@ export const qk = {
   dataStats: () => ["data-stats"] as const,
   uploadSessions: (params: UploadListParams) => ["upload-sessions", params] as const,
   companies: () => ["companies"] as const,
+  // Network workspace. Overview is keyed on the roster (uploader); search on the query + page.
+  // The `*All` prefixes are what a contact rename invalidates — it can change any roster's counts
+  // and any search page, and prefix matching reaches all of them.
+  networkOverviewAll: () => ["network-overview"] as const,
+  networkOverview: (uploader: string | null) => ["network-overview", uploader] as const,
+  networkSearchAll: () => ["network-search"] as const,
+  networkSearch: (params: { q?: string; company?: string; page: number; limit: number }) =>
+    ["network-search", params] as const,
+  // Uploaders tab + one uploader's name breakdown. Both read `comparison_result` + `friend`, which
+  // a contact rename does not touch, so these are deliberately outside the rename invalidation.
+  networkUploaders: () => ["network-uploaders"] as const,
+  networkUploader: (name: string) => ["network-uploader", name] as const,
   // "Past runs" lists the runs themselves now, so its key IS the comparisons key.
   comparisons: () => ["comparisons"] as const,
   latestSession: () => ["latest-session"] as const,

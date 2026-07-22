@@ -156,6 +156,22 @@ function applyFilter(q: any, table: RegistryTable, f: DbFilter): any {
   return q.where(ref, COMPARISON_OPS[f.op], operand);
 }
 
+/**
+ * Free-text search: one term, matched as a case-insensitive substring against every text
+ * column at once, the columns OR'd together. The term is escaped like `contains`, so a
+ * literal `%` or `_` matches itself, and only string columns take part — numbers,
+ * timestamps, booleans and jsonb have no useful substring match. The OR group is a single
+ * `where`, so it AND-combines with any filters rather than widening them.
+ */
+function applySearch(q: any, table: RegistryTable, term: string): any {
+  const like = `%${escapeLike(term)}%`;
+  const refs = table.columns.filter((col) => col.type === "string").map((col) => columnRef(table, col));
+  // Every registry table has a text column; the guard only stops a future text-free table
+  // from handing eb.or() an empty array, which it rejects.
+  if (refs.length === 0) return q;
+  return q.where((eb: any) => eb.or(refs.map((ref: string) => eb(ref, "ilike", like))));
+}
+
 export class TableEditorModel extends DBModel {
   /** Filtered, sorted, paginated rows. Throws 404/400 for anything not in the registry. */
   static async queryRows(tableName: string, body: TableQueryBody): Promise<PaginatedResult<DbRow>> {
@@ -174,7 +190,13 @@ export class TableEditorModel extends DBModel {
         (db as any).selectFrom(table.name)
       );
 
-    const withFilters = (q: any): any => body.filters.reduce((acc, f) => applyFilter(acc, table, f), q);
+    // Filters AND the free-text search. Both narrow the same base, so the count and the
+    // page of rows stay in agreement.
+    const term = body.search?.trim();
+    const constrain = (q: any): any => {
+      const filtered = body.filters.reduce((acc, f) => applyFilter(acc, table, f), q);
+      return term ? applySearch(filtered, table, term) : filtered;
+    };
 
     // An explicit select list, not selectAll(): across a join, `friend` and `upload` both
     // have `id`, `source`, `created_at` and `updated_at`, and selectAll() would collapse
@@ -187,12 +209,12 @@ export class TableEditorModel extends DBModel {
     const sortDir = body.sort?.direction ?? "asc";
 
     const [data, countRow] = await Promise.all([
-      withFilters(base().select(selection))
+      constrain(base().select(selection))
         .orderBy(sortCol, sortDir)
         .limit(body.limit)
         .offset(offset)
         .execute() as Promise<DbRow[]>,
-      withFilters(base().select((db as any).fn.count(columnRef(table, pk)).as("count")))
+      constrain(base().select((db as any).fn.count(columnRef(table, pk)).as("count")))
         .executeTakeFirst() as Promise<{ count: number | string | bigint } | undefined>,
     ]);
 
