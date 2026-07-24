@@ -62,11 +62,22 @@ export class UserModel extends DBModel {
     return Number(row?.count ?? 0);
   }
 
-  static async touchLastLogin(id: string): Promise<void> {
+  /**
+   * Stamp a successful sign-in. `ip` is deliberately written even when undefined: this pair
+   * describes the LAST login, so a login whose address wasn't known must clear the previous
+   * one rather than leave a stale address looking current.
+   */
+  static async touchLastLogin(id: string, ip?: string | null): Promise<void> {
     const db = await this.getKyselyDB();
     await db
       .updateTable("app_user")
-      .set({ last_login_at: sql`now()`, updated_at: sql`now()` })
+      .set({
+        last_login_at: sql`now()`,
+        // Capped like auth_session.ip: with TRUST_PROXY on this value started life as a
+        // request header, so its length is the client's choice until we bound it.
+        last_login_ip: ip?.slice(0, 64) ?? null,
+        updated_at: sql`now()`,
+      })
       .where("id", "=", id)
       .execute();
   }

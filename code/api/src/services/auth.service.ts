@@ -151,7 +151,10 @@ export async function issueSession(
     userAgent: meta.userAgent,
     ip: meta.ip,
   });
-  await UserModel.touchLastLogin(user.id);
+  // The same address on both rows, and on purpose: auth_session.ip is per-session and dies
+  // with it, app_user.last_login_ip survives on the account. Both paths into this function
+  // (local password, Center) carry the address, so neither can quietly skip recording it.
+  await UserModel.touchLastLogin(user.id, meta.ip);
 
   return { token, user: toSessionUser(user), expiresAt };
 }

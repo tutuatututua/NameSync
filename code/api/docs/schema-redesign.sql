@@ -274,6 +274,11 @@
     roles         text[] NOT NULL DEFAULT '{}',
     is_active     boolean NOT NULL DEFAULT true,
     last_login_at timestamptz,
+    -- Where that last sign-in came from. Overwritten each login, so it is the account's
+    -- current whereabouts; the per-session history is auth_session.ip, which dies with the
+    -- session. Only meaningful if the API can see the client — behind a proxy that needs
+    -- TRUST_PROXY, or this records the proxy. (Added later: docs/add-last-login-ip.sql.)
+    last_login_ip varchar(64),
     created_at    timestamptz NOT NULL DEFAULT now(),
     updated_at    timestamptz NOT NULL DEFAULT now()
   );

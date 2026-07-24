@@ -21,7 +21,7 @@ describe("FileParserService", () => {
   // name is the exception, and the assertions below pin that difference deliberately.
   it("parses a company workbook, mapping the spaced headers", async () => {
     const p = await tmp("c.xlsx", csvToXlsx("Company Name,Thai Name,English Name\nAcme,สมชาย,Somchai\n"));
-    const rows = await FileParserService.parseCompanyXLSX(p);
+    const rows = await FileParserService.parseCompanyFile(p);
     fs.unlinkSync(p);
     expect(rows).toHaveLength(1);
     expect(rows[0].company_name).toBe("Acme");
@@ -31,7 +31,7 @@ describe("FileParserService", () => {
 
   it("maps the real underscored headers (company_name/thai_name/eng_name)", async () => {
     const p = await tmp("c2.xlsx", csvToXlsx("company_name,thai_name,eng_name\nMCKINSEY,นพมาศ,Noppamas\n"));
-    const rows = await FileParserService.parseCompanyXLSX(p);
+    const rows = await FileParserService.parseCompanyFile(p);
     fs.unlinkSync(p);
     // A company name is tidied, not cleaned: its case is its own and nothing folds it.
     expect(rows[0].company_name).toBe("MCKINSEY");
@@ -41,7 +41,7 @@ describe("FileParserService", () => {
 
   it("parses a friends workbook into names and nothing else", async () => {
     const p = await tmp("f.xlsx", friendsXlsx([["Nok", 1700000000]]));
-    const rows = await FileParserService.parseFacebookXLSX(p);
+    const rows = await FileParserService.parseFacebookFile(p);
     fs.unlinkSync(p);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toEqual({ friend_name: "nok" });
@@ -53,19 +53,19 @@ describe("FileParserService", () => {
   it("ignores the export's timestamp column rather than storing it", async () => {
     const iso = "2023-11-14T22:13:20.000Z";
     const p = await tmp("f3.xlsx", xlsxBuffer(["name", "timestamp"], [["Nok", iso]]));
-    const rows = await FileParserService.parseFacebookXLSX(p);
+    const rows = await FileParserService.parseFacebookFile(p);
     fs.unlinkSync(p);
     expect(rows[0]).toEqual({ friend_name: "nok" });
 
     const p2 = await tmp("f4.xlsx", xlsxBuffer(["name", "added"], [["Nok", iso]]));
-    const preview = await FileParserService.previewFacebookXLSX(p2, "f4.xlsx");
+    const preview = await FileParserService.previewFacebookFile(p2, "f4.xlsx");
     fs.unlinkSync(p2);
     expect(preview.ignoredColumns).toContain("added");
   });
 
   it("throws when the file isn't a workbook at all", async () => {
     const p = await tmp("bad.xlsx", Buffer.from("not a workbook"));
-    await expect(FileParserService.parseCompanyXLSX(p)).rejects.toThrow();
+    await expect(FileParserService.parseCompanyFile(p)).rejects.toThrow();
     fs.unlinkSync(p);
   });
 
@@ -88,7 +88,7 @@ describe("FileParserService", () => {
       "c3.xlsx",
       csvToXlsx("company_name,thai_name,eng_name\nAcme,นายสมชาย ใจดี,MR. SOMCHAI J. JAIDEE JR.\n")
     );
-    const rows = await FileParserService.parseCompanyXLSX(p);
+    const rows = await FileParserService.parseCompanyFile(p);
     fs.unlinkSync(p);
 
     expect(rows[0]).toEqual({
@@ -101,7 +101,7 @@ describe("FileParserService", () => {
 
   it("cleans facebook names the same way", async () => {
     const p = await tmp("f2.xlsx", friendsXlsx([['Somchai "Tui" Jaidee', 1700000000]]));
-    const rows = await FileParserService.parseFacebookXLSX(p);
+    const rows = await FileParserService.parseFacebookFile(p);
     fs.unlinkSync(p);
 
     expect(rows[0]).toEqual({ friend_name: "somchai jaidee" });
@@ -112,7 +112,7 @@ describe("FileParserService", () => {
       "c4.xlsx",
       csvToXlsx("company_name,thai_name,eng_name\nAcme,นายสมชาย ใจดี,Mr. Somchai Jaidee\n")
     );
-    const preview = await FileParserService.previewCompanyXLSX(p, "c4.xlsx");
+    const preview = await FileParserService.previewCompanyFile(p, "c4.xlsx");
     fs.unlinkSync(p);
 
     expect(preview.warnings.some((w) => w.includes("will be cleaned"))).toBe(true);
@@ -131,12 +131,113 @@ describe("FileParserService", () => {
 
   it("pairs the friend's raw name with the one that will be stored, and carries no timestamp", async () => {
     const p = await tmp("f5.xlsx", friendsXlsx([["Mr. Somchai Jaidee", 1700000000]]));
-    const preview = await FileParserService.previewFacebookXLSX(p, "f5.xlsx");
+    const preview = await FileParserService.previewFacebookFile(p, "f5.xlsx");
     fs.unlinkSync(p);
 
     expect(preview.sampleRows[0].friend_name).toBe("Mr. Somchai Jaidee");
     expect(preview.sampleRows[0].friend_name_clean).toBe("somchai jaidee");
     expect(preview.sampleRows[0]).not.toHaveProperty("source_timestamp");
+  });
+
+  // ── the other two formats ──────────────────────────────────────────────────
+  // A workbook, a CSV and a JSON export are three ways of writing one table, and the point of
+  // reading them behind a single `readTable` is that everything above it — aliases, cleaning,
+  // the warnings — stays one implementation. These assert exactly that: the same file, written
+  // three ways, produces the same records.
+
+  const text = (name: string, body: string) => tmp(name, Buffer.from(body, "utf8"));
+
+  it("parses a company .csv the same way it parses the workbook", async () => {
+    const p = await text("c.csv", "company_name,thai_name,eng_name\nAcme,นายสมชาย ใจดี,MR. SOMCHAI JAIDEE\n");
+    const rows = await FileParserService.parseCompanyFile(p);
+    fs.unlinkSync(p);
+    expect(rows).toEqual([
+      { company_name: "Acme", person_name_th: "สมชาย ใจดี", person_name_en: "somchai jaidee" },
+    ]);
+  });
+
+  it("honours quoted cells, CRLF and a BOM in a .csv", async () => {
+    const p = await text(
+      "c2.csv",
+      '﻿company_name,eng_name\r\n"Acme, Inc.","Somchai ""Tui"" Jaidee"\r\n"Beta\nLtd",Anong\r\n'
+    );
+    const rows = await FileParserService.parseCompanyFile(p);
+    fs.unlinkSync(p);
+    // The BOM is stripped (or `company_name` would match no alias and the column would vanish),
+    // the comma inside quotes is data, and the newline inside quotes is not a row break — it
+    // survives into the cell, where `tidyText` folds it to a space like any other whitespace.
+    expect(rows).toEqual([
+      { company_name: "Acme, Inc.", person_name_th: null, person_name_en: "somchai jaidee" },
+      { company_name: "Beta Ltd", person_name_th: null, person_name_en: "anong" },
+    ]);
+  });
+
+  it("reads a semicolon-delimited .csv — Excel writes the separator its locale uses", async () => {
+    const p = await text("c3.csv", "company_name;thai_name;eng_name\nAcme;สมชาย;Somchai\n");
+    const rows = await FileParserService.parseCompanyFile(p);
+    fs.unlinkSync(p);
+    expect(rows[0].company_name).toBe("Acme");
+    expect(rows[0].person_name_en).toBe("somchai");
+  });
+
+  it("refuses a .csv where two columns share one header, as the workbook reader does", async () => {
+    const p = await text("dupe.csv", "company_name,eng_name,eng_name\nAcme,Somchai,Nok\n");
+    await expect(FileParserService.parseCompanyFile(p)).rejects.toThrow(
+      /Two columns share the header “eng_name”/
+    );
+    fs.unlinkSync(p);
+  });
+
+  it("parses a friends .json — the bare array and the export's own wrapper alike", async () => {
+    const bare = await text("f.json", JSON.stringify([{ name: "Mr. Somchai Jaidee", timestamp: 1700000000 }]));
+    const wrapped = await text(
+      "f2.json",
+      JSON.stringify({ friends_v2: [{ name: "Mr. Somchai Jaidee", timestamp: 1700000000 }] })
+    );
+    const [a, b] = [await FileParserService.parseFacebookFile(bare), await FileParserService.parseFacebookFile(wrapped)];
+    fs.unlinkSync(bare);
+    fs.unlinkSync(wrapped);
+    expect(a).toEqual([{ friend_name: "somchai jaidee" }]);
+    expect(b).toEqual(a);
+  });
+
+  it("reads a .json list of bare names as a single name column", async () => {
+    const p = await text("f3.json", JSON.stringify(["Somchai", "Anong"]));
+    const preview = await FileParserService.previewFacebookFile(p, "f3.json");
+    const rows = await FileParserService.parseFacebookFile(p);
+    fs.unlinkSync(p);
+    // The invented column is shown in the preview, so the guess is visible before anything lands.
+    expect(preview.mapping.find((m) => m.target === "friend_name")?.sourceColumn).toBe("name");
+    expect(rows).toEqual([{ friend_name: "somchai" }, { friend_name: "anong" }]);
+  });
+
+  it("keeps a column a later record omits, and warns about the columns it ignores", async () => {
+    const p = await text(
+      "c4.json",
+      JSON.stringify([
+        { company_name: "Acme", eng_name: "Somchai", note: "referral" },
+        { company_name: "Beta", thai_name: "อนงค์" },
+      ])
+    );
+    const preview = await FileParserService.previewCompanyFile(p, "c4.json");
+    const rows = await FileParserService.parseCompanyFile(p);
+    fs.unlinkSync(p);
+
+    expect(preview.ignoredColumns).toContain("note");
+    expect(rows).toEqual([
+      { company_name: "Acme", person_name_th: null, person_name_en: "somchai" },
+      { company_name: "Beta", person_name_th: "อนงค์", person_name_en: null },
+    ]);
+  });
+
+  it("says so plainly when a .json file isn't a list of records", async () => {
+    const notJson = await text("bad.json", "{ nope");
+    await expect(FileParserService.parseCompanyFile(notJson)).rejects.toThrow(/readable JSON/i);
+    fs.unlinkSync(notJson);
+
+    const notAList = await text("bad2.json", JSON.stringify({ company: "Acme" }));
+    await expect(FileParserService.parseCompanyFile(notAList)).rejects.toThrow(/list of records/i);
+    fs.unlinkSync(notAList);
   });
 });
 

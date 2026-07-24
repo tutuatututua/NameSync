@@ -9,10 +9,10 @@ import type { LoginResult } from "./auth.service";
  * Center sign-in, end to end.
  *
  * The shape of it: Center *authenticates* (owns the password and the second factor), and
- * NameSync *authorises* (owns who is allowed in, and with what roles). So a login only
+ * Network Intel *authorises* (owns who is allowed in, and with what roles). So a login only
  * succeeds when BOTH agree — Center accepts the credentials, and an `app_user` row already
  * exists for that email. Center accepting a whole company's credentials does not put anyone
- * into NameSync who an admin hasn't first added. See docs/AUTH.md.
+ * into Network Intel who an admin hasn't first added. See docs/AUTH.md.
  *
  * There is no auto-provisioning, on purpose: a Center account with no `app_user` is turned
  * away, not silently created.
@@ -66,9 +66,9 @@ export async function signInWithCenter(input: CenterSignInInput): Promise<Center
   const email = profile.email ?? input.email;
 
   const user = await UserModel.findByEmail(email);
-  // Authenticated by Center, but not authorised for NameSync: no row, or a disabled one.
+  // Authenticated by Center, but not authorised for Network Intel: no row, or a disabled one.
   if (!user) {
-    throw new Forbidden("Your Center account isn't authorised for NameSync. Ask an administrator to add you.");
+    throw new Forbidden("Your Center account isn't authorised for Network Intel. Ask an administrator to add you.");
   }
   if (!user.is_active) {
     throw new Forbidden("This account has been disabled. Contact an administrator.");

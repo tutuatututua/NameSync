@@ -8,7 +8,7 @@ import { UserModel } from "../src/models";
  * Center sign-in (POST /api/auth/center/login).
  *
  * Center itself is never dialled — global `fetch` is stubbed to play Center's part, so these
- * tests pin the *contract* NameSync depends on (2FA-as-an-error, the email/OTP branch, the
+ * tests pin the *contract* Network Intel depends on (2FA-as-an-error, the email/OTP branch, the
  * match-or-reject rule) without a live centerapp.io. The base URL is set in test/setup.ts.
  *
  * The stub encodes the signed-in email into the token it returns (`tok:<email>`) so `auth/me`
@@ -20,7 +20,7 @@ const HAPPY = "happy@example.com";
 const TOTP_USER = "totp@example.com";
 const EMAIL_USER = "email2fa@example.com";
 const SMS_USER = "sms@example.com";
-const UNKNOWN = "stranger@example.com"; // Center accepts them; NameSync has no row.
+const UNKNOWN = "stranger@example.com"; // Center accepts them; Network Intel has no row.
 
 let secured: FastifyInstance;
 let sendcodeCalls = 0;
@@ -61,7 +61,7 @@ const post = (payload: unknown) =>
 function sessionCookie(setCookie: string | string[] | undefined): string | undefined {
   const headers = Array.isArray(setCookie) ? setCookie : setCookie ? [setCookie] : [];
   for (const header of headers) {
-    const match = /^namesync_session=([^;]*)/.exec(header);
+    const match = /^networkintel_session=([^;]*)/.exec(header);
     if (match && match[1]) return decodeURIComponent(match[1]);
   }
   return undefined;
@@ -103,7 +103,7 @@ describe("Center sign-in", () => {
     const res = await post({ email: HAPPY, password: GOOD_PASSWORD });
     expect(res.statusCode, res.body).toBe(200);
     expect(res.json().data.user.email).toBe(HAPPY);
-    // NameSync's own cookie — Center's token never reaches the browser or the body.
+    // Network Intel's own cookie — Center's token never reaches the browser or the body.
     expect(res.body).not.toContain("tok:");
     expect(sessionCookie(res.headers["set-cookie"])).toBeTruthy();
     const header = ([] as string[]).concat(res.headers["set-cookie"] as string).join(";");

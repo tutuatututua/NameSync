@@ -3,7 +3,7 @@
 import * as React from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { Building2, Pencil, SearchX, UserCheck, Users } from "lucide-react";
+import { Building2, Pencil, SearchX, Users } from "lucide-react";
 import type { NameSearchRow } from "@extensions/contract";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -11,6 +11,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { PageHeader, SectionHeader } from "@/components/page-header";
 import { EmptyState } from "@/components/empty-state";
 import { StatTile, compactCount } from "@/components/stat-tile";
+import { KnownByBadge } from "@/components/network/KnownByBadge";
 import { RenameContactDialog, type EditableContact } from "@/components/network/RenameContactDialog";
 import { useNetworkSearch } from "@/hooks/queries";
 
@@ -87,16 +88,17 @@ export default function CompanyPage() {
             <StatTile
               label="Reachable by"
               value={compactCount(reachedBy.length)}
-              hint={reachedBy.length === 1 ? "uploader" : "uploaders"}
+              hint={reachedBy.length === 1 ? "relationship owner" : "relationship owners"}
             />
           </div>
 
-          {/* Feature 2b — the uploaders with a connection to *someone* here, i.e. who can get you in. */}
+          {/* Feature 2b — the relationship owners with a connection to *someone* here, i.e. who can
+              get you in. */}
           {reachedBy.length > 0 && (
             <div className="space-y-3">
               <SectionHeader
                 title="Who can reach this company"
-                description="Uploaders whose friend is connected to someone here."
+                description="Relationship owners whose friend is connected to someone here."
               />
               <div className="flex flex-wrap gap-2">
                 {reachedBy.map((u) => (
@@ -182,16 +184,14 @@ function PersonRow({ row, onEdit }: { row: NameSearchRow; onEdit: () => void }) 
           <p className="truncate font-medium">{name}</p>
           {secondary && <span className="truncate text-sm text-muted-foreground">{secondary}</span>}
         </div>
-        {/* Who in the network personally knows THIS contact — by name, each a link to their roster. */}
+        {/* Who in the network personally knows THIS contact — by name, each a link to their roster,
+            each carrying how close the match that connects them was. */}
         {row.connectedUploaders.length > 0 && (
           <div className="flex flex-wrap items-center gap-1.5 text-sm text-muted-foreground">
             <span>Known by</span>
             {row.connectedUploaders.map((u) => (
-              <Link key={u} href={`/uploaders/${encodeURIComponent(u)}`}>
-                <Badge variant="success" title="Knows this person" className="cursor-pointer">
-                  <UserCheck className="h-3 w-3" />
-                  {u}
-                </Badge>
+              <Link key={u.name} href={`/uploaders/${encodeURIComponent(u.name)}`}>
+                <KnownByBadge uploader={u} />
               </Link>
             ))}
           </div>

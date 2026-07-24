@@ -35,7 +35,7 @@ const post = (payload: unknown) =>
 function sessionCookie(setCookie: string | string[] | undefined): string | undefined {
   const headers = Array.isArray(setCookie) ? setCookie : setCookie ? [setCookie] : [];
   for (const header of headers) {
-    const match = /^namesync_session=([^;]*)/.exec(header);
+    const match = /^networkintel_session=([^;]*)/.exec(header);
     if (match && match[1]) return decodeURIComponent(match[1]);
   }
   return undefined;

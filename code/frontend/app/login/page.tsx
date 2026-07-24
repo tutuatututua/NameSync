@@ -23,15 +23,15 @@ import { ThemeToggle } from "@/components/theme-toggle";
  * and the form asks for the code, then submits again.
  *
  * The local path (`NEXT_PUBLIC_AUTH_MODE=local`) now carries the same two-step: the password
- * is only the first factor, and NameSync then emails a one-time code the form asks for — the
- * exact shape as Center's email 2FA, just minted by NameSync itself. So both real sign-in
+ * is only the first factor, and Network Intel then emails a one-time code the form asks for — the
+ * exact shape as Center's email 2FA, just minted by Network Intel itself. So both real sign-in
  * paths verify a second factor before a session is issued.
  */
 
 /**
  * Which sign-in the form drives:
  *  - `center` (default) — forward to Center; Center owns the second factor.
- *  - `local`            — NameSync's own login: password, then a one-time code it emails.
+ *  - `local`            — Network Intel's own login: password, then a one-time code it emails.
  */
 const AUTH_MODE = process.env.NEXT_PUBLIC_AUTH_MODE === "local" ? "local" : "center";
 

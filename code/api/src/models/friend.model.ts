@@ -228,11 +228,17 @@ export class FriendModel extends DBModel {
               "comparison_result.person_name_en",
               "comparison_result.person_name_th",
               "comparison_result.company_name",
+              "comparison_result.similarity",
               "comparison_result.extra",
             ])
             .where("comparison_result.comparison_id", "=", comparisonId)
             .whereRef("comparison_result.friend_name", "=", "friend.friend_name")
             .orderBy(matchedFirstSql("comparison_result.status"))
+            // Then the closest of them. This is the score-ranking the comment below says was lost:
+            // a friend who matched several contacts shows the one they matched *best*, not the one
+            // that happened to be inserted first. NULLs last, so a matcher that scores some pairs
+            // and not others never lets an unscored row outrank a scored one.
+            .orderBy(sql`comparison_result.similarity desc nulls last`)
             .orderBy("comparison_result.id", "asc")
             .limit(1)
             .as("best"),
@@ -263,6 +269,11 @@ export class FriendModel extends DBModel {
         effectiveStatusSql("friend.status", hasMatch).as("status"),
         "best.person_name_en as matchedName",
         "best.person_name_th as matchedNameTh",
+        // How close it was. Carried from the result row, because that is the only place a score
+        // for an import exists — `friend` has no such column, and never will: a score is a fact
+        // about a *pair*, not about a name. Null on a run whose matcher reported only verdicts,
+        // which is what makes the column hideable (see ComparisonResultModel.hasSimilarity).
+        "best.similarity as similarity",
         // The result row's own answer first; the by-name lookup only for rows that never recorded
         // one. With several companies in scope the lookup is a guess (two employers can share a
         // name), so it must never overrule a matcher that actually knows — the same precedence
@@ -283,15 +294,25 @@ export class FriendModel extends DBModel {
      *
      * Once it stops moving that reason is gone, and import order becomes the problem instead —
      * the four matches of a 320-row run are scattered across 13 pages and the first screen is
-     * whichever names happened to be inserted first. `friend.id` breaks the tie, which it now has
-     * to do far more often: every match ranks equal, where the score used to order them.
+     * whichever names happened to be inserted first.
+     *
+     * All three sorts are real here now that the match's score comes back with it. `similarity`
+     * ranks every row by closeness; `status` brings the matches up and orders them by closeness
+     * within, so the strongest match is the first thing on the page rather than whichever name the
+     * file happened to list first. On a run whose matcher recorded no score both fall back to
+     * `friend.id`, which is the old behaviour exactly — and the client does not offer "Best match"
+     * there at all (see ComparisonProgress.hasSimilarity).
      */
+    const byScore = sql`best.similarity desc nulls last`;
     const ordered =
-      sort === "status"
-        ? selected
-            .orderBy(sql`case when ${verdict} = ${sql.val("matched")} then 0 else 1 end`)
-            .orderBy("friend.id", "asc")
-        : selected.orderBy("friend.id", "asc");
+      sort === "similarity"
+        ? selected.orderBy(byScore).orderBy("friend.id", "asc")
+        : sort === "status"
+          ? selected
+              .orderBy(sql`case when ${verdict} = ${sql.val("matched")} then 0 else 1 end`)
+              .orderBy(byScore)
+              .orderBy("friend.id", "asc")
+          : selected.orderBy("friend.id", "asc");
 
     const [data, countResult] = await Promise.all([
       ordered.limit(limit).offset(offset).execute(),

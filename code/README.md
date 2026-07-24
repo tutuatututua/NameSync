@@ -1,20 +1,25 @@
 # Network Intel
 
-Upload **Company data** and **Facebook friends** (both `.xlsx`), forward both to an external
-name-matching service, watch progress live over WebSocket, and review the **name matches** it
-found — with history and saved comparisons.
+Upload **Company data** and **Facebook friends** (either as `.xlsx`, `.csv` or `.json`), forward
+both to an external name-matching service, watch progress live over WebSocket, and review the
+**name matches** it found — with history and saved comparisons.
+
+Every import is filed under a **relationship owner** — the person whose contacts they are. It is
+required for a friends import (it is half the dedup key: same owner + same name = duplicate) and an
+audit note on a company one. On the wire and in the database it is still `uploadPersonName` /
+`uploaded_by`; "relationship owner" is what the screens call it.
 
 The home page is the **Network** workspace, two tabs over the same stored data (a run is created by
 importing — the external matcher matches each import against everything on file — so there is no
 manual "compare" step in the everyday flow):
 
-- **Overview** — per roster (an uploader, or everyone): how many **friends** they uploaded, how
+- **Overview** — per roster (a relationship owner, or everyone): how many **friends** they uploaded, how
   many of those **matched** vs **no match**, and how many **companies** they reach ("known"), plus
   the history of every comparison run (`GET /api/network/overview?uploader=`). Clicking a reached
   company opens the Search tab, prefiltered to it. A secondary "Find connections" action covers the
   ad-hoc case (`POST /api/comparisons/compare`), handing off to the run's own page.
 - **Search** — look a person up by name to see which company they're in, **who knows them**, and
-  **which uploaders reach that company** (`GET /api/network/search?q=`). Rename a contact inline
+  **which relationship owners reach that company** (`GET /api/network/search?q=`). Rename a contact inline
   when someone leaves or a name changes (`PATCH /api/comparisons/company-data/:uuid`); the rename is
   cleaned the same way an import is, so it stays matchable, and past runs are frozen snapshots left
   unchanged.

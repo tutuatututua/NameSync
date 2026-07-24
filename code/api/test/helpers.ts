@@ -14,14 +14,17 @@ export async function truncateAll(): Promise<void> {
 }
 
 /**
- * Both sources upload .xlsx, so every helper here posts a real workbook. The rows are still
- * *written* as CSV text (`csv`) or as name/timestamp pairs (`friends`) — that is the fixture
- * these tests are about — and are turned into a workbook on the way out.
+ * Every helper here posts a real file. The rows are *written* as CSV text (`csv`) or as
+ * name/timestamp pairs (`friends`) — that is the fixture these tests are about — and are rendered
+ * into whichever accepted format the test asks for on the way out. `format` defaults to `xlsx`
+ * because that is what the everyday export is; a test naming another one is a test about the
+ * format itself.
  *
  * The friends fixture still carries a timestamp because the real export does, and a fixture that
  * dropped it would stop testing the file we actually receive. Nothing reads it any more: the
  * column is one of the ones the import ignores.
  */
+export type UploadFormat = "xlsx" | "csv" | "json";
 export const DEFAULT_CSV =
   "company_name,thai_name,eng_name\nAcme Co,สมชาย,Somchai\nBeta Ltd,อนงค์,Anong\n";
 export const DEFAULT_FRIENDS: [string, number][] = [
@@ -30,13 +33,45 @@ export const DEFAULT_FRIENDS: [string, number][] = [
 ];
 
 const XLSX_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+const CONTENT_TYPE: Record<UploadFormat, string> = {
+  xlsx: XLSX_TYPE,
+  csv: "text/csv",
+  json: "application/json",
+};
 
-/** Attach a workbook (or, for the rejection tests, whatever bytes `raw` says) to a form. */
+/** The company fixture, in the requested format. CSV is the fixture's own text, unchanged. */
+async function companyBody(csv: string, format: UploadFormat): Promise<Buffer> {
+  if (format === "csv") return Buffer.from(csv, "utf8");
+  if (format === "json") {
+    const [header = "", ...lines] = csv.split("\n").filter((l) => l.trim() !== "");
+    const keys = header.split(",");
+    const rows = lines.map((line) => Object.fromEntries(line.split(",").map((cell, i) => [keys[i], cell])));
+    return Buffer.from(JSON.stringify(rows), "utf8");
+  }
+  return csvToXlsx(csv);
+}
+
+/** The friends fixture, in the requested format — JSON is shaped like the real export's wrapper. */
+async function friendsBody(friends: [string, number][], format: UploadFormat): Promise<Buffer> {
+  if (format === "csv") {
+    return Buffer.from(`name,timestamp\n${friends.map(([n, t]) => `"${n}",${t}`).join("\n")}\n`, "utf8");
+  }
+  if (format === "json") {
+    return Buffer.from(
+      JSON.stringify({ friends_v2: friends.map(([name, timestamp]) => ({ name, timestamp })) }),
+      "utf8"
+    );
+  }
+  return friendsXlsx(friends);
+}
+
+/** Attach a file (or, for the rejection tests, whatever bytes `raw` says) to a form. */
 async function attach(
   form: FormData,
   opts: {
     csv?: string;
     friends?: [string, number][];
+    format?: UploadFormat;
     raw?: { field: "companyFile" | "facebookFile"; body: Buffer | string; filename: string };
     filename?: string;
   }
@@ -45,16 +80,17 @@ async function attach(
     form.append(opts.raw.field, Buffer.from(opts.raw.body), { filename: opts.raw.filename });
     return;
   }
+  const format = opts.format ?? "xlsx";
   if (opts.csv !== undefined) {
-    form.append("companyFile", await csvToXlsx(opts.csv), {
-      filename: opts.filename ?? "company.xlsx",
-      contentType: XLSX_TYPE,
+    form.append("companyFile", await companyBody(opts.csv, format), {
+      filename: opts.filename ?? `company.${format}`,
+      contentType: CONTENT_TYPE[format],
     });
   }
   if (opts.friends !== undefined) {
-    form.append("facebookFile", await friendsXlsx(opts.friends), {
-      filename: opts.filename ?? "friends.xlsx",
-      contentType: XLSX_TYPE,
+    form.append("facebookFile", await friendsBody(opts.friends, format), {
+      filename: opts.filename ?? `friends.${format}`,
+      contentType: CONTENT_TYPE[format],
     });
   }
 }
@@ -65,6 +101,7 @@ export async function previewUpload(
   opts: {
     csv?: string;
     friends?: [string, number][];
+    format?: UploadFormat;
     raw?: { field: "companyFile" | "facebookFile"; body: Buffer | string; filename: string };
     filename?: string;
   }
@@ -79,27 +116,28 @@ export async function previewUpload(
   });
 }
 
-/** Import one company workbook via /run (creates an `upload`, stacks its rows). */
+/** Import one company file via /run (creates an `upload`, stacks its rows). `owner` is the
+ *  relationship owner the import is filed under — the `uploadPersonName` field on the wire. */
 export async function importCompany(
   app: FastifyInstance,
-  opts: { csv?: string; uploader?: string; name?: string } = {}
+  opts: { csv?: string; owner?: string; format?: UploadFormat; name?: string } = {}
 ) {
   const form = new FormData();
   form.append("name", opts.name ?? "Company import");
-  form.append("uploadPersonName", opts.uploader ?? "Tester");
-  await attach(form, { csv: opts.csv ?? DEFAULT_CSV });
+  form.append("uploadPersonName", opts.owner ?? "Tester");
+  await attach(form, { csv: opts.csv ?? DEFAULT_CSV, format: opts.format });
   return app.inject({ method: "POST", url: "/api/comparisons/run", payload: form, headers: form.getHeaders() });
 }
 
-/** Import one Facebook friends workbook via /run. */
+/** Import one Facebook friends file via /run. */
 export async function importFacebook(
   app: FastifyInstance,
-  opts: { friends?: [string, number][]; uploader?: string; name?: string } = {}
+  opts: { friends?: [string, number][]; owner?: string; format?: UploadFormat; name?: string } = {}
 ) {
   const form = new FormData();
   form.append("name", opts.name ?? "Facebook import");
-  form.append("uploadPersonName", opts.uploader ?? "Tester");
-  await attach(form, { friends: opts.friends ?? DEFAULT_FRIENDS });
+  form.append("uploadPersonName", opts.owner ?? "Tester");
+  await attach(form, { friends: opts.friends ?? DEFAULT_FRIENDS, format: opts.format });
   return app.inject({ method: "POST", url: "/api/comparisons/run", payload: form, headers: form.getHeaders() });
 }
 

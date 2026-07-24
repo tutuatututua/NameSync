@@ -15,7 +15,9 @@ import type { RowVerdict, RunRow } from "@extensions/contract";
 export type RunRowFilter = RowVerdict | "all";
 
 /** See RunRowsQuerySchema — `row` is import order, `status` is matches-first, `similarity` is
- *  best-match-first (only meaningful for a compare run, whose rows carry a score). */
+ *  best-match-first. All three are honoured by all three readers; on a run whose matcher recorded
+ *  no score the two score-aware ones simply fall back to row order, and the client does not offer
+ *  "Best match" for it (see ComparisonProgress.hasSimilarity). */
 export type RunRowSort = "row" | "status" | "similarity";
 
 /**
@@ -50,8 +52,10 @@ export interface RawRunRow {
   matchedName: string | null;
   matchedNameTh: string | null;
   matchedContext: string | null;
-  /** In [0, 1], or null/absent. Only the `comparison_result` reader selects a real value; the
-   *  import readers (friend / company_contact) have no score column and don't select it at all. */
+  /** In [0, 1], or null/absent. The compare reader selects it from the row itself; the import
+   *  readers (friend / company_contact) carry it over from the `comparison_result` row they
+   *  joined — the tables they read have no score column, because a score is a fact about a pair.
+   *  Null on a run whose matcher recorded none. */
   similarity?: number | null;
   extras: string | null;
 }

@@ -59,12 +59,12 @@ export const AuthSessionDataSchema = z.object({ user: AuthUserSchema });
 export type AuthSessionData = z.infer<typeof AuthSessionDataSchema>;
 
 // ── Center sign-in ────────────────────────────────────────────────────────────
-// The production login. NameSync's own form posts here; the API forwards the
+// The production login. Network Intel's own form posts here; the API forwards the
 // credentials to Center (centerapp.io), and on success mints its OWN session cookie —
 // Center's token is used once and discarded. See docs/AUTH.md and
 // docs/wayfinder/assets/06-center-sso-integration-spec.md.
 //
-// The two second factors NameSync relays. SMS is deliberately excluded: a Center account
+// The two second factors Network Intel relays. SMS is deliberately excluded: a Center account
 // set to SMS 2FA is rejected with a clear message rather than half-supported.
 export const TwoFactorMethodSchema = z.enum(['totp', 'email']);
 export type TwoFactorMethod = z.infer<typeof TwoFactorMethodSchema>;
@@ -101,9 +101,9 @@ export type TwoFactorChallenge = z.infer<typeof TwoFactorChallengeSchema>;
 export const CenterLoginDataSchema = z.union([AuthSessionDataSchema, TwoFactorChallengeSchema]);
 export type CenterLoginData = z.infer<typeof CenterLoginDataSchema>;
 
-// ── Email-OTP sign-in (NameSync-owned) ─────────────────────────────────────────
-// A second login path that NameSync runs itself — no external issuer. Two factors:
-// the account password, then a one-time code NameSync generates and emails. It works
+// ── Email-OTP sign-in (Network Intel-owned) ─────────────────────────────────────────
+// A second login path that Network Intel runs itself — no external issuer. Two factors:
+// the account password, then a one-time code Network Intel generates and emails. It works
 // in every environment (unlike the dev-only local /login), and unlike Center the code
 // is minted and sent from here (api/src/services/otp-auth.service.ts).
 //

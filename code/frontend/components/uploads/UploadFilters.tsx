@@ -45,7 +45,7 @@ export function UploadFilters({
           <Input
             value={value.search}
             onChange={(e) => set({ search: e.target.value })}
-            placeholder="name, uploaded by, session id…"
+            placeholder="name, relationship owner, session id…"
             className="pl-9"
             aria-label="Search uploads"
           />

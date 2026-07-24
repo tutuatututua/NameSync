@@ -5,7 +5,7 @@ import { ServiceUnavailable } from "./errors";
 /**
  * Outbound email, over SMTP (nodemailer).
  *
- * There is exactly one thing NameSync emails today — a sign-in code — so that is the whole
+ * There is exactly one thing Network Intel emails today — a sign-in code — so that is the whole
  * surface here. The transport is built once, lazily, from the SMTP_* env (config/env.ts).
  *
  * When SMTP is not configured the mailer does NOT fail silently: in development it logs the
@@ -42,14 +42,14 @@ export type LogFn = (msg: string) => void;
  */
 export async function sendLoginCode(to: string, code: string, log?: LogFn): Promise<void> {
   const ttl = env.OTP_TTL_MINUTES;
-  const subject = "Your NameSync sign-in code";
+  const subject = "Your Network Intel sign-in code";
   const text =
-    `Your NameSync sign-in code is ${code}.\n\n` +
+    `Your Network Intel sign-in code is ${code}.\n\n` +
     `It expires in ${ttl} minute${ttl === 1 ? "" : "s"}. ` +
     `If you didn't try to sign in, you can ignore this email.`;
   const html =
     `<div style="font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;max-width:420px">` +
-    `<p style="font-size:14px;color:#334155">Your NameSync sign-in code is</p>` +
+    `<p style="font-size:14px;color:#334155">Your Network Intel sign-in code is</p>` +
     `<p style="font-size:30px;font-weight:700;letter-spacing:6px;margin:12px 0;color:#0f172a">${code}</p>` +
     `<p style="font-size:13px;color:#64748b">It expires in ${ttl} minute${ttl === 1 ? "" : "s"}. ` +
     `If you didn't try to sign in, you can ignore this email.</p></div>`;

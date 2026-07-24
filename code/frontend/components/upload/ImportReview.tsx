@@ -98,7 +98,7 @@ const renderCell = (m: ColumnMapping, row: Record<string, string | null>) => {
 export function ImportReview({ source, file, onCancel, onComplete }: Props) {
   const isCompany = source === "company";
   const router = useRouter();
-  const [uploader, setUploader] = React.useState("");
+  const [owner, setOwner] = React.useState("");
 
   /**
    * The import landed but added nothing, so no run was opened and there is nowhere to go.
@@ -122,18 +122,19 @@ export function ImportReview({ source, file, onCancel, onComplete }: Props) {
     runPreview(form);
   }, [file, source, runPreview]);
 
-  // The uploader is half the dedup key for friends (same uploader + same name = duplicate),
+  // The relationship owner is half the dedup key for friends (same owner + same name = duplicate),
   // so a Facebook import can't do without one. Company rows dedupe on their own contents.
-  const uploaderRequired = !isCompany;
+  const ownerRequired = !isCompany;
   const data = preview.data;
   const busy = run.isPending;
-  const canImport = !!data && data.totalRows > 0 && (!uploaderRequired || !!uploader.trim()) && !busy;
+  const canImport = !!data && data.totalRows > 0 && (!ownerRequired || !!owner.trim()) && !busy;
 
   async function commit() {
     if (!canImport || !data) return;
     const form = new FormData();
     form.append(fieldName(source), file);
-    form.append("uploadPersonName", uploader.trim());
+    // The wire field keeps its name; what it carries is the import's relationship owner.
+    form.append("uploadPersonName", owner.trim());
     form.set("name", file.name); // the upload's name is the file it came from
     try {
       // One request does the whole job — the server forwards the new rows to the ingestion
@@ -226,25 +227,25 @@ export function ImportReview({ source, file, onCancel, onComplete }: Props) {
 
           <div className="flex flex-wrap items-end justify-between gap-4 border-t pt-5">
             <div className="w-full max-w-xs space-y-1.5">
-              <Label htmlFor="import-uploader" className="text-xs">
-                Upload user{" "}
-                {uploaderRequired ? (
+              <Label htmlFor="import-relationship-owner" className="text-xs">
+                Relationship owner{" "}
+                {ownerRequired ? (
                   <span className="text-destructive">*</span>
                 ) : (
                   <span className="font-normal text-muted-foreground">(optional)</span>
                 )}
               </Label>
               <Input
-                id="import-uploader"
-                value={uploader}
-                onChange={(e) => setUploader(e.target.value)}
+                id="import-relationship-owner"
+                value={owner}
+                onChange={(e) => setOwner(e.target.value)}
                 placeholder="e.g. Alex"
                 disabled={busy}
               />
               <p className="text-xs text-muted-foreground">
-                {uploaderRequired
-                  ? "Friends are deduplicated per uploader, so this is required."
-                  : "Recorded as who imported the file. Company rows dedupe on their own contents."}
+                {ownerRequired
+                  ? "Friends are deduplicated per relationship owner, so this is required."
+                  : "Recorded as the relationship owner for these rows. Company rows dedupe on their own contents."}
               </p>
             </div>
 

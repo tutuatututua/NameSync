@@ -1,12 +1,13 @@
 import ExcelJS from 'exceljs';
 import { BadRequest } from './errors';
+import { assertUniqueHeaders, type Sheet } from './sheet';
 
 /**
- * Reads a spreadsheet into headers + row objects — the one shape both imports parse from.
+ * Reads a spreadsheet into headers + row objects — one of the readers behind `readTable`
+ * (table-file.ts), and the shape all of them produce.
  *
- * Company data and Facebook friends now arrive as .xlsx, so there is a single reader and a
- * single set of failure messages. A row is keyed by its header text, exactly like the CSV
- * reader this replaces, which is what lets the column-mapping code above it stay unchanged.
+ * A row is keyed by its header text, exactly as the .csv and .json readers key theirs, which is
+ * what lets the column-mapping code above them be written once and stay format-blind.
  *
  * Only the first worksheet is read. A workbook whose second tab holds the real data is a
  * different file than the one the preview showed, and guessing which tab was meant is the
@@ -31,12 +32,7 @@ function cellText(value: ExcelJS.CellValue): string {
   return String(value);
 }
 
-export interface Sheet {
-  /** Header texts, in column order, as written in row 1. */
-  headers: string[];
-  /** One object per data row, keyed by header. */
-  rows: Record<string, string>[];
-}
+export type { Sheet };
 
 /**
  * Read the first worksheet: row 1 is the header, the rest are data.
@@ -63,24 +59,9 @@ export async function readSheet(filePath: string): Promise<Sheet> {
     headers.push(cellText(headerRow.getCell(c).value).trim());
   }
 
-  // Two columns under one header is refused, not resolved. A row is keyed by header text, so a
-  // repeat silently overwrites: the earlier column's data vanishes, and — worse — the mapping
-  // resolves to the FIRST such header while the row object holds the LAST one's values, so the
-  // preview shows one column and the import reads another. Which of the two was meant is not
-  // knowable here, and a wrong guess imports the wrong column under a preview that agreed with it.
-  const duplicates = [
-    ...new Set(
-      headers.filter((h) => h !== '').filter((h, i, all) => all.indexOf(h) !== i)
-    ),
-  ];
-  if (duplicates.length > 0) {
-    const named = duplicates.map((h) => `“${h}”`).join(', ');
-    throw new BadRequest(
-      duplicates.length === 1
-        ? `Two columns share the header ${named}. Rename or remove one so it's clear which to import.`
-        : `Several columns share headers: ${named}. Rename or remove the duplicates so it's clear which to import.`
-    );
-  }
+  // Shared with the other readers: a repeated header is refused rather than resolved. See
+  // assertUniqueHeaders (sheet.ts) for why guessing is worse than stopping.
+  assertUniqueHeaders(headers);
 
   const rows: Record<string, string>[] = [];
   for (let r = 2; r <= sheet.rowCount; r++) {

@@ -96,7 +96,7 @@ export function OverviewTab() {
               <StatTile
                 label="Friends"
                 value={isLoading ? "" : compactCount(friends)}
-                hint={uploader ? "uploaded by this person" : "uploaded, all rosters"}
+                hint={uploader ? "on this owner's list" : "uploaded, all owners"}
                 isLoading={isLoading}
               />
               <StatTile

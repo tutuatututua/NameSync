@@ -17,12 +17,14 @@ import { UploadersTab } from "@/components/network/UploadersTab";
  * jobs through a single state machine — which is what made it confusing. Now the name matches the
  * work and each job has its own tab:
  *
- * Left to right — Company · Uploaders · Search, with Company the home (the URL default):
+ * Left to right — Company · Relationship owners · Search, with Company the home (the URL default):
  *   · Company   — the state of your network: which companies your friends reach, how many friends
  *     you've uploaded, and the history of every comparison run. A company row opens the company's
  *     own page (`/companies/:name`).
- *   · Uploaders — search a person who uploaded friends and see how many of their names matched vs.
- *     didn't; a row opens the roster's own page (`/uploaders/:name`) with the actual names.
+ *   · Relationship owners — search an owner and see how many of their names matched vs. didn't; a
+ *     row opens the roster's own page (`/uploaders/:name`) with the actual names. The tab value and
+ *     the route keep the older "uploaders" spelling — they are links people have, and only the
+ *     wording on screen changed.
  *   · Search    — look a person up by name: which company they're in, and who in your network knows
  *     them. Editing a contact's name lives here, inline.
  *
@@ -34,7 +36,7 @@ import { UploadersTab } from "@/components/network/UploadersTab";
  * The tab lives in the URL (`?tab=`), so it's linkable and the back button works.
  */
 
-// Left-to-right: Company · Uploaders · Search. "company" is the home tab (the URL default), so it
+// Left-to-right: Company · Relationship owners · Search. "company" is the home tab (the URL default), so it
 // maps to a bare "/"; the other two carry a `?tab=`. The internal value "company" replaced
 // "overview" when the tab was renamed — the component behind it is still the network snapshot.
 type TabValue = "company" | "uploaders" | "search";
@@ -75,7 +77,7 @@ function NetworkWorkspace() {
             <Building2 className="h-4 w-4" /> Company
           </TabsTrigger>
           <TabsTrigger value="uploaders" className="gap-1.5">
-            <Users className="h-4 w-4" /> Uploaders
+            <Users className="h-4 w-4" /> Relationship owners
           </TabsTrigger>
           <TabsTrigger value="search" className="gap-1.5">
             <Search className="h-4 w-4" /> Search

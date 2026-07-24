@@ -18,6 +18,7 @@ import {
 } from "@/components/uploads/UploadFilters";
 import { useUploadSessions } from "@/hooks/queries";
 import { formatDate } from "@/lib/format";
+import { UPLOAD_ACCEPT } from "@/lib/files";
 
 /**
  * Uploads — the import lifecycle, in the order you live it: put a file in, check what it
@@ -86,16 +87,16 @@ function ImportSection() {
         source="company"
         icon={Building2}
         title="Company data"
-        subtitle="A company Excel export"
-        accept={[".xlsx"]}
+        subtitle="A company export — Excel, CSV or JSON"
+        accept={UPLOAD_ACCEPT}
         onFile={(file) => setPicked({ source: "company", file })}
       />
       <DropCard
         source="facebook"
         icon={Users}
         title="Facebook data"
-        subtitle="A Facebook friends Excel export"
-        accept={[".xlsx"]}
+        subtitle="A Facebook friends export — Excel, CSV or JSON"
+        accept={UPLOAD_ACCEPT}
         onFile={(file) => setPicked({ source: "facebook", file })}
       />
     </div>
@@ -113,7 +114,7 @@ function DropCard({
   icon: typeof Building2;
   title: string;
   subtitle: string;
-  accept: string[];
+  accept: readonly string[];
   onFile: (file: File) => void;
 }) {
   return (
@@ -132,7 +133,7 @@ function DropCard({
           accept={accept}
           file={null}
           onChange={(f) => f && onFile(f)}
-          title={`Drop ${accept[0].replace(".", "").toUpperCase()}`}
+          title="Drop a file"
           hint="or browse"
           className="min-h-[11rem]"
         />
@@ -230,7 +231,7 @@ function SessionsList() {
     { key: "upload_type", header: "Type", render: (r) => typeBadge(r.upload_type) },
     {
       key: "uploaded_by",
-      header: "Uploaded by",
+      header: "Relationship owner",
       className: "text-muted-foreground",
       render: (r) => r.uploaded_by ?? "—",
     },
@@ -263,7 +264,7 @@ function SessionsList() {
         onPageChange={setPage}
         isLoading={q.isLoading}
         emptyTitle="No imports yet"
-        emptyText="Drop a company or Facebook .xlsx export above to get started."
+        emptyText="Drop a company or Facebook export above (.xlsx, .csv or .json) to get started."
       />
     </div>
   );

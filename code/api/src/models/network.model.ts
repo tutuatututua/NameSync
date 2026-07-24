@@ -2,6 +2,7 @@ import { DBModel } from "@extensions/sqldb";
 import { sql, type SqlBool } from "kysely";
 import type {
   CompanyConnection,
+  ConnectedUploader,
   NameSearchRow,
   PaginatedResult,
   UploaderStats,
@@ -25,12 +26,35 @@ import { rowVerdictSql } from "./row-status";
 /** `%` and `_` are ILIKE wildcards — a search for a literal one must not widen the match. */
 const escapeLike = (s: string): string => s.replace(/[\\%_]/g, (m) => `\\${m}`);
 
+/**
+ * A similarity as it comes back from Postgres, as a number or null.
+ *
+ * `real` arrives as a JS number, but the column is applied by hand against a live database (see
+ * add-similarity.sql) and a `numeric` there would arrive as a *string* — which would sail through
+ * a `number | null` type and reach the page as "0.83" where a percent belongs. Cheap to rule out.
+ */
+const score = (v: unknown): number | null => {
+  const n = typeof v === "string" ? Number(v) : v;
+  return typeof n === "number" && Number.isFinite(n) ? n : null;
+};
+
 /** "Is this comparison_result row a match?", over an arbitrarily-aliased status column. */
 const matchedFor = (statusColumn: string) => sql`${rowVerdictSql(statusColumn)} = ${sql.val("matched")}`;
 
 /** The same, typed as a boolean for a top-level `.where(...)` on `comparison_result`. */
 const matched = (): ReturnType<typeof sql<SqlBool>> =>
   sql<SqlBool>`${rowVerdictSql("comparison_result.status")} = ${sql.val("matched")}`;
+
+/**
+ * Its negation — every row a run decided against, plus the ones it never finished.
+ *
+ * `<>` rather than `not (…)` because the verdict expression is a CASE with an ELSE and so is never
+ * NULL: the two are equivalent here, and one of them stays readable in the generated SQL. Pending
+ * and failed rows fall in this bucket, which is right for the only thing it feeds — the near miss
+ * shown beside an unplaced friend. A row still being worked on has no match to show either.
+ */
+const notMatched = (): ReturnType<typeof sql<SqlBool>> =>
+  sql<SqlBool>`${rowVerdictSql("comparison_result.status")} <> ${sql.val("matched")}`;
 
 export class NetworkModel extends DBModel {
   /**
@@ -120,8 +144,13 @@ export class NetworkModel extends DBModel {
    * `matchedByCompany` is one section per company the roster reaches, each listing the friends who
    * landed there — with the matched contact's English and Thai names alongside the uploaded name,
    * because a friend list carries one name each and the contact side is where an English spelling
-   * lives. A friend at several companies appears under each. `noMatchNames` is the rest of the
+   * lives. A friend at several companies appears under each. `noMatchPeople` is the rest of the
    * roster: friends with no connection on file, the actionable half ("who still needs an intro").
+   *
+   * Those carry a near miss where a run recorded one — see `NoMatchPerson`. The friend row itself
+   * has nothing but a name, so the Thai name and company beside an unplaced friend are the closest
+   * CONTACT's, not theirs: the thing the matcher looked at and turned down. That is a different
+   * claim from the one `matchedByCompany` makes and is worded as one everywhere it surfaces.
    *
    * The counts mirror `uploaderStats`/`overview` (friends = roster, matched = distinct matched,
    * `noMatch = friends − matched`) so the detail page reconciles with the tab that linked to it.
@@ -133,7 +162,7 @@ export class NetworkModel extends DBModel {
     const db = await this.getKyselyDB();
     const key = name.toLowerCase();
 
-    const [rosterRows, matchedRows] = await Promise.all([
+    const [rosterRows, matchedRows, nearMissRows] = await Promise.all([
       // The roster: distinct friend names this uploader contributed, one display spelling each.
       db
         .selectFrom("friend")
@@ -149,8 +178,9 @@ export class NetworkModel extends DBModel {
         .orderBy(sql`min(friend.friend_name) asc`)
         .execute(),
       // The matched pairs of this uploader, one row per (company, friend), carrying the matched
-      // contact's English and Thai names. Grouped case-folded on both sides; `min` keeps one
-      // display spelling. `company` is null-selected here but the rows are read below.
+      // contact's English and Thai names and how close the match was. Grouped case-folded on both
+      // sides; `min` keeps one display spelling. `company` is null-selected here but the rows are
+      // read below.
       db
         .selectFrom("comparison_result")
         .select([
@@ -159,6 +189,11 @@ export class NetworkModel extends DBModel {
           sql<string>`min(comparison_result.friend_name)`.as("friend"),
           sql<string | null>`min(comparison_result.person_name_en)`.as("en"),
           sql<string | null>`min(comparison_result.person_name_th)`.as("th"),
+          // `max`, not `min` like the display names: these rows fold every run on file, so the same
+          // pairing may have been scored several times, and the best score is the strongest
+          // evidence we have that they are the same person. `max` also ignores NULLs, so one run
+          // that recorded no score cannot blank a pairing another run did score.
+          sql<number | null>`max(comparison_result.similarity)`.as("similarity"),
         ])
         .where(sql`lower(comparison_result.upload_name)`, "=", key)
         .where("comparison_result.friend_name", "is not", null)
@@ -167,6 +202,40 @@ export class NetworkModel extends DBModel {
         .orderBy(sql`min(comparison_result.company_name) asc`)
         .orderBy(sql`min(comparison_result.friend_name) asc`)
         .execute(),
+      // The near miss for every friend a run decided against: the closest contact it considered,
+      // and how close that got. Only ever read for friends who ended up in the no-match list, but
+      // selected for all of them in one pass rather than per name.
+      //
+      // DISTINCT ON rather than the GROUP BY + min/max the matched query uses, because these four
+      // columns describe ONE contact and must come from one row. Aggregating them independently
+      // would compose a person who does not exist — the highest score from one candidate, the Thai
+      // name of another, the employer of a third — and present them as the near miss.
+      db
+        .selectFrom("comparison_result")
+        .distinctOn(sql`lower(comparison_result.friend_name)`)
+        .select([
+          sql<string>`lower(comparison_result.friend_name)`.as("friendKey"),
+          "comparison_result.person_name_en as en",
+          "comparison_result.person_name_th as th",
+          "comparison_result.company_name as company",
+          "comparison_result.similarity as similarity",
+        ])
+        .where(sql`lower(comparison_result.upload_name)`, "=", key)
+        .where("comparison_result.friend_name", "is not", null)
+        .where(notMatched())
+        .orderBy(sql`lower(comparison_result.friend_name)`)
+        // A row that names somebody beats one that names nobody, whatever it scored: a matcher
+        // that reported a bare verdict on its best candidate and a name on a worse one still only
+        // has one row worth showing. Then the closest of what is left, then insertion order — the
+        // same "best, then stable" tie-break every other reader of this table applies.
+        .orderBy(
+          sql`case when comparison_result.person_name_en is not null
+                     or comparison_result.person_name_th is not null
+                     or comparison_result.company_name is not null then 0 else 1 end`
+        )
+        .orderBy(sql`comparison_result.similarity desc nulls last`)
+        .orderBy("comparison_result.id", "asc")
+        .execute(),
     ]);
 
     // Distinct matched friends — the count, regardless of whether the match named a company.
@@ -174,7 +243,10 @@ export class NetworkModel extends DBModel {
 
     // Group the company-bearing matches into one section per company, preserving row order (already
     // company-then-friend sorted). Matches with no company are counted but have nowhere to group.
-    const groups = new Map<string, { company: string; people: { friend: string; en: string | null; th: string | null }[] }>();
+    const groups = new Map<
+      string,
+      { company: string; people: { friend: string; en: string | null; th: string | null; similarity: number | null }[] }
+    >();
     for (const r of matchedRows as any[]) {
       const company = r.company as string | null;
       if (!company) continue;
@@ -184,17 +256,37 @@ export class NetworkModel extends DBModel {
         g = { company, people: [] };
         groups.set(gkey, g);
       }
-      g.people.push({ friend: r.friend as string, en: (r.en as string | null) ?? null, th: (r.th as string | null) ?? null });
+      g.people.push({
+        friend: r.friend as string,
+        en: (r.en as string | null) ?? null,
+        th: (r.th as string | null) ?? null,
+        // `numeric`/`real` can arrive as a string from node-postgres depending on the column type,
+        // and a string here would reach the page and render as "0.83" where a percent belongs.
+        similarity: score(r.similarity),
+      });
     }
     // Strongest first, then alphabetical — the Overview's own ordering for reached companies.
     const matchedByCompany = [...groups.values()].sort(
       (a, b) => b.people.length - a.people.length || a.company.localeCompare(b.company)
     );
 
-    // The roster minus whoever matched (any company) — the friends still without a connection.
-    const noMatchNames = (rosterRows as any[])
+    const nearMissByKey = new Map((nearMissRows as any[]).map((r) => [r.friendKey as string, r]));
+
+    // The roster minus whoever matched (any company) — the friends still without a connection,
+    // each carrying the closest contact a run turned down for them, where there was one.
+    const noMatchPeople = (rosterRows as any[])
       .filter((r) => !matchedFriendKeys.has(r.key as string))
-      .map((r) => r.name as string);
+      .map((r) => {
+        const near = nearMissByKey.get(r.key as string);
+        return {
+          friend: r.name as string,
+          en: (near?.en as string | null) ?? null,
+          th: (near?.th as string | null) ?? null,
+          company: (near?.company as string | null) ?? null,
+          // Same string-vs-number guard as the matched rows above, for the same column.
+          similarity: score(near?.similarity),
+        };
+      });
 
     const friends = (rosterRows as any[]).length;
     const matchedCount = matchedFriendKeys.size;
@@ -204,7 +296,7 @@ export class NetworkModel extends DBModel {
       matched: matchedCount,
       noMatch: Math.max(0, friends - matchedCount),
       matchedByCompany,
-      noMatchNames,
+      noMatchPeople,
     };
   }
 
@@ -319,17 +411,28 @@ export class NetworkModel extends DBModel {
               and lower(cr.company_name) = lower(company_contact.company_name)
               and ${matchedFor("cr.status")}
           )`.as("companyConnections"),
-          sql<string[]>`array(
-            select distinct cr.upload_name
-            from comparison_result cr
-            where cr.upload_name is not null
-              and ${matchedFor("cr.status")}
-              and (
-                cr.person_name_en = company_contact.person_name_en
-                or cr.person_name_th = company_contact.person_name_th
-              )
-            order by cr.upload_name
-          )`.as("connectedUploaders"),
+          // Who knows THIS contact, and how close their match was. Grouped by uploader and taking
+          // the best score, because one uploader may have matched this contact in several runs (or
+          // via two friends whose names both resemble theirs) and the strongest is the one that
+          // says how confident the connection is. Objects rather than bare names — see
+          // ConnectedUploader — built as jsonb because a Postgres array cannot carry a pair.
+          sql<{ name: string; similarity: unknown }[]>`coalesce((
+            select jsonb_agg(
+              jsonb_build_object('name', u.name, 'similarity', u.similarity)
+              order by u.name
+            )
+            from (
+              select cr.upload_name as name, max(cr.similarity) as similarity
+              from comparison_result cr
+              where cr.upload_name is not null
+                and ${matchedFor("cr.status")}
+                and (
+                  cr.person_name_en = company_contact.person_name_en
+                  or cr.person_name_th = company_contact.person_name_th
+                )
+              group by cr.upload_name
+            ) u
+          ), '[]'::jsonb)`.as("connectedUploaders"),
           sql<string[]>`array(
             select distinct cr.upload_name
             from comparison_result cr
@@ -352,6 +455,15 @@ export class NetworkModel extends DBModel {
     ]);
 
     const arr = (v: unknown): string[] => (Array.isArray(v) ? (v as string[]) : []);
+    // The jsonb pairs above, as the contract's ConnectedUploader. Nameless entries are dropped
+    // rather than rendered as blank chips — `upload_name is not null` already excludes them, so
+    // this only ever fires if the shape changes underneath us.
+    const pairs = (v: unknown): ConnectedUploader[] =>
+      Array.isArray(v)
+        ? (v as { name?: unknown; similarity?: unknown }[])
+            .filter((u) => typeof u?.name === "string")
+            .map((u) => ({ name: u.name as string, similarity: score(u.similarity) }))
+        : [];
     const total = Number((countRow as any)?.count) || 0;
     return {
       data: (rows as any[]).map((r) => ({
@@ -360,8 +472,9 @@ export class NetworkModel extends DBModel {
         person_name_en: r.person_name_en ?? null,
         person_name_th: r.person_name_th ?? null,
         companyConnections: Number(r.companyConnections) || 0,
-        // node-postgres hands a text[] back as a JS array of strings.
-        connectedUploaders: arr(r.connectedUploaders),
+        connectedUploaders: pairs(r.connectedUploaders),
+        // Still bare names: this is who reaches the *company*, which is not one pairing and so has
+        // no one score to put on it. node-postgres hands a text[] back as a JS array of strings.
         companyUploaders: arr(r.companyUploaders),
       })),
       pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },

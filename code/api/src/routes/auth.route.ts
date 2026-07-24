@@ -55,7 +55,7 @@ export default async function authRoutes(fastify: FastifyInstance): Promise<void
   // ── Sign in with Center ───────────────────────────────────────────────────
   // The production path. One endpoint, two steps: the first call carries email+password; if
   // Center wants a second factor the response is a challenge (no cookie) and the client calls
-  // again with `code`. On success we mint NameSync's own session — Center's token never
+  // again with `code`. On success we mint Network Intel's own session — Center's token never
   // touches the browser. See services/center-auth.service.ts.
   app.post(
     "/center/login",
@@ -78,7 +78,7 @@ export default async function authRoutes(fastify: FastifyInstance): Promise<void
   );
 
   // ── Sign in with an emailed one-time code ─────────────────────────────────
-  // NameSync's own two-factor path, usable in every environment. One endpoint, two steps:
+  // Network Intel's own two-factor path, usable in every environment. One endpoint, two steps:
   // the first call carries email+password (a code is emailed, the reply is a challenge with a
   // `ref` and no cookie); the second call adds `code`+`ref` and, on success, gets the session.
   // See services/otp-auth.service.ts.
@@ -106,7 +106,7 @@ export default async function authRoutes(fastify: FastifyInstance): Promise<void
   // ── Sign in with a local password (dev only) ──────────────────────────────
   // Retained for local development against a database of your own accounts. Refused in
   // production, where Center is the only identity source — so a prod deploy cannot be entered
-  // with a NameSync-local password even if one somehow exists on a row.
+  // with a Network Intel-local password even if one somehow exists on a row.
   app.post(
     "/login",
     { schema: { body: LoginBodySchema, response: { 200: apiSuccess(AuthSessionDataSchema) } } },

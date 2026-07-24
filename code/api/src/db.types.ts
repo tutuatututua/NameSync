@@ -106,6 +106,12 @@ export interface AppUser {
   roles: string[]; // text[] — node-postgres hands this back already parsed
   is_active: boolean;
   last_login_at: string | null;
+  /**
+   * Where the most recent sign-in came from. Overwritten on every login, so it answers
+   * "where is this account being used from now", not "where has it been" — the per-session
+   * history is auth_session.ip. Null when the address was unknown (see TRUST_PROXY).
+   */
+  last_login_ip: string | null;
   created_at: string;
   updated_at: string;
 }

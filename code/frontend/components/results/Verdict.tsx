@@ -65,7 +65,7 @@ export function Verdict({
    *
    * These used to render unconditionally, and they were designed for the run this page was designed
    * for: 13 matches out of 320. At 1 of 2 they degenerate into the headline wearing several hats —
-   * "1 friend matches…", and beside it 1 contact, 1 uploader. Three ways of printing the number 1,
+   * "1 friend matches…", and beside it 1 contact, 1 owner. Three ways of printing the number 1,
    * which reads as three findings until you stop and check.
    *
    * So each is gated on the thing that makes it informative:
@@ -73,8 +73,8 @@ export function Verdict({
    *   · contacts — only when several matches point at the same contact, which is the only case
    *     where the count differs from the headline. (And never on a company import, where the
    *     matched rows *are* the contacts.)
-   *   · uploaders — only when there are several. "1 uploader with a connection" on a single-uploader
-   *     database is not a fact about the run, it is a fact about the database.
+   *   · relationship owners — only when there are several. "1 relationship owner with a connection"
+   *     on a single-owner database is not a fact about the run, it is a fact about the database.
    *
    * A "near-certain" count sat at the top of this list until `matching_score` was dropped. It
    * counted matches in the ≥90% tier, and there are no tiers now — a row records that it matched,
@@ -106,7 +106,7 @@ export function Verdict({
       supporting.push({
         icon: Users,
         value: matchedUploaders,
-        label: "uploaders",
+        label: "relationship owners",
         hint: "with a connection",
       });
     }

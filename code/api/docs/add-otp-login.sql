@@ -1,5 +1,5 @@
 -- ============================================================================
--- NameSync — add the email one-time-code login to an EXISTING database
+-- Network Intel — add the email one-time-code login to an EXISTING database
 -- ============================================================================
 -- Companion to add-auth.sql. Purely additive and fully idempotent: it creates one
 -- table and its indexes, drops nothing, and touches no existing row. Running it twice

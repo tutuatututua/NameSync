@@ -78,8 +78,8 @@ there is no second code path.
 
 ## Email one-time-code sign-in (2FA)
 
-`POST /api/auth/otp/login` is NameSync's own two-factor login: the password is the **first**
-factor, and NameSync then **emails a 6-digit code** that must be entered to finish. It is the
+`POST /api/auth/otp/login` is Network Intel's own two-factor login: the password is the **first**
+factor, and Network Intel then **emails a 6-digit code** that must be entered to finish. It is the
 same two-step, stateless shape as the Center path — and unlike the plain `/login`, it works in
 every environment, Center or no Center.
 

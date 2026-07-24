@@ -36,7 +36,7 @@ beforeEach(async () => {
 
 describe("unconfigured ingestion webhook — internal matcher", () => {
   it("imports a company file cleanly, skipping the forward", async () => {
-    const res = await importCompany(app, { uploader: "Alex" });
+    const res = await importCompany(app, { owner: "Alex" });
     expect(res.statusCode, res.body).toBe(200);
     expect(res.json().data.companyAdded).toBe(2);
     expect(res.json().data.status).toBe("completed");
@@ -48,14 +48,14 @@ describe("unconfigured ingestion webhook — internal matcher", () => {
   });
 
   it("imports a friends file cleanly too", async () => {
-    const res = await importFacebook(app, { friends: [["Somchai", 1]], uploader: "Alex" });
+    const res = await importFacebook(app, { friends: [["Somchai", 1]], owner: "Alex" });
     expect(res.statusCode, res.body).toBe(200);
     expect(res.json().data.facebookAdded).toBe(1);
     expect(res.json().data.status).toBe("completed");
   });
 
   it("still fails a MANUAL send loudly — that one was asked for by name", async () => {
-    const id = (await importCompany(app, { uploader: "Alex" })).json().data.sessionId;
+    const id = (await importCompany(app, { owner: "Alex" })).json().data.sessionId;
 
     const res = await app.inject({ method: "POST", url: `/api/comparisons/${id}/send-webhook` });
     expect(res.statusCode).toBe(503);

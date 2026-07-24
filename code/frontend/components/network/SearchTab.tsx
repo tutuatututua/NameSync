@@ -3,7 +3,7 @@
 import * as React from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { Building2, Pencil, Search, UserCheck, Users } from "lucide-react";
+import { Building2, Pencil, Search, Users } from "lucide-react";
 import type { NameSearchRow } from "@extensions/contract";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -11,6 +11,7 @@ import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/empty-state";
 import { SectionHeader } from "@/components/page-header";
+import { KnownByBadge } from "@/components/network/KnownByBadge";
 import { RenameContactDialog, type EditableContact } from "@/components/network/RenameContactDialog";
 import { useNetworkSearch } from "@/hooks/queries";
 
@@ -159,13 +160,11 @@ function ResultRow({ row, onEdit }: { row: NameSearchRow; onEdit: () => void }) 
       <div className="min-w-0 flex-1 space-y-1">
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
           <p className="truncate font-medium">{name}</p>
-          {/* Who in the network actually knows THIS person — by name, each a link to their roster. */}
+          {/* Who in the network actually knows THIS person — by name, each a link to their roster,
+              each with how close the match that connects them was. */}
           {row.connectedUploaders.map((u) => (
-            <Link key={u} href={`/uploaders/${encodeURIComponent(u)}`}>
-              <Badge variant="success" title="Knows this person" className="cursor-pointer">
-                <UserCheck className="h-3 w-3" />
-                {u}
-              </Badge>
+            <Link key={u.name} href={`/uploaders/${encodeURIComponent(u.name)}`}>
+              <KnownByBadge uploader={u} />
             </Link>
           ))}
         </div>

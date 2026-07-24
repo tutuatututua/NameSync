@@ -334,6 +334,31 @@ export class ComparisonResultModel extends DBModel {
   }
 
   /**
+   * Did this run score anything — is there a similarity to show and rank by?
+   *
+   * Asked of the results table for every kind of run, because that is where a score lives whichever
+   * matcher produced it: the internal one writes it as it decides each pair, and an external one's
+   * callback maps `similarity` into the same column (callbacks.route.ts). An import's own rows have
+   * no score column and never will — a score is a fact about a pair, not about a name — so this is
+   * the only place the question can be put.
+   *
+   * A boolean, not a count, and stopped at the first row: the client only needs to know whether to
+   * draw the column. False on a matcher that reports verdicts alone, which is exactly the run where
+   * a Similarity column would be a screenful of dashes.
+   */
+  static async hasSimilarity(comparisonId: string): Promise<boolean> {
+    const db = await this.getKyselyDB();
+    const row = await db
+      .selectFrom("comparison_result")
+      .select("id")
+      .where("comparison_id", "=", comparisonId)
+      .where("similarity", "is not", null)
+      .limit(1)
+      .executeTakeFirst();
+    return !!row;
+  }
+
+  /**
    * Batch-level idempotency: has any row for this (comparison, batch) already been
    * stored? A re-posted batch (external retry) is then a no-op.
    */

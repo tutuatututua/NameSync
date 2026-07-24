@@ -14,6 +14,7 @@ import { CompanyContactModel } from "../models/company-contact.model";
 import { FriendModel } from "../models/friend.model";
 import { FileParserService } from "../services/file-parser.service";
 import { parseUpload, unlinkQuiet } from "../lib/upload-files";
+import { UPLOAD_FORMATS } from "../lib/table-file";
 import { BadRequest, NotFound } from "../lib/errors";
 import { ok, okList } from "../lib/http";
 
@@ -75,12 +76,12 @@ export default async function uploadSessionsRoutes(fastify: FastifyInstance): Pr
 
       try {
         if (companyPath) {
-          return ok(await FileParserService.previewCompanyXLSX(companyPath, companyFileName ?? "file.xlsx"));
+          return ok(await FileParserService.previewCompanyFile(companyPath, companyFileName ?? "file"));
         }
         if (facebookPath) {
-          return ok(await FileParserService.previewFacebookXLSX(facebookPath, facebookFileName ?? "file.xlsx"));
+          return ok(await FileParserService.previewFacebookFile(facebookPath, facebookFileName ?? "file"));
         }
-        throw new BadRequest("Attach a company or Facebook .xlsx file.");
+        throw new BadRequest(`Attach a company or Facebook file (${UPLOAD_FORMATS}).`);
       } finally {
         unlinkQuiet(companyPath, facebookPath);
       }

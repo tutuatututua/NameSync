@@ -48,7 +48,7 @@ const CO_CSV = "company_name,thai_name,eng_name\nMCKINSEY,นพมาศ,Noppam
 
 describe("import (/run)", () => {
   it("imports a company file or a facebook file — and 400s a request with neither", async () => {
-    const co = (await importCompany(app, { uploader: "Alex" })).json().data;
+    const co = (await importCompany(app, { owner: "Alex" })).json().data;
     expect(co.companyAdded).toBe(2);
     expect(co.facebookAdded).toBe(0);
     expect(co.status).toBe("completed");
@@ -57,7 +57,7 @@ describe("import (/run)", () => {
     const rows = (await app.inject({ method: "GET", url: "/api/comparisons/company-data/all?page=1&limit=50" })).json();
     expect(rows.data.every((r: { upload_person_name: string | null }) => r.upload_person_name === "Alex")).toBe(true);
 
-    const fb = (await importFacebook(app, { friends: [["X", 1]], uploader: "Alex" })).json().data;
+    const fb = (await importFacebook(app, { friends: [["X", 1]], owner: "Alex" })).json().data;
     expect(fb.facebookAdded).toBe(1);
     expect(fb.companyAdded).toBe(0);
 
@@ -87,7 +87,7 @@ describe("import (/run)", () => {
     return app.inject({ method: "POST", url: "/api/comparisons/run", payload: form, headers: form.getHeaders() });
   }
 
-  it("accepts a company file with no upload user — the name is only an audit note there", async () => {
+  it("accepts a company file with no relationship owner — the name is only an audit note there", async () => {
     const res = await importWithoutUploader("companyFile");
     expect(res.statusCode).toBe(200);
     expect(res.json().data.companyAdded).toBe(1);
@@ -97,10 +97,30 @@ describe("import (/run)", () => {
     expect(rows.data[0].upload_person_name).toBeNull();
   });
 
-  it("400s a friends file with no upload user — the uploader is half its dedup key", async () => {
+  it("400s a friends file with no relationship owner — the owner is half its dedup key", async () => {
     const res = await importWithoutUploader("facebookFile");
     expect(res.statusCode).toBe(400);
-    expect(res.json().message).toMatch(/upload user/i);
+    expect(res.json().message).toMatch(/relationship owner/i);
+  });
+
+  // The same fixture, written three ways, imports to the same rows. The preview tests below cover
+  // the readers; this covers the half that writes — a format that previews and then fails to
+  // import would be the one failure the preview screen cannot warn anybody about.
+  it("imports a .csv and a .json export as it imports a workbook", async () => {
+    const csv = (await importCompany(app, { format: "csv", owner: "Alex" })).json().data;
+    expect(csv.companyAdded).toBe(2);
+
+    // Same rows again from a JSON file: every one a duplicate, which is only true if both
+    // formats produced identical records.
+    const json = (await importCompany(app, { format: "json", owner: "Alex" })).json().data;
+    expect(json.companyAdded).toBe(0);
+    expect(json.companyDuplicates).toBe(2);
+
+    const friends = (await importFacebook(app, { format: "json", owner: "Alex" })).json().data;
+    expect(friends.facebookAdded).toBe(2);
+
+    const stored = (await app.inject({ method: "GET", url: "/api/comparisons/facebook-data/all?page=1&limit=50" })).json();
+    expect(stored.data.map((r: { fb_name: string }) => r.fb_name).sort()).toEqual(["anong", "somchai"]);
   });
 
   /** GET /api/upload-sessions — the import history the Uploads page renders. */
@@ -134,14 +154,14 @@ describe("import (/run)", () => {
   it("400s a friends file whose every row is nameless", async () => {
     // The timestamp column matched, so the rows aren't empty — but a friend without a name
     // can never be matched, deduped or displayed.
-    const res = await importFacebook(app, { friends: [["", 1], ["", 2]], uploader: "Alex" });
+    const res = await importFacebook(app, { friends: [["", 1], ["", 2]], owner: "Alex" });
     expect(res.statusCode).toBe(400);
     expect(res.json().message).toMatch(/name/i);
     expect(await uploadHistory()).toHaveLength(0);
   });
 
   it("drops a nameless friend row rather than storing a NULL name", async () => {
-    const res = (await importFacebook(app, { friends: [["Somchai", 1], ["", 2]], uploader: "Alex" })).json().data;
+    const res = (await importFacebook(app, { friends: [["Somchai", 1], ["", 2]], owner: "Alex" })).json().data;
     expect(res.facebookAdded).toBe(1);
 
     const all = (await app.inject({ method: "GET", url: "/api/comparisons/facebook-data/all?page=1&limit=50" })).json();
@@ -151,12 +171,12 @@ describe("import (/run)", () => {
   });
 
   it("keeps no history row for an import whose every row was a duplicate", async () => {
-    const first = (await importCompany(app, { uploader: "Alex" })).json().data;
+    const first = (await importCompany(app, { owner: "Alex" })).json().data;
     expect(first.companyAdded).toBe(2);
 
     // The re-import is answered — added 0, duplicates 2 — but it changed nothing, so it
     // leaves no record behind: a history of non-events reads as events.
-    const again = (await importCompany(app, { uploader: "Alex" })).json().data;
+    const again = (await importCompany(app, { owner: "Alex" })).json().data;
     expect(again.companyAdded).toBe(0);
     expect(again.companyDuplicates).toBe(2);
 
@@ -168,12 +188,12 @@ describe("import (/run)", () => {
 
 describe("dedup — exactly matching rows are skipped", () => {
   it("skips company rows that already exist, no matter who uploaded them", async () => {
-    const first = (await importCompany(app, { uploader: "Alice" })).json().data;
+    const first = (await importCompany(app, { owner: "Alice" })).json().data;
     expect(first.companyAdded).toBe(2);
     expect(first.companyDuplicates).toBe(0);
 
     // Same rows, different uploader — the uploader is not part of the company key.
-    const second = (await importCompany(app, { uploader: "Bob" })).json().data;
+    const second = (await importCompany(app, { owner: "Bob" })).json().data;
     expect(second.companyAdded).toBe(0);
     expect(second.companyDuplicates).toBe(2);
 
@@ -192,12 +212,12 @@ describe("dedup — exactly matching rows are skipped", () => {
   });
 
   it("skips a friend the same uploader already contributed", async () => {
-    const first = (await importFacebook(app, { friends: [["Somchai", 1]], uploader: "Alice" })).json().data;
+    const first = (await importFacebook(app, { friends: [["Somchai", 1]], owner: "Alice" })).json().data;
     expect(first.facebookAdded).toBe(1);
     expect(first.facebookDuplicates).toBe(0);
 
     // Same uploader, same name — a different timestamp does not make it a new row.
-    const second = (await importFacebook(app, { friends: [["Somchai", 2]], uploader: "Alice" })).json().data;
+    const second = (await importFacebook(app, { friends: [["Somchai", 2]], owner: "Alice" })).json().data;
     expect(second.facebookAdded).toBe(0);
     expect(second.facebookDuplicates).toBe(1);
   });
@@ -228,11 +248,11 @@ describe("dedup — exactly matching rows are skipped", () => {
   });
 
   it("treats two spellings of one friend from the same uploader as a duplicate", async () => {
-    const first = (await importFacebook(app, { friends: [["Mr. Somchai Jaidee", 1]], uploader: "Alice" })).json()
+    const first = (await importFacebook(app, { friends: [["Mr. Somchai Jaidee", 1]], owner: "Alice" })).json()
       .data;
     expect(first.facebookAdded).toBe(1);
 
-    const second = (await importFacebook(app, { friends: [["SOMCHAI JAIDEE", 2]], uploader: "Alice" })).json()
+    const second = (await importFacebook(app, { friends: [["SOMCHAI JAIDEE", 2]], owner: "Alice" })).json()
       .data;
     expect(second.facebookAdded).toBe(0);
     expect(second.facebookDuplicates).toBe(1);
@@ -256,17 +276,17 @@ describe("dedup — exactly matching rows are skipped", () => {
   });
 
   it("treats a case-variant friend from the same uploader as a duplicate", async () => {
-    const first = (await importFacebook(app, { friends: [["McKinsey Jaidee", 1]], uploader: "Alice" })).json().data;
+    const first = (await importFacebook(app, { friends: [["McKinsey Jaidee", 1]], owner: "Alice" })).json().data;
     expect(first.facebookAdded).toBe(1);
 
-    const second = (await importFacebook(app, { friends: [["MCKINSEY JAIDEE", 2]], uploader: "Alice" })).json().data;
+    const second = (await importFacebook(app, { friends: [["MCKINSEY JAIDEE", 2]], owner: "Alice" })).json().data;
     expect(second.facebookAdded).toBe(0);
     expect(second.facebookDuplicates).toBe(1);
   });
 
   it("keeps the same friend name from two different uploaders as separate rows", async () => {
-    await importFacebook(app, { friends: [["Somchai", 1]], uploader: "Alice" });
-    await importFacebook(app, { friends: [["Somchai", 2]], uploader: "Bob" });
+    await importFacebook(app, { friends: [["Somchai", 1]], owner: "Alice" });
+    await importFacebook(app, { friends: [["Somchai", 2]], owner: "Bob" });
 
     const all = (await app.inject({ method: "GET", url: "/api/comparisons/facebook-data/all?page=1&limit=50" })).json();
     const somchai = all.data.filter((r: { fb_name: string }) => r.fb_name === "somchai");
@@ -279,7 +299,7 @@ describe("dedup — exactly matching rows are skipped", () => {
   it("dedupes repeats within a single file", async () => {
     const res = (await importFacebook(app, {
       friends: [["Somchai", 1], ["Somchai", 2], ["Anong", 3]],
-      uploader: "Alice",
+      owner: "Alice",
     })).json().data;
     expect(res.facebookAdded).toBe(2);
     expect(res.facebookDuplicates).toBe(1);
@@ -302,7 +322,7 @@ describe("ingestion webhook — the import forwards itself", () => {
     app.inject({ method: "POST", url: `/api/comparisons/${id}/send-webhook` });
 
   it("forwards a company import as a CSV file part, inside the import request", async () => {
-    const id = (await importCompany(app, { csv: CO_CSV, uploader: "Alex" })).json().data.sessionId;
+    const id = (await importCompany(app, { csv: CO_CSV, owner: "Alex" })).json().data.sessionId;
 
     // No second request: /run handed the rows over before it responded.
     expect(mock.state.company).toHaveLength(1);
@@ -336,7 +356,7 @@ describe("ingestion webhook — the import forwards itself", () => {
   });
 
   it("forwards a facebook import as a CSV file part", async () => {
-    const id = (await importFacebook(app, { friends: [["Somchai", 1]], uploader: "Alice" })).json().data.sessionId;
+    const id = (await importFacebook(app, { friends: [["Somchai", 1]], owner: "Alice" })).json().data.sessionId;
 
     expect(mock.state.facebook).toHaveLength(1);
     const hit = mock.state.facebook[0];
@@ -379,7 +399,7 @@ describe("ingestion webhook — the import forwards itself", () => {
   });
 
   it("re-sends an import's rows on demand — the manual retry", async () => {
-    const id = (await importCompany(app, { csv: CO_CSV, uploader: "Alex" })).json().data.sessionId;
+    const id = (await importCompany(app, { csv: CO_CSV, owner: "Alex" })).json().data.sessionId;
     mock.state.company.length = 0;
 
     const res = await sendWebhook(id);
@@ -398,8 +418,8 @@ describe("ingestion webhook — the import forwards itself", () => {
 
 describe("compare flow (scored against Postgres, no external matcher)", () => {
   it("scores the friends against the selected company and stores the results", async () => {
-    await importCompany(app, { uploader: "Alex" }); // Acme Co → Somchai, Beta Ltd → Anong
-    await importFacebook(app, { uploader: "Alex" }); // friends: Somchai, Anong
+    await importCompany(app, { owner: "Alex" }); // Acme Co → Somchai, Beta Ltd → Anong
+    await importFacebook(app, { owner: "Alex" }); // friends: Somchai, Anong
 
     const id = await startCompare(app, "Acme Co");
 
@@ -434,8 +454,8 @@ describe("compare flow (scored against Postgres, no external matcher)", () => {
   });
 
   it("attributes each result to the uploader who contributed the friend", async () => {
-    await importCompany(app, { uploader: "Alex" });
-    await importFacebook(app, { uploader: "Dana" }); // a different uploader's friend list
+    await importCompany(app, { owner: "Alex" });
+    await importFacebook(app, { owner: "Dana" }); // a different uploader's friend list
 
     const id = await startCompare(app, "Acme Co");
     const res = await app.inject({ method: "GET", url: `/api/comparisons/${id}/results` });
@@ -454,10 +474,10 @@ describe("compare flow (scored against Postgres, no external matcher)", () => {
 
 describe("company-selection compare", () => {
   it("lists distinct companies and scores against only the selected one", async () => {
-    await importCompany(app, { csv: CO_CSV, uploader: "Alex" });
+    await importCompany(app, { csv: CO_CSV, owner: "Alex" });
     await importFacebook(app, {
       friends: [["Noppamas", 1700000000], ["Thana", 1700000100]],
-      uploader: "Alex",
+      owner: "Alex",
     });
 
     const companies = await app.inject({ method: "GET", url: "/api/comparisons/companies" });
@@ -482,10 +502,10 @@ describe("company-selection compare", () => {
    * employs that name. Noppamas works at both here, so that lookup was a coin toss.
    */
   it("scores against several companies at once, keeping each friend's best match", async () => {
-    await importCompany(app, { csv: CO_CSV, uploader: "Alex" });
+    await importCompany(app, { csv: CO_CSV, owner: "Alex" });
     await importFacebook(app, {
       friends: [["Noppamas", 1700000000], ["Thana", 1700000100]],
-      uploader: "Alex",
+      owner: "Alex",
     });
 
     const id = await startCompare(app, ["MCKINSEY", "BLUEBIK"]);
@@ -512,8 +532,8 @@ describe("company-selection compare", () => {
   });
 
   it("names the matched company on the run's rows, not just on the run", async () => {
-    await importCompany(app, { csv: CO_CSV, uploader: "Alex" });
-    await importFacebook(app, { friends: [["Thana", 1700000100]], uploader: "Alex" });
+    await importCompany(app, { csv: CO_CSV, owner: "Alex" });
+    await importFacebook(app, { friends: [["Thana", 1700000100]], owner: "Alex" });
 
     const id = await startCompare(app, ["MCKINSEY", "BLUEBIK"]);
     const res = await app.inject({ method: "GET", url: `/api/comparisons/${id}/rows?page=1&limit=25` });
@@ -533,12 +553,12 @@ describe("company-selection compare", () => {
    * offers on a compare run.
    */
   it("stores a per-row similarity and ranks rows best-first by it", async () => {
-    await importCompany(app, { csv: CO_CSV, uploader: "Alex" });
+    await importCompany(app, { csv: CO_CSV, owner: "Alex" });
     // Noppamas is MCKINSEY's contact exactly; "Thanaphon" is only close to BLUEBIK's "Thana". The
     // near one is imported FIRST, so import order and best-first order disagree — which is the point.
     await importFacebook(app, {
       friends: [["Thanaphon", 1700000000], ["Noppamas", 1700000100]],
-      uploader: "Alex",
+      owner: "Alex",
     });
 
     const id = await startCompare(app, ["MCKINSEY", "BLUEBIK"]);
@@ -564,8 +584,8 @@ describe("company-selection compare", () => {
   });
 
   it("deduplicates a repeated company rather than double-weighting it", async () => {
-    await importCompany(app, { csv: CO_CSV, uploader: "Alex" });
-    await importFacebook(app, { friends: [["Noppamas", 1700000000]], uploader: "Alex" });
+    await importCompany(app, { csv: CO_CSV, owner: "Alex" });
+    await importFacebook(app, { friends: [["Noppamas", 1700000000]], owner: "Alex" });
 
     const id = await startCompare(app, ["MCKINSEY", "MCKINSEY"]);
     const res = await app.inject({ method: "GET", url: `/api/comparisons/${id}/results` });
@@ -594,8 +614,8 @@ describe("company-selection compare", () => {
    * picked, with nothing on screen admitting the third contributed nothing.
    */
   it("400s a multi-company compare if any one company has no contacts, naming it", async () => {
-    await importCompany(app, { csv: CO_CSV, uploader: "Alex" });
-    await importFacebook(app, { friends: [["Noppamas", 1700000000]], uploader: "Alex" });
+    await importCompany(app, { csv: CO_CSV, owner: "Alex" });
+    await importFacebook(app, { friends: [["Noppamas", 1700000000]], owner: "Alex" });
 
     const res = await app.inject({
       method: "POST",
@@ -825,8 +845,8 @@ describe("past runs (GET /api/comparisons)", () => {
 
 describe("data-stats", () => {
   it("counts what each table holds, and does not change because a run finished", async () => {
-    await importCompany(app, { uploader: "Alex" });
-    await importFacebook(app, { uploader: "Alex" });
+    await importCompany(app, { owner: "Alex" });
+    await importFacebook(app, { owner: "Alex" });
 
     const before = await app.inject({ method: "GET", url: "/api/comparisons/data-stats" });
     expect(before.json().data).toEqual({ company: { total: 2 }, facebook: { total: 2 } });
@@ -1077,25 +1097,46 @@ describe("import preview", () => {
     expect(await countUploads()).toBe(0);
   });
 
-  it("rejects anything that isn't an .xlsx workbook, before anything is written", async () => {
-    // The old formats, offered as-is: both sources take .xlsx now, and nothing else.
+  // The three formats go in the same door and come out the same shape. Asserted through the
+  // HTTP preview rather than the parser (which unit.test.ts covers) because the intake filters on
+  // the extension *before* any reader sees the file — a format the reader knows and the intake
+  // rejects would fail here and nowhere else.
+  it("previews a .csv and a .json export as it previews a workbook", async () => {
     const csv = await previewUpload(app, {
-      raw: { field: "companyFile", body: "company_name,thai_name,eng_name\nAcme,ก,A\n", filename: "company.csv" },
+      raw: { field: "companyFile", body: "company_name,thai_name,eng_name\nAcme,นายสมชาย,Mr. Somchai\n", filename: "company.csv" },
     });
-    expect(csv.statusCode).toBe(400);
-    expect(csv.json().message).toMatch(/xlsx/i);
+    expect(csv.statusCode).toBe(200);
+    expect(csv.json().data.kind).toBe("company");
+    expect(csv.json().data.sampleRows[0].person_name_en_clean).toBe("somchai");
 
     const json = await previewUpload(app, {
-      raw: { field: "facebookFile", body: '{"friends_v2":[]}', filename: "friends.json" },
+      raw: { field: "facebookFile", body: '{"friends_v2":[{"name":"Mr. Somchai","timestamp":1}]}', filename: "friends.json" },
     });
-    expect(json.statusCode).toBe(400);
-    expect(json.json().message).toMatch(/xlsx/i);
+    expect(json.statusCode).toBe(200);
+    expect(json.json().data.kind).toBe("facebook");
+    expect(json.json().data.totalRows).toBe(1);
+    expect(json.json().data.sampleRows[0].friend_name_clean).toBe("somchai");
+
+    expect(await countUploads()).toBe(0); // a preview writes nothing, whatever the format
+  });
+
+  it("rejects a format nothing can read, before anything is written", async () => {
+    const pdf = await previewUpload(app, {
+      raw: { field: "companyFile", body: "%PDF-1.4 not a table", filename: "company.pdf" },
+    });
+    expect(pdf.statusCode).toBe(400);
+    expect(pdf.json().message).toMatch(/\.xlsx, \.csv or \.json/i);
 
     // Right extension, wrong bytes — caught by the reader rather than the intake.
     const notAWorkbook = await previewUpload(app, {
       raw: { field: "companyFile", body: "definitely not a workbook", filename: "company.xlsx" },
     });
     expect(notAWorkbook.statusCode).toBe(400);
+
+    const notJson = await previewUpload(app, {
+      raw: { field: "facebookFile", body: "{ nope", filename: "friends.json" },
+    });
+    expect(notJson.statusCode).toBe(400);
 
     expect(await countUploads()).toBe(0);
   });
@@ -1140,7 +1181,7 @@ describe("import preview", () => {
 
 describe("upload sessions + rollback", () => {
   it("lists an import, searches it, and rolls back its rows", async () => {
-    const sid = (await importCompany(app, { csv: CO_CSV, uploader: "Alex" })).json().data.sessionId;
+    const sid = (await importCompany(app, { csv: CO_CSV, owner: "Alex" })).json().data.sessionId;
 
     const sessions = await app.inject({ method: "GET", url: "/api/upload-sessions" });
     const row = sessions.json().data.find((s: { id: string }) => s.id === sid);
@@ -1190,8 +1231,8 @@ describe("upload sessions + rollback", () => {
    * no sessions, no rows, no ghost claim.
    */
   it("rollback after an all-duplicate re-import leaves no ghost claim", async () => {
-    const first = (await importCompany(app, { csv: CO_CSV, uploader: "Alex" })).json().data.sessionId;
-    const again = (await importCompany(app, { csv: CO_CSV, uploader: "Alex" })).json().data;
+    const first = (await importCompany(app, { csv: CO_CSV, owner: "Alex" })).json().data.sessionId;
+    const again = (await importCompany(app, { csv: CO_CSV, owner: "Alex" })).json().data;
     expect(again.companyAdded).toBe(0);
     expect(again.companyDuplicates).toBe(2);
 

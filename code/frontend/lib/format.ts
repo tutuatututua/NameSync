@@ -78,6 +78,24 @@ export function runTitle(run: {
   return stripped || formatCompanies(run.selectedCompanies, { conjunction: "and" }) || `Run ${run.id}`;
 }
 
+/**
+ * A similarity in [0, 1] as a whole-number percent — "83%" — or null when there is none.
+ *
+ * One formatter for every place a match is shown (the run table, an uploader's matched list, the
+ * "Known by" chips), so the same pair cannot read as 83% on one screen and 0.83 on another. Whole
+ * numbers because the underlying column is a `real`: a friend scored 0.8300000429153442 is 83%, and
+ * a decimal place here would be reporting float noise as precision.
+ *
+ * Null rather than a dash, so each caller decides how a scoreless match reads — a table cell wants
+ * "—" holding the column open, a chip wants no chip at all.
+ */
+export function formatSimilarity(value: number | null | undefined): string | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  // Clamped, not trusted: an external matcher writes this column too, and "140%" beside a name
+  // reads as a bug in the app rather than in the data it was sent.
+  return `${Math.round(Math.min(Math.max(value, 0), 1) * 100)}%`;
+}
+
 export function formatRelativeTime(iso: string | null | undefined): string {
   if (!iso) return "";
   const then = new Date(iso).getTime();

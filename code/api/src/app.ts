@@ -12,7 +12,7 @@ import {
   hasZodFastifySchemaValidationErrors,
 } from "fastify-type-provider-zod";
 import { DBModel } from "@extensions/sqldb";
-import { corsOrigins, isProduction, isTest } from "./config/env";
+import { corsOrigins, isProduction, isTest, trustProxy } from "./config/env";
 import { AppError } from "./lib/errors";
 import { registerAuth } from "./plugins/auth";
 import { closeSqlConsolePool } from "./services/sql-console.service";
@@ -45,6 +45,9 @@ export async function buildApp(): Promise<FastifyInstance> {
           },
     requestIdHeader: "x-request-id",
     bodyLimit: 50 * 1024 * 1024,
+    // Decides what `req.ip` means, which is what the login throttle keys on and what gets
+    // stored against a session and a user. Off unless TRUST_PROXY says otherwise — see env.ts.
+    trustProxy,
   });
 
   app.setValidatorCompiler(validatorCompiler);

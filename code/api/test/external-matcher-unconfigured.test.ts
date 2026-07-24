@@ -48,14 +48,14 @@ async function expectNoTrace() {
 
 describe("unconfigured ingestion webhook — external matcher", () => {
   it("refuses a company import before anything is written", async () => {
-    const res = await importCompany(app, { uploader: "Alex" });
+    const res = await importCompany(app, { owner: "Alex" });
     expect(res.statusCode).toBe(503);
     expect(res.json().message).toMatch(/COMPANY_WEBHOOK_URL/);
     await expectNoTrace();
   });
 
   it("refuses a friends import before anything is written", async () => {
-    const res = await importFacebook(app, { friends: [["Somchai", 1]], uploader: "Alex" });
+    const res = await importFacebook(app, { friends: [["Somchai", 1]], owner: "Alex" });
     expect(res.statusCode).toBe(503);
     expect(res.json().message).toMatch(/FACEBOOK_WEBHOOK_URL/);
     await expectNoTrace();

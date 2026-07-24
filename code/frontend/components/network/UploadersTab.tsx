@@ -12,14 +12,14 @@ import { SectionHeader } from "@/components/page-header";
 import { useNetworkUploaders } from "@/hooks/queries";
 
 /**
- * Uploaders (Feature 2a) — search an uploader, see how many of their friends matched and how many
- * didn't.
+ * Relationship owners (Feature 2a) — search an owner, see how many of their friends matched and how
+ * many didn't.
  *
- * The client's question is "for this person I uploaded, how many names did we place, how many are
- * still nowhere". The Overview answers it one roster at a time behind a dropdown; this puts every
- * roster in one list with its tally, filterable by name, and each row opens the roster's actual
- * names (matched, and — the useful half — not). The counts here are the same numbers the Overview
- * shows for a single roster, so the two never disagree.
+ * The client's question is "for this person's list, how many names did we place, how many are still
+ * nowhere". The Overview answers it one roster at a time behind a dropdown; this puts every roster
+ * in one list with its tally, filterable by name, and each row opens the roster's actual names
+ * (matched, and — the useful half — not). The counts here are the same numbers the Overview shows
+ * for a single roster, so the two never disagree.
  */
 export function UploadersTab() {
   const { data, isLoading } = useNetworkUploaders();
@@ -32,8 +32,8 @@ export function UploadersTab() {
   return (
     <div className="space-y-6">
       <SectionHeader
-        title="Uploaders"
-        description="Search a person who uploaded friends to see how many matched — and how many didn't."
+        title="Relationship owners"
+        description="Search a relationship owner to see how many of their friends matched — and how many didn't."
       />
 
       <div className="relative max-w-md">
@@ -41,9 +41,9 @@ export function UploadersTab() {
         <Input
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          placeholder="Search an uploader by name…"
+          placeholder="Search a relationship owner by name…"
           className="pl-9"
-          aria-label="Search an uploader by name"
+          aria-label="Search a relationship owner by name"
         />
       </div>
 
@@ -56,13 +56,13 @@ export function UploadersTab() {
       ) : uploaders.length === 0 ? (
         <EmptyState
           icon={Users}
-          title="No uploaders yet"
-          description="Import a friend list to see who's been uploaded and how far their network reaches."
+          title="No relationship owners yet"
+          description="Import a friend list to see whose relationships are on file and how far their network reaches."
         />
       ) : filtered.length === 0 ? (
         <EmptyState
           icon={Search}
-          title={`No uploader matches “${query.trim()}”`}
+          title={`No relationship owner matches “${query.trim()}”`}
           description="Try a different spelling, or clear the search to see everyone."
         />
       ) : (

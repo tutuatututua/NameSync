@@ -8,7 +8,7 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 
 interface UploadPanelProps {
-  accept: string[];
+  accept: readonly string[];
   file: File | null;
   onChange: (file: File | null) => void;
   title: string;

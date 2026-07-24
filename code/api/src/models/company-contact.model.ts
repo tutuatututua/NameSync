@@ -262,6 +262,7 @@ export class CompanyContactModel extends DBModel {
             .select([
               "comparison_result.friend_name",
               "comparison_result.upload_name",
+              "comparison_result.similarity",
               "comparison_result.extra",
             ])
             .where("comparison_result.comparison_id", "=", comparisonId)
@@ -272,6 +273,9 @@ export class CompanyContactModel extends DBModel {
               )`
             )
             .orderBy(matchedFirstSql("comparison_result.status"))
+            // Then the closest — see FriendModel.findRunRows. A contact who matched several friends
+            // shows the one they matched best, not the first one written.
+            .orderBy(sql`comparison_result.similarity desc nulls last`)
             .orderBy("comparison_result.id", "asc")
             .limit(1)
             .as("best"),
@@ -286,12 +290,15 @@ export class CompanyContactModel extends DBModel {
         "best.friend_name as matchedName",
         // A friend has one name — there is no Thai twin to show.
         sql<string | null>`null`.as("matchedNameTh"),
+        // How close the match was, carried from the result row — the only place an import's score
+        // lives. See FriendModel.findRunRows.
+        "best.similarity as similarity",
         // Not another name: the person who uploaded that matched friend. Who they are is the
         // match; whose they are is what you can act on.
         //
         // The matcher's own value first, then the friend row it names — the same coalesce
         // ComparisonResultModel uses, and needed for the same reason: `upload_name` is optional on
-        // the contract, and a workflow that leaves it null still matched a friend NameSync has on
+        // the contract, and a workflow that leaves it null still matched a friend Network Intel has on
         // file and knows the uploader of. Without the fallback a company import that found a match
         // showed the friend's name beside an empty "Uploaded by", which is the one column that
         // makes the match actionable. Scalar subquery, so a name two people share never multiplies
@@ -305,13 +312,18 @@ export class CompanyContactModel extends DBModel {
         sql<string | null>`best.extra::text`.as("extras"),
       ]);
 
-    // See FriendModel.findRunRows — import order while the run moves, matches first once it stops.
+    // See FriendModel.findRunRows — import order while the run moves, matches first once it stops,
+    // and closest-first within either once the run has scores to rank by.
+    const byScore = sql`best.similarity desc nulls last`;
     const ordered =
-      sort === "status"
-        ? selected
-            .orderBy(sql`case when ${verdict} = ${sql.val("matched")} then 0 else 1 end`)
-            .orderBy("company_contact.id", "asc")
-        : selected.orderBy("company_contact.id", "asc");
+      sort === "similarity"
+        ? selected.orderBy(byScore).orderBy("company_contact.id", "asc")
+        : sort === "status"
+          ? selected
+              .orderBy(sql`case when ${verdict} = ${sql.val("matched")} then 0 else 1 end`)
+              .orderBy(byScore)
+              .orderBy("company_contact.id", "asc")
+          : selected.orderBy("company_contact.id", "asc");
 
     const [data, countResult] = await Promise.all([
       ordered.limit(limit).offset(offset).execute(),

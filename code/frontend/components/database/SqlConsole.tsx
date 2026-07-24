@@ -180,7 +180,7 @@ export function SqlConsole() {
               id="query-name"
               value={saveName}
               onChange={(e) => setSaveName(e.target.value)}
-              placeholder="e.g. Contacts by uploader"
+              placeholder="e.g. Contacts by relationship owner"
             />
           </div>
           <DialogFooter>

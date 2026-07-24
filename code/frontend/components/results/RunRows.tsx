@@ -19,6 +19,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { useFullWidth } from "@/components/main-container";
 import { useRunRows } from "@/hooks/queries";
 import type { RunRowsParams } from "@/lib/api/client";
+import { formatSimilarity } from "@/lib/format";
 import { parseExtra } from "@/lib/match";
 import { cn } from "@/lib/utils";
 
@@ -144,7 +145,7 @@ const SIDE: Record<Side, SideMeta> = {
     table: "friend",
     icon: Users,
     name: "Friend",
-    context: "Uploaded by",
+    context: "Relationship owner",
     tint: "bg-brand-2/[0.07]",
     rule: "border-b-brand-2",
     badge: "Facebook friends",
@@ -241,7 +242,7 @@ function Person({ name, nameTh }: { name: string | null; nameTh: string | null }
   );
 }
 
-/** A context cell — the uploader, or the company. Its header says which. */
+/** A context cell — the relationship owner, or the company. Its header says which. */
 function Context({ value }: { value: string | null }) {
   if (!value) return <span className="text-muted-foreground">—</span>;
   return (
@@ -313,11 +314,18 @@ export function RunRows({ comparisonId, progress, live, company = null }: Props)
   /**
    * Whether this run carries a per-row similarity to rank and show.
    *
-   * Only a compare-by-company run does: its rows are `comparison_result` rows the internal matcher
-   * scored. An import-driven run reads its rows from `friend` / `company_contact`, which have no
-   * score, so the column would be all "—" and the "Best match" sort a no-op — both hidden there.
+   * The run's own answer, from the progress poll, rather than the guess this made from `origin`.
+   * That guess said only a compare-by-company run has scores — true when the import readers didn't
+   * select one, and wrong ever since they did: an external matcher that reports `similarity` on its
+   * callback has it stored in the same column the internal one writes, and an import driven by that
+   * matcher hid a score it had. The flag is measured over the run's actual rows, so the column
+   * appears exactly when there is something to put in it and the "Best match" sort is only offered
+   * where it can do something.
+   *
+   * `origin === "compare"` survives as the fallback for the first frame, before the poll lands —
+   * that run always has scores, so the column does not flicker in a moment later.
    */
-  const showSimilarity = origin === "compare";
+  const showSimilarity = progress?.hasSimilarity ?? origin === "compare";
 
   /**
    * Null until the reader says otherwise, and that is the whole design.
@@ -384,8 +392,8 @@ export function RunRows({ comparisonId, progress, live, company = null }: Props)
   const TgtIcon = tgt.icon;
 
   const { title, description } = heading(origin, live, company);
-  // name + context, per side, then whatever the matcher sent, then similarity (compare runs only),
-  // then the verdict.
+  // name + context, per side, then whatever the matcher sent, then similarity (when the run scored
+  // anything), then the verdict.
   const colCount = 4 + extraKeys.length + (showSimilarity ? 1 : 0) + 1;
 
   return (
@@ -562,10 +570,10 @@ export function RunRows({ comparisonId, progress, live, company = null }: Props)
  * checkbox. File order is not a curiosity: it is the order your source file is in, which is what you
  * want when you are checking this table against the thing you uploaded.
  *
- * "Best match" (similarity) is only offered when the run has scores to rank by — a compare run.
- * It ranks *within* the matches, which "Matches first" cannot: that one brings the matches to the
- * top and, on a compare run, orders them by similarity too, but on an import (no score) it stops at
- * matched-vs-not and leaves the file's order inside each group.
+ * "Best match" (similarity) is only offered when the run has scores to rank by — see
+ * `showSimilarity`. It ranks across every row, which "Matches first" cannot: that one brings the
+ * matches to the top and, where there are scores, orders them by closeness within, but on a run
+ * that recorded none it stops at matched-vs-not and leaves the file's order inside each group.
  */
 function SortToggle({
   sort,
@@ -634,11 +642,13 @@ function SourceLabel({
   );
 }
 
-/** A similarity in [0, 1] as a whole-number percent, or "—" when the row kept no score. */
+/** A similarity as a whole-number percent, or "—" when this row kept no score. The column is only
+ *  drawn for a run that scored something, but a single row inside it may still have none — an
+ *  unmatched name the matcher never scored, or one it declined to put a number on. */
 function SimilarityCell({ value, className }: { value: number | null; className?: string }) {
   return (
     <TableCell className={cn("text-right align-top tabular-nums text-sm text-muted-foreground", className)}>
-      {value === null || value === undefined ? "—" : `${Math.round(value * 100)}%`}
+      {formatSimilarity(value) ?? "—"}
     </TableCell>
   );
 }
@@ -691,14 +701,13 @@ function Row({
       })}
 
       {/*
-        Similarity, then the verdict — but only on a compare run, which is the only kind that keeps a
-        per-row score.
+        Similarity, then the verdict — on any run that recorded a score, which now includes an
+        import whose matcher sent one.
 
-        This once said the score column was gone for good ("the badge won that argument"), and for an
-        import that is still true: those rows have no score, and a matcher that sends one on the
-        callback has it carried into `extra` as before. What is back is `comparison_result.similarity`
-        — display and sort only, beside the badge rather than instead of it. The badge is still the
-        verdict; the percent only says how close, and never overrules it.
+        This once said the score column was gone for good ("the badge won that argument"), and then
+        that it was back for compare runs only. Both readings of `comparison_result.similarity` are
+        the same one: display and sort, beside the badge rather than instead of it. The badge is
+        still the verdict; the percent only says how close, and never overrules it.
       */}
       {showSimilarity && (
         <SimilarityCell value={row.similarity} className={cn(extraKeys.length === 0 && DIVIDER)} />

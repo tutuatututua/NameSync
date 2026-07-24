@@ -2,11 +2,11 @@ import { env } from "../config/env";
 import { BadRequest, ServiceUnavailable, Unauthorized } from "./errors";
 
 /**
- * The Center (centerapp.io "PlayMe") auth API, as NameSync talks to it.
+ * The Center (centerapp.io "PlayMe") auth API, as Network Intel talks to it.
  *
- * NameSync's own login form posts email+password here; this module forwards them to Center,
+ * Network Intel's own login form posts email+password here; this module forwards them to Center,
  * and the caller (services/center-auth.service.ts) takes the Center JWT it returns, reads the
- * profile once, and then throws the token away — NameSync mints its OWN session cookie. See
+ * profile once, and then throws the token away — Network Intel mints its OWN session cookie. See
  * docs/AUTH.md and docs/wayfinder/assets/06-center-sso-integration-spec.md.
  *
  * Center speaks a few non-obvious dialects, and hiding them is the whole job of this module:
@@ -93,7 +93,7 @@ export async function centerLogin(creds: CenterCredentials): Promise<CenterLogin
   const { ok, data } = await centerPost("auth/login", loginBody(creds));
 
   // Success: Center hands back a JWT. `requiredReset === "Y"` means the password is expired
-  // and Center wants it changed — NameSync can't change a Center password, so the caller
+  // and Center wants it changed — Network Intel can't change a Center password, so the caller
   // turns this into a "reset in Center" rejection rather than a session.
   if (ok && typeof data.token === "string" && data.token) {
     return { kind: "success", token: data.token, requiredReset: data.requiredReset === "Y" };
@@ -145,7 +145,7 @@ export async function centerSendEmailOtp(username: string): Promise<void> {
 
 /**
  * Read the signed-in user's Center profile, using the JWT from a successful login. This is
- * the authoritative identity — NameSync matches its `app_user` against the email here.
+ * the authoritative identity — Network Intel matches its `app_user` against the email here.
  *
  * NOTE: the exact field names in Center's `auth/me` are unconfirmed until ticket 07 (a real
  * specimen). We read the common spellings defensively and fall back to the typed login, so a

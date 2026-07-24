@@ -93,8 +93,49 @@ export const MatchedPersonSchema = z.object({
   en: z.string().nullable(),
   /** The matched contact's Thai name, or null. */
   th: z.string().nullable(),
+  /**
+   * How close the match was, in [0, 1] — the best score any run recorded for this pairing.
+   *
+   * The strongest of them rather than the latest, because these rows are folded over every run on
+   * file: the same friend may have been scored against the same contact several times, and the
+   * question this page answers ("how sure are we they're the same person") is settled by the best
+   * evidence, not the most recent.
+   *
+   * Null when no run recorded one — an external matcher that reported only a verdict. It never
+   * decides whether this is a match; being in this list is what says that.
+   */
+  similarity: z.number().nullable(),
 });
 export type MatchedPerson = z.infer<typeof MatchedPersonSchema>;
+
+/**
+ * A friend with no connection on file — and whatever a run recorded while deciding that.
+ *
+ * The friend themself is a name and nothing else: `friend` stores one column, so there is no Thai
+ * spelling and no employer to report about *them*. What there can be is the contact the matcher
+ * came closest to and rejected — the internal matcher keeps every friend's best candidate whether
+ * it cleared the bar or not, so a no-match row already carries that contact's English name, Thai
+ * name, employer and score. `th` and `company` are that contact's, never the friend's, which is
+ * why they are named for the near miss rather than mirroring `MatchedPerson`'s fields.
+ *
+ * All four are null on a friend no run ever scored (never compared, or an external matcher that
+ * posts only its matches). The friend still belongs in the list — being unplaced is the fact this
+ * list is about; the near miss is context, not the entry.
+ */
+export const NoMatchPersonSchema = z.object({
+  /** The friend's name as uploaded (their social name), cleaned + lower-cased. */
+  friend: z.string(),
+  /** The closest considered contact's English name, or null. */
+  en: z.string().nullable(),
+  /** The closest considered contact's Thai name, or null. */
+  th: z.string().nullable(),
+  /** Where that contact works, or null. NOT where the friend works — nothing knows that. */
+  company: z.string().nullable(),
+  /** How close that near miss got, in [0, 1], or null when the run recorded no score. Always
+   *  below whatever bar the matcher applied: a score that cleared it would be a match. */
+  similarity: z.number().nullable(),
+});
+export type NoMatchPerson = z.infer<typeof NoMatchPersonSchema>;
 
 /** A company this roster reaches, and the matched people under it. */
 export const CompanyMatchGroupSchema = z.object({
@@ -121,8 +162,9 @@ export const UploaderDetailDataSchema = z.object({
   noMatch: z.number(),
   /** Matches grouped by company — one section per company the roster reaches, strongest first. */
   matchedByCompany: z.array(CompanyMatchGroupSchema),
-  /** Friends with no connection — the names to chase next. */
-  noMatchNames: z.array(z.string()),
+  /** Friends with no connection — the names to chase next, each with the near miss a run recorded
+   *  for them, where one exists. */
+  noMatchPeople: z.array(NoMatchPersonSchema),
 });
 export type UploaderDetailData = z.infer<typeof UploaderDetailDataSchema>;
 
@@ -142,6 +184,22 @@ export const NameSearchQuerySchema = PaginationQuerySchema.extend({
 });
 export type NameSearchQuery = z.infer<typeof NameSearchQuerySchema>;
 
+/**
+ * One uploader who knows a contact, and how close the match that says so was.
+ *
+ * A name alone used to be the whole answer, and it hid the difference between "Alex's friend IS
+ * this person" and "Alex has a friend whose name looks a bit like theirs" — two claims that lead to
+ * very different emails. The score is per (uploader, contact) pair and is the best any run recorded
+ * for it, for the same reason `MatchedPerson.similarity` is.
+ */
+export const ConnectedUploaderSchema = z.object({
+  /** The uploader, as `comparison_result.upload_name` spells them — also the roster page's key. */
+  name: z.string(),
+  /** In [0, 1], or null when no run scored the pairing. Never the verdict; presence here is that. */
+  similarity: z.number().nullable(),
+});
+export type ConnectedUploader = z.infer<typeof ConnectedUploaderSchema>;
+
 export const NameSearchRowSchema = z.object({
   id: z.string(),
   company_name: z.string().nullable(),
@@ -150,11 +208,11 @@ export const NameSearchRowSchema = z.object({
   /** Distinct people in the network with a match somewhere at this contact's company. */
   companyConnections: z.number(),
   /**
-   * The uploaders whose friend matched THIS contact — who in the network actually knows them.
-   * Empty means nobody does. Replaces a bare boolean because a contact can be known by several
-   * people at once, and the useful answer is their names, not just "yes".
+   * The uploaders whose friend matched THIS contact — who in the network actually knows them, and
+   * how close each one's match was. Empty means nobody does. Objects rather than bare names because
+   * a contact can be known by several people at once and not equally well; see ConnectedUploader.
    */
-  connectedUploaders: z.array(z.string()),
+  connectedUploaders: z.array(ConnectedUploaderSchema),
   /**
    * The uploaders who reach this contact's COMPANY at all — i.e. who has a connection to *someone*
    * there, not necessarily this person. A superset of `connectedUploaders`; this is the "who can

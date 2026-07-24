@@ -73,7 +73,7 @@ const db = async () => (await DBModel.getPool()).connect();
 
 /** Import a friends file. The import forwards its own rows to the "workflow" — one request. */
 async function importAndForward(names: string[]) {
-  const res = await importFacebook(app, { friends: friendRows(names), uploader: "Alex" });
+  const res = await importFacebook(app, { friends: friendRows(names), owner: "Alex" });
   const { sessionId, comparisonId } = res.json().data;
   return { uploadId: sessionId as string, comparisonId: comparisonId as string };
 }
@@ -83,13 +83,16 @@ async function importAndForward(names: string[]) {
  * comparison_result. This is the contract in docs/EXTERNAL-MATCHER.md, and the test is only
  * worth anything if it does exactly what the document tells the workflow to do.
  *
- * `score` is gone from the verdict fixture along with the column. It used to be the interesting
- * half — a workflow could stamp 'match' at 0.7 and Network Intel would overrule it — and there is no
- * overruling left to test: `matched` is now the entire input and the entire output.
+ * `matched` is the verdict, whole: a workflow could once stamp 'match' at 0.7 and Network Intel
+ * would overrule it from the score, and there is no overruling left to test.
+ *
+ * `similarity` is optional and does not change any of that. It is how close the workflow says the
+ * two names were — display and ranking only — and leaving it off is the other real case: a matcher
+ * that reports verdicts and no numbers, whose runs must not grow a column of dashes.
  */
 async function workflowStamps(
   comparisonId: string,
-  verdicts: { name: string; matched: boolean }[]
+  verdicts: { name: string; matched: boolean; similarity?: number }[]
 ) {
   const conn = await db();
   for (const v of verdicts) {
@@ -117,9 +120,9 @@ async function workflowStamps(
     await sql`
       INSERT INTO lakeshore.comparison_result
         (comparison_id, friend_name, person_name_en, person_name_th,
-         batch_number, status, upload_name)
+         batch_number, status, upload_name, similarity)
       VALUES (${comparisonId}, ${name}, ${name}, ${"ชื่อ"},
-              1, ${"match"}, ${"Alex"})
+              1, ${"match"}, ${"Alex"}, ${v.similarity ?? null})
     `.execute(conn);
   }
 }
@@ -131,7 +134,10 @@ const progress = async (id: string) =>
 const rowsOf = async (
   id: string,
   query = ""
-): Promise<{ data: { name: string }[]; pagination: { total: number } }> =>
+): Promise<{
+  data: { name: string; similarity?: number | null }[];
+  pagination: { total: number };
+}> =>
   (await app.inject({ method: "GET", url: `/api/comparisons/${id}/rows${query}` })).json();
 
 describe("external matcher — an import starts a run", () => {
@@ -342,7 +348,7 @@ describe("external matcher — an import starts a run", () => {
   });
 
   it("a company import is a run too", async () => {
-    const res = await importCompany(app, { csv: CO_CSV, uploader: "Alex" });
+    const res = await importCompany(app, { csv: CO_CSV, owner: "Alex" });
     const { comparisonId } = res.json().data;
     expect(comparisonId).toBeTruthy();
 
@@ -362,11 +368,11 @@ describe("external matcher — an import starts a run", () => {
     // the result was a comparison that could never finish: the progress endpoint drew a full bar
     // (an upload with no rows is vacuously done) while refusing to complete it (it waited for at
     // least one row to be stamped). "Running · 0 of 0 rows · 100%", forever.
-    const first = await importCompany(app, { csv: CO_CSV, uploader: "Alex" });
+    const first = await importCompany(app, { csv: CO_CSV, owner: "Alex" });
     expect(first.json().data.comparisonId).toBeTruthy();
     expect(first.json().data.companyAdded).toBe(2);
 
-    const again = await importCompany(app, { csv: CO_CSV, uploader: "Alex" });
+    const again = await importCompany(app, { csv: CO_CSV, owner: "Alex" });
     const data = again.json().data;
 
     expect(data.companyAdded).toBe(0);
@@ -387,10 +393,10 @@ describe("external matcher — an import starts a run", () => {
   });
 
   it("sends nothing to the webhook when there is nothing to send", async () => {
-    await importCompany(app, { csv: CO_CSV, uploader: "Alex" });
+    await importCompany(app, { csv: CO_CSV, owner: "Alex" });
     mock.state.company.length = 0;
 
-    const again = await importCompany(app, { csv: CO_CSV, uploader: "Alex" });
+    const again = await importCompany(app, { csv: CO_CSV, owner: "Alex" });
     const { sessionId } = again.json().data;
 
     const sent = await app.inject({
@@ -410,7 +416,7 @@ describe("external matcher — an import starts a run", () => {
     // stored, but the run is marked failed rather than left waiting forever on a workflow that
     // was never given anything to do.
     mock.state.failNext = true;
-    const res = await importFacebook(app, { friends: friendRows(["Somchai"]), uploader: "Alex" });
+    const res = await importFacebook(app, { friends: friendRows(["Somchai"]), owner: "Alex" });
     expect(res.statusCode).toBeGreaterThanOrEqual(400);
 
     const runs = (await app.inject({ method: "GET", url: "/api/comparisons" })).json().data;
@@ -425,7 +431,7 @@ describe("external matcher — an import starts a run", () => {
 
   it("un-fails the run when the handover is retried through POST /:id/send-webhook", async () => {
     mock.state.failNext = true;
-    await importFacebook(app, { friends: friendRows(["Somchai"]), uploader: "Alex" });
+    await importFacebook(app, { friends: friendRows(["Somchai"]), owner: "Alex" });
 
     const upload = (await app.inject({ method: "GET", url: "/api/upload-sessions" })).json().data[0];
     expect(upload.status).toBe("failed");
@@ -517,7 +523,7 @@ describe("external matcher — watching the rows", () => {
     // The whole question a friends import asks is "does anyone I know work there?" — so the answer
     // has to name the *there*. `comparison_result` holds a pair of names and a verdict and nothing
     // else, which is why this is reached through the contact themself.
-    await importCompany(app, { csv: CO_CSV, uploader: "Alex" });
+    await importCompany(app, { csv: CO_CSV, owner: "Alex" });
     const { comparisonId } = await importAndForward(["Somchai"]);
 
     const conn = await db();
@@ -553,7 +559,7 @@ describe("external matcher — watching the rows", () => {
     // Not the mirror image with the words swapped. Here the uploaded row is the rich side (an
     // English name, a Thai name, an employer) and the match is a friend — who has one name, and
     // whose interesting property is not another name but the person who knows them.
-    const res = await importCompany(app, { csv: CO_CSV, uploader: "Alex" });
+    const res = await importCompany(app, { csv: CO_CSV, owner: "Alex" });
     const { comparisonId } = res.json().data;
 
     const conn = await db();
@@ -585,12 +591,12 @@ describe("external matcher — watching the rows", () => {
 
   it("fills a matched friend's uploader from the friend on file when the workflow leaves it null", async () => {
     // The friend is already on file — Nok imported them — and `upload_name` is optional on the
-    // contract, so a workflow may match a friend and never say whose. NameSync knows anyway: it has
+    // contract, so a workflow may match a friend and never say whose. Network Intel knows anyway: it has
     // the friend row. Without the fallback a company import that found a match showed the friend's
     // name beside an empty "Uploaded by" — the one column that turns a match into an introduction.
-    await importFacebook(app, { friends: friendRows(["Somchai Jaidee"]), uploader: "Nok" });
+    await importFacebook(app, { friends: friendRows(["Somchai Jaidee"]), owner: "Nok" });
 
-    const res = await importCompany(app, { csv: CO_CSV, uploader: "Alex" });
+    const res = await importCompany(app, { csv: CO_CSV, owner: "Alex" });
     const { comparisonId } = res.json().data;
 
     const conn = await db();
@@ -702,6 +708,75 @@ describe("external matcher — watching the rows", () => {
     expect((await rows(comparisonId, "?filter=matched")).data[0].matchedName).toBeNull();
   });
 
+  /**
+   * How close the match was, on an import.
+   *
+   * The score used to be a compare-run privilege: these rows come out of `friend`, which has no
+   * score column and never will — a score is a fact about a *pair* — so the reader simply didn't
+   * select one and the table hid the column for every import. But the pair is right there in
+   * `comparison_result`, joined already for the matched name, and a workflow that reports
+   * `similarity` on its callback has had it stored all along. It was being thrown away one join
+   * short of the screen.
+   */
+  it("carries the workflow's similarity onto an imported row, and says the run has scores", async () => {
+    const { comparisonId } = await importAndForward(["Somchai", "Anong"]);
+    await workflowStamps(comparisonId, [
+      { name: "Somchai", matched: true, similarity: 0.75 },
+      { name: "Anong", matched: false },
+    ]);
+
+    // The run's own answer to "is there a column to draw", measured over its rows rather than
+    // guessed from the fact that it was an import.
+    expect((await progress(comparisonId)).hasSimilarity).toBe(true);
+
+    const matched = (await rows(comparisonId, "?filter=matched")).data[0];
+    expect(matched.similarity).toBeCloseTo(0.75, 5);
+    // …and the stamp is still the verdict. The percent describes the match; it does not make one.
+    expect(matched.status).toBe("match");
+
+    // A row that matched nobody has no pair and so no score. The column stays (the run has scores),
+    // the cell is empty — which is the honest reading of "there was nothing to score".
+    expect((await rows(comparisonId, "?filter=unmatched")).data[0].similarity).toBeNull();
+  });
+
+  it("says a run whose matcher scored nothing has no scores, so the column stays away", async () => {
+    const { comparisonId } = await importAndForward(["Somchai"]);
+    // A verdict and nothing else — the whole contract obliges no more than this.
+    await workflowStamps(comparisonId, [{ name: "Somchai", matched: true }]);
+
+    expect((await progress(comparisonId)).hasSimilarity).toBe(false);
+    expect((await rows(comparisonId)).data[0].similarity).toBeNull();
+  });
+
+  it("ranks an import's rows by score when asked, across the whole run", async () => {
+    const { comparisonId } = await importAndForward(["Somchai", "Anong", "Malee"]);
+    await workflowStamps(comparisonId, [
+      { name: "Somchai", matched: true, similarity: 0.4 },
+      { name: "Anong", matched: true, similarity: 0.9 },
+      { name: "Malee", matched: false },
+    ]);
+
+    // `?sort=similarity` used to fall through to import order here, because these rows had no score
+    // to rank by — a control the client offered and the server quietly ignored.
+    const best = await rows(comparisonId, "?sort=similarity");
+    expect(best.data.map((r: { name: string }) => r.name)).toEqual(
+      ["Anong", "Somchai", "Malee"].map(stored)
+    );
+
+    // Matches first still leads with the matches — and now orders them best-first within, instead
+    // of leaving whichever name the file happened to list first at the top of the finding.
+    const byStatus = await rows(comparisonId, "?sort=status");
+    expect(byStatus.data.map((r: { name: string }) => r.name)).toEqual(
+      ["Anong", "Somchai", "Malee"].map(stored)
+    );
+
+    // File order is untouched by any of it — it is the order you can check against your upload.
+    const byRow = await rows(comparisonId, "?sort=row");
+    expect(byRow.data.map((r: { name: string }) => r.name)).toEqual(
+      ["Somchai", "Anong", "Malee"].map(stored)
+    );
+  });
+
   it("pages without losing or repeating a row", async () => {
     const names = Array.from({ length: 5 }, (_, i) => `Friend ${i + 1}`);
     const { comparisonId } = await importAndForward(names);
@@ -727,8 +802,8 @@ describe("external matcher — watching the rows", () => {
    * table then duplicated this one on every import-driven run.
    */
   async function compareAgainstAcme(friends: string[]) {
-    await importFacebook(app, { friends: friendRows(friends), uploader: "Alex" });
-    await importCompany(app, { csv: CO_CSV, uploader: "Alex" });
+    await importFacebook(app, { friends: friendRows(friends), owner: "Alex" });
+    await importCompany(app, { csv: CO_CSV, owner: "Alex" });
 
     const run = await app.inject({
       method: "POST",
@@ -775,6 +850,8 @@ describe("external matcher — watching the rows", () => {
       // rows over. A friends import and a compare are both `facebook`; only one is "your rows".
       kind: "facebook",
       origin: "compare",
+      // This matcher computes the score to decide the row, so it always has one to show.
+      hasSimilarity: true,
       total: 2,
       matched: 1,
       unmatched: 1,
@@ -854,7 +931,7 @@ describe("external matcher — watching the rows", () => {
     // The console builds its SQL from the registry, so a column being *listed* is not proof it
     // can be selected or updated — `status` is reached through the same query builder as the
     // rest, and this is what would catch it naming a column the table doesn't have.
-    await importFacebook(app, { friends: friendRows(["Somchai"]), uploader: "Alex" });
+    await importFacebook(app, { friends: friendRows(["Somchai"]), owner: "Alex" });
 
     const queried = await app.inject({
       method: "POST",

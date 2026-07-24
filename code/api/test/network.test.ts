@@ -58,9 +58,9 @@ const uploader = async (name: string) =>
 
 /** Seed one company import + one friend list, run a compare, return the run id. */
 async function seedAndCompare(): Promise<string> {
-  await importCompany(app, { csv: CO_CSV, uploader: "Alex" });
+  await importCompany(app, { csv: CO_CSV, owner: "Alex" });
   // Noppamas matches MCKINSEY exactly; Stranger matches nobody.
-  await importFacebook(app, { friends: [["Noppamas", 1], ["Stranger", 2]], uploader: "Alex" });
+  await importFacebook(app, { friends: [["Noppamas", 1], ["Stranger", 2]], owner: "Alex" });
   return startCompare(app, ["MCKINSEY", "BLUEBIK"]);
 }
 
@@ -97,7 +97,7 @@ describe("network overview (GET /api/network/overview)", () => {
   });
 
   it("lists no uploaders when only company data has been imported (no friend lists yet)", async () => {
-    await importCompany(app, { csv: CO_CSV, uploader: "Alex" });
+    await importCompany(app, { csv: CO_CSV, owner: "Alex" });
     const ov = await overview();
     expect(ov.uploaders).toEqual([]); // "Alex" here is a company import, not a friend roster
     expect(ov.friends).toBe(0);
@@ -117,7 +117,9 @@ describe("network search (GET /api/network/search)", () => {
     expect(row.company_name).toBe("MCKINSEY");
     expect(row.person_name_en).toBe("noppamas"); // stored lower-cased
     expect(row.companyConnections).toBe(1); // one person reaches MCKINSEY
-    expect(row.connectedUploaders).toEqual(["Alex"]); // Alex's friend knows Noppamas
+    // Who knows them, and how close the match that says so was — the chip carries both, so an
+    // exact name and a near miss cannot read as the same claim. Alex's friend IS Noppamas: 1.
+    expect(row.connectedUploaders).toEqual([{ name: "Alex", similarity: 1 }]);
     expect(row.companyUploaders).toEqual(["Alex"]); // Alex reaches MCKINSEY (via Noppamas)
   });
 
@@ -133,14 +135,18 @@ describe("network search (GET /api/network/search)", () => {
   });
 
   it("names every uploader who knows a contact and who reaches the company", async () => {
-    await importCompany(app, { csv: CO_CSV, uploader: "Alex" });
+    await importCompany(app, { csv: CO_CSV, owner: "Alex" });
     // Two different people each have Noppamas in their friend list — the case a boolean couldn't show.
-    await importFacebook(app, { friends: [["Noppamas", 1]], uploader: "Alex" });
-    await importFacebook(app, { friends: [["Noppamas", 2]], uploader: "Bee" });
+    await importFacebook(app, { friends: [["Noppamas", 1]], owner: "Alex" });
+    await importFacebook(app, { friends: [["Noppamas", 2]], owner: "Bee" });
     await startCompare(app, ["MCKINSEY", "BLUEBIK"]);
 
     const row = (await search("Noppamas")).data[0];
-    expect(row.connectedUploaders).toEqual(["Alex", "Bee"]); // both know Noppamas
+    // Both know Noppamas, each with their own score — one chip per person, not a shared verdict.
+    expect(row.connectedUploaders).toEqual([
+      { name: "Alex", similarity: 1 },
+      { name: "Bee", similarity: 1 },
+    ]);
     expect(row.companyUploaders).toEqual(["Alex", "Bee"]); // both reach MCKINSEY
   });
 
@@ -174,9 +180,9 @@ describe("network uploaders (GET /api/network/uploaders)", () => {
   });
 
   it("lists a roster with zero matches (so 'who have I placed nobody for' is answerable)", async () => {
-    await importCompany(app, { csv: CO_CSV, uploader: "Alex" });
+    await importCompany(app, { csv: CO_CSV, owner: "Alex" });
     // Bee uploaded friends who match nobody on file.
-    await importFacebook(app, { friends: [["Nobody", 1], ["Noone", 2]], uploader: "Bee" });
+    await importFacebook(app, { friends: [["Nobody", 1], ["Noone", 2]], owner: "Bee" });
     await startCompare(app, ["MCKINSEY", "BLUEBIK"]);
 
     const rows = await uploaders();
@@ -184,13 +190,13 @@ describe("network uploaders (GET /api/network/uploaders)", () => {
   });
 
   it("is empty when no friend lists have been uploaded", async () => {
-    await importCompany(app, { csv: CO_CSV, uploader: "Alex" });
+    await importCompany(app, { csv: CO_CSV, owner: "Alex" });
     expect(await uploaders()).toEqual([]);
   });
 });
 
 describe("network uploader detail (GET /api/network/uploader)", () => {
-  it("groups matches by company, carrying the contact's en/th names, and lists no-match names", async () => {
+  it("groups matches by company, carrying the contact's en/th names, and lists the unplaced", async () => {
     await seedAndCompare();
 
     const alex = await uploader("Alex");
@@ -201,9 +207,52 @@ describe("network uploader detail (GET /api/network/uploader)", () => {
     // One company section, the matched contact's English + Thai names alongside the uploaded name.
     // Everything is stored lower-cased except the company, which keeps its case.
     expect(alex.matchedByCompany).toEqual([
-      { company: "MCKINSEY", people: [{ friend: "noppamas", en: "noppamas", th: "นพมาศ" }] },
+      {
+        company: "MCKINSEY",
+        // With how close the match was: this list is every pairing a run called a match, and
+        // without the score an exact name and a near miss read as the same claim.
+        people: [{ friend: "noppamas", en: "noppamas", th: "นพมาศ", similarity: 1 }],
+      },
     ]);
-    expect(alex.noMatchNames).toEqual(["stranger"]);
+    // The unplaced friend, with whatever the matcher looked at before turning them down: it keeps
+    // every friend's closest candidate whether or not it clears the bar, so the row is there to
+    // read. WHICH contact is not asserted — "Stranger" shares no trigram with either name, so both
+    // score 0 and the winner is a tie-break, not a finding. The score is: 0 is what says so.
+    expect(alex.noMatchPeople).toHaveLength(1);
+    const [stranger] = alex.noMatchPeople;
+    expect(stranger.friend).toBe("stranger");
+    expect(stranger.similarity).toBe(0);
+    expect(["MCKINSEY", "BLUEBIK"]).toContain(stranger.company);
+  });
+
+  it("carries the near miss a run rejected — the contact, their company and how close it got", async () => {
+    await importCompany(app, { csv: CO_CSV, owner: "Alex" });
+    // One p short of MCKINSEY's Noppamas: a real near miss at 0.7 trigram overlap, under the 0.8
+    // the internal matcher calls a match. Unambiguously closest to her, so unlike "Stranger" above
+    // this pins the actual contact.
+    await importFacebook(app, { friends: [["Nopamas", 1]], owner: "Alex" });
+    await startCompare(app, ["MCKINSEY", "BLUEBIK"]);
+
+    const alex = await uploader("Alex");
+    expect(alex.matched).toBe(0);
+    expect(alex.noMatchPeople).toHaveLength(1);
+    const [near] = alex.noMatchPeople;
+    // The Thai name and the company are the CONTACT's — the friend row has neither.
+    expect(near).toMatchObject({ friend: "nopamas", en: "noppamas", th: "นพมาศ", company: "MCKINSEY" });
+    expect(near.similarity).toBeGreaterThan(0.5);
+    expect(near.similarity).toBeLessThan(0.8);
+  });
+
+  it("leaves the near miss null for a friend no run has scored", async () => {
+    await importCompany(app, { csv: CO_CSV, owner: "Alex" });
+    await importFacebook(app, { friends: [["Stranger", 1]], owner: "Alex" });
+    // No compare run — nothing has been scored against anyone, and an empty matcher is not a
+    // finding about the friend: the entry is still listed, with nothing attached to it.
+
+    const alex = await uploader("Alex");
+    expect(alex.noMatchPeople).toEqual([
+      { friend: "stranger", en: null, th: null, company: null, similarity: null },
+    ]);
   });
 
   it("reports an unknown uploader as an empty roster rather than an error", async () => {
@@ -218,7 +267,7 @@ describe("network uploader detail (GET /api/network/uploader)", () => {
       matched: 0,
       noMatch: 0,
       matchedByCompany: [],
-      noMatchNames: [],
+      noMatchPeople: [],
     });
   });
 
@@ -236,7 +285,7 @@ describe("rename a contact (PATCH /api/comparisons/company-data/:uuid)", () => {
     app.inject({ method: "PATCH", url: `/api/comparisons/company-data/${uuid}`, payload: body });
 
   it("cleans the new name the same way an import does, and returns what was stored", async () => {
-    await importCompany(app, { csv: CO_CSV, uploader: "Alex" });
+    await importCompany(app, { csv: CO_CSV, owner: "Alex" });
     const noppamas = (await contacts()).find((c) => c.person_name_en === "noppamas")!;
 
     const res = await rename(noppamas.uuid, { person_name_en: "Mr. Somchai Jaidee" });
@@ -249,7 +298,7 @@ describe("rename a contact (PATCH /api/comparisons/company-data/:uuid)", () => {
   });
 
   it("moves a contact to a new company", async () => {
-    await importCompany(app, { csv: CO_CSV, uploader: "Alex" });
+    await importCompany(app, { csv: CO_CSV, owner: "Alex" });
     const thana = (await contacts()).find((c) => c.company_name === "BLUEBIK")!;
 
     const res = await rename(thana.uuid, { company_name: "SCG" });
@@ -269,7 +318,7 @@ describe("rename a contact (PATCH /api/comparisons/company-data/:uuid)", () => {
   });
 
   it("400s an edit that would leave the contact with no name at all", async () => {
-    await importCompany(app, { csv: CO_CSV, uploader: "Alex" });
+    await importCompany(app, { csv: CO_CSV, owner: "Alex" });
     const noppamas = (await contacts()).find((c) => c.person_name_en === "noppamas")!;
 
     const res = await rename(noppamas.uuid, { person_name_en: "", person_name_th: "" });
@@ -277,7 +326,7 @@ describe("rename a contact (PATCH /api/comparisons/company-data/:uuid)", () => {
   });
 
   it("400s an empty edit and 404s an unknown contact", async () => {
-    await importCompany(app, { csv: CO_CSV, uploader: "Alex" });
+    await importCompany(app, { csv: CO_CSV, owner: "Alex" });
     const noppamas = (await contacts()).find((c) => c.person_name_en === "noppamas")!;
 
     expect((await rename(noppamas.uuid, {})).statusCode).toBe(400);

@@ -78,7 +78,8 @@ export type ComparisonResultRow = z.infer<typeof ComparisonResultRowSchema>;
 export const CreateComparisonBodySchema = z.object({
   name: z.string().trim().min(1, 'Session name is required'),
   mode: ModeSchema.default('fresh'),
-  uploadPersonName: z.string().trim().min(1, 'Upload user is required'),
+  // The field keeps its wire name; what it holds is the import's relationship owner.
+  uploadPersonName: z.string().trim().min(1, 'Relationship owner is required'),
 });
 export type CreateComparisonBody = z.infer<typeof CreateComparisonBodySchema>;
 
@@ -215,6 +216,22 @@ export const ComparisonProgressSchema = z.object({
    * that from "these rows have no department".
    */
   extraKeys: z.array(z.string()),
+
+  /**
+   * Did any row of this run record a similarity — i.e. is there a score to show and rank by.
+   *
+   * A property of the run, not of the matcher that made it. The score used to be assumed from
+   * `origin`: a compare run had one, an import did not, because the import readers never selected
+   * it. They do now — an external matcher that sends `similarity` on its callback has it stored in
+   * the same column the internal one writes — so the question "does this run have scores" is a fact
+   * about the rows, and only they can answer it.
+   *
+   * Computed over the whole run for the same reason `extraKeys` is: a column that exists on page 1
+   * and not on page 2 reads as "these rows scored nothing", which is a different claim entirely.
+   * False means the Similarity column is hidden and "Best match" is not offered — both would be
+   * furniture over a column of dashes.
+   */
+  hasSimilarity: z.boolean(),
 });
 export type ComparisonProgress = z.infer<typeof ComparisonProgressSchema>;
 

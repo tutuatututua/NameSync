@@ -5,11 +5,14 @@ import { pipeline } from "stream/promises";
 import type { FastifyRequest } from "fastify";
 import { env } from "../config/env";
 import { BadRequest } from "./errors";
+import { isSupportedUpload, UPLOAD_FORMATS } from "./table-file";
 
 /**
- * Streaming multipart intake for the two files this app accepts: a company workbook and a
- * Facebook friends workbook. Both are .xlsx — the extension is the only thing checked here,
- * because whether the bytes really are a workbook is the reader's question, not this one's.
+ * Streaming multipart intake for the two files this app accepts: company data and a Facebook
+ * friends list. Either may be a workbook, a CSV or a JSON export — the extension is the only thing
+ * checked here, and it is checked against the reader registry (table-file.ts) rather than a list of
+ * its own, so what the intake accepts is exactly what something downstream can read. Whether the
+ * bytes really are what the name claims is the reader's question, not this one's.
  *
  * Shared by the import (`POST /api/comparisons/run`) and the preview
  * (`POST /api/upload-sessions/preview`) precisely so the two can't drift. A preview that
@@ -42,10 +45,7 @@ export interface ParsedUpload {
   fields: Record<string, string>;
 }
 
-/** The one upload format, for both sources. */
-const XLSX = ".xlsx";
-
-/** Stream companyFile (.xlsx) + facebookFile (.xlsx) to disk; collect text fields. */
+/** Stream companyFile + facebookFile (.xlsx, .csv or .json) to disk; collect text fields. */
 export async function parseUpload(req: FastifyRequest): Promise<ParsedUpload> {
   const fields: Record<string, string> = {};
   let companyPath: string | null = null;
@@ -57,15 +57,15 @@ export async function parseUpload(req: FastifyRequest): Promise<ParsedUpload> {
 
   for await (const part of req.parts()) {
     if (part.type === "file") {
-      const name = (part.filename || "").toLowerCase();
+      const readable = isSupportedUpload(part.filename || "");
       try {
-        if (part.fieldname === "companyFile" && name.endsWith(XLSX)) {
+        if (part.fieldname === "companyFile" && readable) {
           companyPath = path.join(UPLOAD_DIR, `${crypto.randomUUID()}-${part.filename}`);
           companyFileName = part.filename;
           await pipeline(part.file, fs.createWriteStream(companyPath));
           written.push(companyPath);
           if (part.file.truncated && !error) error = new BadRequest("Company file exceeds the size limit");
-        } else if (part.fieldname === "facebookFile" && name.endsWith(XLSX)) {
+        } else if (part.fieldname === "facebookFile" && readable) {
           facebookPath = path.join(UPLOAD_DIR, `${crypto.randomUUID()}-${part.filename}`);
           facebookFileName = part.filename;
           await pipeline(part.file, fs.createWriteStream(facebookPath));
@@ -73,8 +73,10 @@ export async function parseUpload(req: FastifyRequest): Promise<ParsedUpload> {
           if (part.file.truncated && !error) error = new BadRequest("Facebook file exceeds the size limit");
         } else {
           await part.toBuffer().catch(() => undefined); // drain rejected/unknown file
-          if (!error && part.fieldname === "companyFile") error = new BadRequest("Company file must be an .xlsx file");
-          if (!error && part.fieldname === "facebookFile") error = new BadRequest("Facebook file must be an .xlsx file");
+          if (!error && part.fieldname === "companyFile")
+            error = new BadRequest(`Company file must be ${UPLOAD_FORMATS}`);
+          if (!error && part.fieldname === "facebookFile")
+            error = new BadRequest(`Facebook file must be ${UPLOAD_FORMATS}`);
         }
       } catch (e) {
         if (!error) error = e as Error;

@@ -1,12 +1,17 @@
 import type { ColumnMapping, UploadPreview } from '@extensions/contract';
 import type { CompanyContactRecord } from '../models/company-contact.model';
 import type { FriendRecord } from '../models/friend.model';
-import { readSheet } from '../lib/xlsx';
+import { readTable } from '../lib/table-file';
 import { cleanPersonName, tidyText, wasCleaned } from './name-cleaner.service';
 
 /**
- * Reads the files this app accepts — an .xlsx workbook, for both sources — and describes
- * what it read.
+ * Reads the files this app accepts — a workbook, a CSV or a JSON export, for both sources — and
+ * describes what it read.
+ *
+ * Format is settled below this, in `readTable`: whichever of the three a user hands over arrives
+ * here as headers and rows, so a column alias, a cleaning rule and a warning are written once and
+ * hold for every format. A file's *shape* is still its own business — the column names are what
+ * this file matches on, and a JSON export and a spreadsheet of the same data have the same ones.
  *
  * `parse*` is what the import runs; `preview*` is what the upload screen shows beforehand.
  * They resolve headers and map rows through the *same* functions (`buildMapping`,
@@ -37,8 +42,8 @@ const COMPANY_FIELDS: FieldSpec[] = [
   { target: 'person_name_en', label: 'English name', aliases: ['eng_name', 'English Name', 'English', 'eng'], isName: true },
 ];
 
-/** Facebook friends, as a sheet. The JSON export's own key name (`name`) leads the aliases,
- *  because a workbook made by pasting that export in keeps it.
+/** Facebook friends, as a table. The JSON export's own key name (`name`) leads the aliases: it is
+ *  what that export writes, and what a workbook made by pasting it in keeps.
  *
  *  The export's `timestamp` ("friended on") used to be read into `friend.source_timestamp`.
  *  Nothing ever matched, grouped or filtered on it — it only ordered the grid — so the column
@@ -172,23 +177,23 @@ function cleaningNote(pairs: [raw: string | null, clean: string | null][]): stri
 }
 
 export class FileParserService {
-  /** Parse a company workbook into contact records. */
-  static async parseCompanyXLSX(filePath: string): Promise<CompanyContactRecord[]> {
-    const { headers, rows } = await readSheet(filePath);
+  /** Parse a company file into contact records. */
+  static async parseCompanyFile(filePath: string): Promise<CompanyContactRecord[]> {
+    const { headers, rows } = await readTable(filePath);
     const mapping = buildMapping(COMPANY_FIELDS, headers);
     return rows.map((r) => mapCompanyRow(r, mapping));
   }
 
-  /** Parse a Facebook friends workbook into friend records. */
-  static async parseFacebookXLSX(filePath: string): Promise<FriendRecord[]> {
-    const { headers, rows } = await readSheet(filePath);
+  /** Parse a Facebook friends file into friend records. */
+  static async parseFacebookFile(filePath: string): Promise<FriendRecord[]> {
+    const { headers, rows } = await readTable(filePath);
     const mapping = buildMapping(FACEBOOK_FIELDS, headers);
     return rows.map((r) => mapFriendRow(r, mapping));
   }
 
-  /** What a company workbook would import, without importing it. */
-  static async previewCompanyXLSX(filePath: string, fileName: string): Promise<UploadPreview> {
-    const { headers, rows } = await readSheet(filePath);
+  /** What a company file would import, without importing it. */
+  static async previewCompanyFile(filePath: string, fileName: string): Promise<UploadPreview> {
+    const { headers, rows } = await readTable(filePath);
     const mapping = buildMapping(COMPANY_FIELDS, headers);
     const mapped = rows.map((r) => mapCompanyRow(r, mapping));
     const raws = rows.map((r) => rawRow(r, mapping));
@@ -237,9 +242,9 @@ export class FileParserService {
     };
   }
 
-  /** What a Facebook friends workbook would import, without importing it. */
-  static async previewFacebookXLSX(filePath: string, fileName: string): Promise<UploadPreview> {
-    const { headers, rows } = await readSheet(filePath);
+  /** What a Facebook friends file would import, without importing it. */
+  static async previewFacebookFile(filePath: string, fileName: string): Promise<UploadPreview> {
+    const { headers, rows } = await readTable(filePath);
     const mapping = buildMapping(FACEBOOK_FIELDS, headers);
     const mapped = rows.map((r) => mapFriendRow(r, mapping));
     const raws = rows.map((r) => rawRow(r, mapping));

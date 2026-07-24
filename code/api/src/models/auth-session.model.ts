@@ -61,6 +61,7 @@ export class AuthSessionModel extends DBModel {
         "u.roles as roles",
         "u.is_active as is_active",
         "u.last_login_at as last_login_at",
+        "u.last_login_ip as last_login_ip",
         "u.created_at as created_at",
         "u.updated_at as updated_at",
       ])
@@ -83,6 +84,7 @@ export class AuthSessionModel extends DBModel {
         roles: (r.roles as string[] | null) ?? [],
         is_active: r.is_active as boolean,
         last_login_at: (r.last_login_at as string | null) ?? null,
+        last_login_ip: (r.last_login_ip as string | null) ?? null,
         created_at: String(r.created_at),
         updated_at: String(r.updated_at),
       },

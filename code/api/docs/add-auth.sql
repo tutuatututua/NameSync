@@ -38,6 +38,9 @@ CREATE TABLE IF NOT EXISTS app_user (
   -- The guard re-checks it on every request, so it takes effect immediately.
   is_active     boolean NOT NULL DEFAULT true,
   last_login_at timestamptz,
+  -- Where that last sign-in came from (see docs/add-last-login-ip.sql, which adds this to a
+  -- database that already ran an earlier version of this script).
+  last_login_ip varchar(64),
   created_at    timestamptz NOT NULL DEFAULT now(),
   updated_at    timestamptz NOT NULL DEFAULT now()
 );

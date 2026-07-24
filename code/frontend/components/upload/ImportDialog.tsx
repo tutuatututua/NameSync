@@ -13,6 +13,7 @@ import {
 } from "@/components/ui/dialog";
 import { UploadPanel } from "@/components/upload/UploadPanel";
 import { ImportReview, type ImportSource } from "@/components/upload/ImportReview";
+import { UPLOAD_ACCEPT } from "@/lib/files";
 
 /**
  * Import, in a dialog — the Database console's entry point, sitting on the table an import
@@ -68,10 +69,10 @@ export function ImportDialog({
           <ImportReview source={source} file={file} onCancel={() => setFile(null)} onComplete={close} />
         ) : (
           <UploadPanel
-            accept={[".xlsx"]}
+            accept={UPLOAD_ACCEPT}
             file={null}
             onChange={setFile}
-            title="Drop XLSX"
+            title="Drop a file"
             hint="or browse"
           />
         )}

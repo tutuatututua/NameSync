@@ -75,8 +75,22 @@ const EnvSchema = z.object({
   // Refused in production.
   AUTH_DISABLED: z.string().optional(),
 
+  // Whether `X-Forwarded-For` may be believed when deciding who a request came from.
+  //
+  // This is what makes the recorded login IP (auth_session.ip, app_user.last_login_ip) the
+  // USER's address rather than whatever last touched the packet. Unset, `req.ip` is the
+  // socket peer — right when the API is exposed directly, and the only safe default, because
+  // any client can put any address in that header and a trusted one is a forgeable audit
+  // trail. Behind nginx/an ingress/compose, leaving this unset records the proxy's internal
+  // address on every single login instead.
+  //
+  //   'true'                 trust the immediate proxy (one hop)
+  //   a number, e.g. '2'     trust that many hops
+  //   a CIDR/IP list         trust only these addresses — the strongest form
+  TRUST_PROXY: z.string().optional(),
+
   // ── Center sign-in (centerapp.io) ──────────────────────────────────────────
-  // The production identity source. NameSync forwards email+password to Center's auth API,
+  // The production identity source. Network Intel forwards email+password to Center's auth API,
   // and on success mints its own session (lib/center.ts, services/center-auth.service.ts).
   // Required in production — with it unset there is no way to sign in to a prod deploy, since
   // the local password path is dev-only (see the login route). See docs/AUTH.md.
@@ -89,7 +103,7 @@ const EnvSchema = z.object({
   CENTER_GROUP_IAM2_ID: z.string().optional(),
 
   // ── Email-OTP sign-in + outbound email (SMTP) ───────────────────────────────
-  // A second, NameSync-owned login path: password, then a one-time code emailed from here.
+  // A second, Network Intel-owned login path: password, then a one-time code emailed from here.
   // See services/otp-auth.service.ts and lib/mailer.ts. The code is delivered over SMTP.
   //
   // With SMTP_HOST set, mail is actually sent. Unset in dev/test, the mailer instead LOGS
@@ -104,7 +118,7 @@ const EnvSchema = z.object({
     .optional(),
   SMTP_USER: z.string().optional(),
   SMTP_PASS: z.string().optional(),
-  // The From: address on OTP mail, e.g. "NameSync <no-reply@example.com>". Falls back to
+  // The From: address on OTP mail, e.g. "Network Intel <no-reply@example.com>". Falls back to
   // SMTP_USER when unset. Required (as itself or SMTP_USER) once SMTP_HOST is set.
   SMTP_FROM: z.string().optional(),
 
@@ -203,7 +217,26 @@ export const corsOrigins: string[] = (env.CORS_ORIGIN ?? '')
 export const isProduction = env.NODE_ENV === 'production';
 export const isTest = env.NODE_ENV === 'test';
 
-/** Is Center sign-in wired up? */
+/**
+ * TRUST_PROXY in the shape Fastify wants: `false` (believe nobody), `true` (one hop), a hop
+ * count, or an explicit allowlist of proxy addresses/CIDRs. Defaults to `false` — a wrong
+ * value here does not break the app, it quietly poisons every address it records, so it has
+ * to be opted into deliberately rather than guessed at.
+ */
+export const trustProxy: boolean | number | string[] = (() => {
+  const raw = env.TRUST_PROXY?.trim();
+  if (!raw) return false;
+  const flag = raw.toLowerCase();
+  if (flag === 'false' || flag === '0') return false;
+  if (flag === 'true') return true;
+  if (/^\d+$/.test(raw)) return Number(raw);
+  return raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+})();
+
+/** Is Center sign-in wired up? Always true in production (env refuses to boot otherwise). */
 export const isCenterConfigured = (): boolean => !!env.CENTER_PLAYME_URL;
 
 /**

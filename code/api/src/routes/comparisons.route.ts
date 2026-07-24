@@ -43,6 +43,7 @@ import { ok, okList, okMessage } from "../lib/http";
 import { requireCallbackToken } from "../lib/auth";
 // Shared with the preview endpoint, so the file the preview read is the file this imports.
 import { parseUpload, unlinkQuiet } from "../lib/upload-files";
+import { UPLOAD_FORMATS } from "../lib/table-file";
 
 /**
  * Hand an import's stored rows to the ingestion webhook, and keep the books straight either
@@ -107,18 +108,18 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
     async (req) => {
       const { companyPath, facebookPath, fields } = await parseUpload(req);
       const uploadPersonName = fields.uploadPersonName?.trim();
-      // The uploader is half the friend dedup key (same uploader + same name = duplicate),
-      // so a social import can't do without it: uploads with no uploader would all dedupe
-      // against each other, merging different people's friend lists. Company rows dedupe on
-      // the row itself and ignore the uploader, so there it's just an audit note — optional.
+      // The relationship owner is half the friend dedup key (same owner + same name = duplicate),
+      // so a social import can't do without one: uploads with no owner would all dedupe against
+      // each other, merging different people's friend lists. Company rows dedupe on the row itself
+      // and ignore the owner, so there it's just an audit note — optional.
       if (facebookPath && !uploadPersonName) {
         unlinkQuiet(companyPath, facebookPath);
-        throw new BadRequest("Upload user is required for a friends import");
+        throw new BadRequest("Relationship owner is required for a friends import");
       }
       // No file is not an import. Answering 200 here used to leave the caller believing
       // something was recorded when nothing was.
       if (!companyPath && !facebookPath) {
-        throw new BadRequest("No file attached — upload a company or Facebook .xlsx file");
+        throw new BadRequest(`No file attached — upload a company or Facebook file (${UPLOAD_FORMATS})`);
       }
       const name =
         (fields.name && fields.name.trim()) || `Comparison ${new Date().toISOString().slice(0, 10)}`;
@@ -204,7 +205,7 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
           if (external && !env.COMPANY_WEBHOOK_URL) {
             throw new ServiceUnavailable("Ingestion service is not configured (COMPANY_WEBHOOK_URL missing)");
           }
-          const recs = await FileParserService.parseCompanyXLSX(companyPath);
+          const recs = await FileParserService.parseCompanyFile(companyPath);
           if (recs.length === 0) {
             throw new BadRequest("The company file has no rows to import");
           }
@@ -244,7 +245,7 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
           if (external && !env.FACEBOOK_WEBHOOK_URL) {
             throw new ServiceUnavailable("Ingestion service is not configured (FACEBOOK_WEBHOOK_URL missing)");
           }
-          const recs = await FileParserService.parseFacebookXLSX(facebookPath);
+          const recs = await FileParserService.parseFacebookFile(facebookPath);
           if (recs.length === 0) {
             throw new BadRequest("The Facebook file has no friends to import");
           }
@@ -510,10 +511,13 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
       // request outright. Same reason, same shape, as the results endpoint below.
       const upload = isExternalMatcher() ? await UploadModel.findByComparisonId(id) : undefined;
 
-      // The extra columns the run's matcher sent, if any. Read from the results table either way:
-      // `extra` is a property of a *result*, not of the row that produced it, so both kinds of run
-      // keep theirs in the same place.
-      const extraKeys = await ComparisonResultModel.extraKeys(id);
+      // The extra columns the run's matcher sent, if any, and whether it scored anything. Both are
+      // read from the results table either way: `extra` and `similarity` are properties of a
+      // *result*, not of the row that produced it, so every kind of run keeps them in one place.
+      const [extraKeys, hasSimilarity] = await Promise.all([
+        ComparisonResultModel.extraKeys(id),
+        ComparisonResultModel.hasSimilarity(id),
+      ]);
 
       /**
        * A run with no import behind it — compare-by-company, the internal matcher.
@@ -542,6 +546,7 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
           kind: "facebook" as const,
           origin: "compare" as const,
           extraKeys,
+          hasSimilarity,
         });
       }
 
@@ -570,6 +575,7 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
           kind,
           origin: "import" as const,
           extraKeys,
+          hasSimilarity,
         });
       }
 
@@ -604,6 +610,7 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
         kind,
         origin: "import" as const,
         extraKeys,
+        hasSimilarity,
       });
     }
   );

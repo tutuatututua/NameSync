@@ -177,7 +177,7 @@ export const api = {
         body: JSON.stringify(body),
       }).then((r) => r.data),
     /**
-     * Sign in with an emailed one-time code — NameSync's own two-factor path, works in every
+     * Sign in with an emailed one-time code — Network Intel's own two-factor path, works in every
      * environment. Returns either the signed-in user or a challenge (`twoFactorRequired`)
      * meaning a code has been emailed; the caller calls again with the same email+password
      * plus `code` and the echoed `ref`. The session cookie is set by the API, never seen here.
