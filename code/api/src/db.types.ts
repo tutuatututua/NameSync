@@ -110,6 +110,26 @@ export interface AppUser {
   updated_at: string;
 }
 
+/**
+ * A one-time login code, emailed to a user. `code_hash` is a scrypt hash of the digits —
+ * never the digits themselves — so a dump of this table yields nothing usable: a 6-digit
+ * code is trivially reversible from a fast hash, so it gets the same treatment as a password.
+ * A row is spent (consumed_at set) on first correct use, and burned after OTP_MAX_ATTEMPTS
+ * wrong guesses or once expires_at passes. See services/otp-auth.service.ts.
+ */
+export interface EmailOtp {
+  id: string;
+  user_id: string;
+  purpose: string; // 'login'
+  code_hash: string;
+  expires_at: string;
+  consumed_at: string | null;
+  attempts: number;
+  ip: string | null;
+  user_agent: string | null;
+  created_at: string;
+}
+
 /** A live login. `token_hash` is the SHA-256 of the token the browser holds. */
 export interface AuthSession {
   id: string;
@@ -131,4 +151,5 @@ export interface DB {
   saved_query: SavedQuery;
   app_user: AppUser;
   auth_session: AuthSession;
+  email_otp: EmailOtp;
 }

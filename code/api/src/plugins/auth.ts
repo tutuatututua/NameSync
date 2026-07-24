@@ -17,7 +17,8 @@ declare module "fastify" {
 
 /**
  * Routes reachable without signing in:
- *  - POST /api/auth/login and /api/auth/center/login, because that is where a session comes from
+ *  - POST /api/auth/login, /api/auth/center/login and /api/auth/otp/login, because that is
+ *    where a session comes from
  *  - health, so a load balancer can probe the app
  *  - the OpenAPI docs
  *  - the matcher callback, which is machine-to-machine and carries its own shared secret
@@ -33,6 +34,7 @@ declare module "fastify" {
 const PUBLIC_PATHS = [
   /^\/api\/auth\/login$/,
   /^\/api\/auth\/center\/login$/,
+  /^\/api\/auth\/otp\/login$/,
   /^\/api\/health/,
   /^\/docs/,
   /^\/api\/callbacks\//,

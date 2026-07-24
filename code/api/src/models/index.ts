@@ -7,3 +7,4 @@ export { TableEditorModel } from "./table-editor.model";
 export { SavedQueryModel } from "./saved-query.model";
 export { UserModel } from "./user.model";
 export { AuthSessionModel, type ActiveSession } from "./auth-session.model";
+export { EmailOtpModel } from "./email-otp.model";

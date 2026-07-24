@@ -29,6 +29,23 @@ export interface CenterSignInArgs {
   ref?: string | null;
 }
 
+/**
+ * An email-OTP sign-in either completes, or the API has emailed a code and wants it back.
+ * Same shape as the Center outcome (the method is always "email" here), so the login form
+ * reuses one second-factor step for both.
+ */
+export type OtpSignInOutcome =
+  | { status: "signed-in" }
+  | { status: "otp-sent"; ref: string | null };
+
+/** What the login form hands to `signInWithOtp`, with the code + ref on step two. */
+export interface OtpSignInArgs {
+  email: string;
+  password: string;
+  code?: string;
+  ref?: string | null;
+}
+
 interface AuthState {
   user: AuthUser | null;
   /** True until the first /me answers. Render nothing decisive while it is. */
@@ -37,6 +54,8 @@ interface AuthState {
   signIn: (email: string, password: string) => Promise<void>;
   /** Center sign-in — the production path. Resolves to a 2FA challenge or a completed session. */
   signInWithCenter: (args: CenterSignInArgs) => Promise<CenterSignInOutcome>;
+  /** Email one-time-code sign-in. Resolves to "code emailed" or a completed session. */
+  signInWithOtp: (args: OtpSignInArgs) => Promise<OtpSignInOutcome>;
   signOut: () => Promise<void>;
 }
 
@@ -124,6 +143,25 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     []
   );
 
+  const signInWithOtp = React.useCallback(
+    async (args: OtpSignInArgs): Promise<OtpSignInOutcome> => {
+      const result = await api.auth.otpLogin({
+        email: args.email,
+        password: args.password,
+        code: args.code,
+        ref: args.ref ?? undefined,
+      });
+      // Either a completed session (`{ user }`) or a challenge meaning a code was emailed.
+      if ("twoFactorRequired" in result) {
+        return { status: "otp-sent", ref: result.ref };
+      }
+      setUser(result.user);
+      setLoading(false);
+      return { status: "signed-in" };
+    },
+    []
+  );
+
   const signOut = React.useCallback(async () => {
     try {
       await api.auth.logout();
@@ -139,8 +177,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [queryClient, router]);
 
   const value = React.useMemo<AuthState>(
-    () => ({ user, loading, signIn, signInWithCenter, signOut }),
-    [user, loading, signIn, signInWithCenter, signOut]
+    () => ({ user, loading, signIn, signInWithCenter, signInWithOtp, signOut }),
+    [user, loading, signIn, signInWithCenter, signInWithOtp, signOut]
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

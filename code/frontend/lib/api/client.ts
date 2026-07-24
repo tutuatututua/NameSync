@@ -8,6 +8,8 @@ import type {
   ChangePasswordBody,
   CreateUserBody,
   LoginBody,
+  OtpLoginBody,
+  OtpLoginData,
   CreateSavedQueryBody,
   DbRow,
   DbTablesData,
@@ -131,7 +133,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     // disabled. Tell the auth layer once, from the one place every request passes through,
     // rather than making every caller remember to handle it. The sign-in endpoints are the
     // exception: a 401 there is "wrong password", which the form shows inline.
-    if (res.status === 401 && path !== "/auth/login" && path !== "/auth/center/login") {
+    if (
+      res.status === 401 &&
+      path !== "/auth/login" &&
+      path !== "/auth/center/login" &&
+      path !== "/auth/otp/login"
+    ) {
       notifyUnauthorized();
     }
 
@@ -166,6 +173,17 @@ export const api = {
      */
     centerLogin: (body: CenterLoginBody) =>
       request<Envelope<CenterLoginData>>("/auth/center/login", {
+        method: "POST",
+        body: JSON.stringify(body),
+      }).then((r) => r.data),
+    /**
+     * Sign in with an emailed one-time code — NameSync's own two-factor path, works in every
+     * environment. Returns either the signed-in user or a challenge (`twoFactorRequired`)
+     * meaning a code has been emailed; the caller calls again with the same email+password
+     * plus `code` and the echoed `ref`. The session cookie is set by the API, never seen here.
+     */
+    otpLogin: (body: OtpLoginBody) =>
+      request<Envelope<OtpLoginData>>("/auth/otp/login", {
         method: "POST",
         body: JSON.stringify(body),
       }).then((r) => r.data),

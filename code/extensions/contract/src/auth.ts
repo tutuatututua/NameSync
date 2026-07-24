@@ -100,3 +100,32 @@ export type TwoFactorChallenge = z.infer<typeof TwoFactorChallengeSchema>;
 /** The Center login answers with either a completed session (`{ user }`) or a 2FA challenge. */
 export const CenterLoginDataSchema = z.union([AuthSessionDataSchema, TwoFactorChallengeSchema]);
 export type CenterLoginData = z.infer<typeof CenterLoginDataSchema>;
+
+// ── Email-OTP sign-in (NameSync-owned) ─────────────────────────────────────────
+// A second login path that NameSync runs itself — no external issuer. Two factors:
+// the account password, then a one-time code NameSync generates and emails. It works
+// in every environment (unlike the dev-only local /login), and unlike Center the code
+// is minted and sent from here (api/src/services/otp-auth.service.ts).
+//
+// Same two-step, stateless shape as Center: the first call carries email+password, the
+// API verifies them, emails a code and answers with a challenge (`ref` = the code's id);
+// the client calls again with the same email+password plus `code` and the echoed `ref`.
+// The password is re-sent on step two on purpose — the API holds no half-finished login
+// between calls, so knowing the password is proven again at the moment the code is spent.
+export const OtpLoginBodySchema = z.object({
+  email: z.string().min(1, 'Email is required').email('Enter a valid email address'),
+  password: z.string().min(1, 'Password is required'),
+  /** The emailed code, on the second (verify) call only. Digits, but validated server-side. */
+  code: z.string().min(1).max(12).optional(),
+  /** The challenge reference (the code's id) handed back by step one; echoed on step two. */
+  ref: z.string().optional(),
+});
+export type OtpLoginBody = z.infer<typeof OtpLoginBodySchema>;
+
+/**
+ * Step one's answer: a code has been emailed, no cookie set yet. `method` is always
+ * `email` here — this path has no other factor — and `ref` is always present (the id the
+ * client must echo back), so it reuses TwoFactorChallengeSchema's shape without its nulls.
+ */
+export const OtpLoginDataSchema = z.union([AuthSessionDataSchema, TwoFactorChallengeSchema]);
+export type OtpLoginData = z.infer<typeof OtpLoginDataSchema>;

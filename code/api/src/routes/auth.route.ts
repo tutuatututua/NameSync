@@ -10,6 +10,8 @@ import {
   ChangePasswordBodySchema,
   CreateUserBodySchema,
   LoginBodySchema,
+  OtpLoginBodySchema,
+  OtpLoginDataSchema,
   type AuthUser,
 } from "@extensions/contract";
 import { isProduction } from "../config/env";
@@ -19,6 +21,7 @@ import { bearerToken, clearSessionCookie, SESSION_COOKIE, setSessionCookie } fro
 import { readCookie } from "../lib/cookies";
 import { changePassword, createUser, login, logout } from "../services/auth.service";
 import { signInWithCenter } from "../services/center-auth.service";
+import { signInWithOtp } from "../services/otp-auth.service";
 import type { SessionUser } from "../lib/session";
 
 /**
@@ -65,6 +68,32 @@ export default async function authRoutes(fastify: FastifyInstance): Promise<void
         method: req.body.method,
         ref: req.body.ref,
         meta: { userAgent: req.headers["user-agent"], ip: ipOf(req) },
+      });
+
+      if (result.kind === "twoFactor") return ok(result.challenge);
+
+      setSessionCookie(reply, result.session.token);
+      return ok({ user: toAuthUser(result.session.user) });
+    }
+  );
+
+  // ── Sign in with an emailed one-time code ─────────────────────────────────
+  // NameSync's own two-factor path, usable in every environment. One endpoint, two steps:
+  // the first call carries email+password (a code is emailed, the reply is a challenge with a
+  // `ref` and no cookie); the second call adds `code`+`ref` and, on success, gets the session.
+  // See services/otp-auth.service.ts.
+  app.post(
+    "/otp/login",
+    { schema: { body: OtpLoginBodySchema, response: { 200: apiSuccess(OtpLoginDataSchema) } } },
+    async (req, reply) => {
+      const result = await signInWithOtp({
+        email: req.body.email,
+        password: req.body.password,
+        code: req.body.code,
+        ref: req.body.ref,
+        meta: { userAgent: req.headers["user-agent"], ip: ipOf(req) },
+        // In dev, with SMTP unset, the mailer writes the code here so the flow still works.
+        log: (msg) => req.log.info(msg),
       });
 
       if (result.kind === "twoFactor") return ok(result.challenge);
