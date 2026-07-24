@@ -83,15 +83,20 @@ export interface LoginResult {
 }
 
 /**
- * Sign in. Every failure — unknown email, wrong password, disabled account — raises the
- * same 401 with the same message and after the same amount of work, so the response can't
- * be used to discover which emails have accounts.
+ * Prove an email+password pair, and return the user it belongs to — without minting a
+ * session. This is the shared, throttled front half of every password-based sign-in: the
+ * plain local `login` below ends in a session, the email-OTP path (otp-auth.service.ts)
+ * ends in a code instead, but both must first get past exactly this check, the same way.
+ *
+ * Every failure — unknown email, wrong password, disabled account — raises the same 401 with
+ * the same message and after the same amount of work, so the response can't be used to
+ * discover which emails have accounts.
  */
-export async function login(
+export async function verifyCredentials(
   email: string,
   password: string,
   meta: { userAgent?: string; ip?: string } = {}
-): Promise<LoginResult> {
+): Promise<AppUser> {
   const key = throttleKey(email, meta.ip);
   checkThrottle(key);
   pruneThrottle();
@@ -108,7 +113,19 @@ export async function login(
   }
 
   attempts.delete(key); // a success clears the slate
+  return user;
+}
 
+/**
+ * Sign in with a password alone. Verifies the credentials and immediately issues a session —
+ * the single-factor path, used by the dev-only local /login.
+ */
+export async function login(
+  email: string,
+  password: string,
+  meta: { userAgent?: string; ip?: string } = {}
+): Promise<LoginResult> {
+  const user = await verifyCredentials(email, password, meta);
   return issueSession(user, meta);
 }
 

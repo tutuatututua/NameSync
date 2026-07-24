@@ -61,7 +61,9 @@ and easier to remember.
 
 | Route | Auth | |
 | --- | --- | --- |
-| `POST /api/auth/login` | public | `{email, password}` → sets the cookie, returns the user. |
+| `POST /api/auth/login` | public | `{email, password}` → sets the cookie, returns the user. Single factor; **dev-only** (refused in production). |
+| `POST /api/auth/otp/login` | public | Password **+ emailed code**, two-factor. Works in every environment. See below. |
+| `POST /api/auth/center/login` | public | Forward to Center; Center owns the second factor. The production default. |
 | `POST /api/auth/logout` | any | Deletes the session row. Always clears the cookie. |
 | `GET /api/auth/me` | session | The signed-in user. **401 when signed out** — this is how the frontend asks. |
 | `POST /api/auth/change-password` | session | Revokes every session, the caller's included. |
@@ -74,11 +76,40 @@ of logs, out of browser history, and out of reach of script.
 off the `Set-Cookie` themselves. It is the same opaque session token, looked up the same way;
 there is no second code path.
 
+## Email one-time-code sign-in (2FA)
+
+`POST /api/auth/otp/login` is NameSync's own two-factor login: the password is the **first**
+factor, and NameSync then **emails a 6-digit code** that must be entered to finish. It is the
+same two-step, stateless shape as the Center path — and unlike the plain `/login`, it works in
+every environment, Center or no Center.
+
+**The flow.** One endpoint, two calls (`api/src/services/otp-auth.service.ts`):
+
+1. `{email, password}` → the password is verified; on success a fresh code is generated, only
+   its **scrypt hash** is stored (`email_otp`), the plaintext is emailed, and the reply is a
+   challenge `{twoFactorRequired: true, method: "email", ref}` with **no cookie**.
+2. `{email, password, code, ref}` → the password is verified *again* (nothing is held between
+   the two calls) and the code is checked. On success the session cookie is set.
+
+**Why the code is safe at rest.** A 6-digit code is instantly reversible from a fast hash, so
+it gets the same scrypt treatment as a password — a dump of `email_otp` yields nothing
+replayable. Each code is **single-use** (consumed atomically, so it can't be spent twice),
+**short-lived** (`OTP_TTL_MINUTES`, default 10), and **burns after `OTP_MAX_ATTEMPTS` wrong
+guesses** (default 5). Requesting a new code invalidates any the user was still holding.
+
+**Delivery** is over SMTP (`api/src/lib/mailer.ts`, `nodemailer`). With `SMTP_HOST` set, mail
+is sent; unset in dev/test, the mailer **logs the code to the server log** so the flow works
+with no mail server. See the SMTP/OTP block in `.env.example`.
+
+**The table.** `email_otp` — apply `docs/add-otp-login.sql` to a live database (a fresh schema
+from `docs/schema-redesign.sql` already has it). Drive the frontend to this path with
+`NEXT_PUBLIC_AUTH_MODE=local` (the login page's `local` mode now runs this two-step).
+
 ## What's protected
 
 Everything, via the global hook. The exceptions, all deliberate:
 
-- `POST /api/auth/login` — where a session comes from.
+- `POST /api/auth/login`, `/api/auth/otp/login`, `/api/auth/center/login` — where a session comes from.
 - `/api/health` — so a load balancer can probe the app.
 - `/docs` — the OpenAPI UI.
 - `/api/callbacks/*` — the external matcher posting results back. Machine-to-machine, with no
@@ -123,8 +154,11 @@ loud warning at boot, and **production refuses to start** with it set (`api/src/
 
 ## Brute force
 
-`POST /api/auth/login` allows **5 failed attempts per (email, IP) per 15 minutes**, then 429s.
+The password check — shared by `/api/auth/login` and `/api/auth/otp/login` (both go through
+`verifyCredentials`) — allows **5 failed attempts per (email, IP) per 15 minutes**, then 429s.
 Keyed on both, so one attacker cannot lock a victim out of their own account from elsewhere.
+The emailed code has its **own** cap on top of this: `OTP_MAX_ATTEMPTS` wrong guesses (default
+5) burn the code, so guessing the second factor is bounded independently of the password.
 
 The counter is **in-memory, so it is per-process**: behind N replicas an attacker gets N × 5
 tries. That is a real limitation, and the reason to put a shared limiter at the edge in a

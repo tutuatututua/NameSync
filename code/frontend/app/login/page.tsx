@@ -22,11 +22,17 @@ import { ThemeToggle } from "@/components/theme-toggle";
  * because none is ever handed to the page. If Center wants a second factor, the API says so
  * and the form asks for the code, then submits again.
  *
- * A local-password path is kept for development (`NEXT_PUBLIC_AUTH_MODE=local`); production
- * uses Center and the API refuses a local password there regardless.
+ * The local path (`NEXT_PUBLIC_AUTH_MODE=local`) now carries the same two-step: the password
+ * is only the first factor, and NameSync then emails a one-time code the form asks for — the
+ * exact shape as Center's email 2FA, just minted by NameSync itself. So both real sign-in
+ * paths verify a second factor before a session is issued.
  */
 
-/** Which sign-in the form drives. Center in production; `local` is a dev convenience. */
+/**
+ * Which sign-in the form drives:
+ *  - `center` (default) — forward to Center; Center owns the second factor.
+ *  - `local`            — NameSync's own login: password, then a one-time code it emails.
+ */
 const AUTH_MODE = process.env.NEXT_PUBLIC_AUTH_MODE === "local" ? "local" : "center";
 
 export default function LoginPage() {
@@ -44,7 +50,7 @@ type Step = "credentials" | "2fa";
 function LoginForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const { user, loading, signIn, signInWithCenter } = useAuth();
+  const { user, loading, signInWithCenter, signInWithOtp } = useAuth();
 
   const [email, setEmail] = React.useState("");
   const [password, setPassword] = React.useState("");
@@ -82,9 +88,18 @@ function LoginForm() {
     setSubmitting(true);
     try {
       if (AUTH_MODE === "local") {
-        await signIn(email, password);
-        router.replace(next);
-        return; // stay busy: the redirect is in flight.
+        // Password is only the first factor now: on success the API has emailed a code and
+        // answered with a challenge, so move to the code step just like the Center path.
+        const outcome = await signInWithOtp({ email, password });
+        if (outcome.status === "signed-in") {
+          router.replace(next);
+          return;
+        }
+        setTwoFactor({ method: "email", ref: outcome.ref });
+        setStep("2fa");
+        setCode("");
+        setSubmitting(false);
+        return;
       }
       const outcome = await signInWithCenter({ email, password });
       if (outcome.status === "signed-in") {
@@ -113,13 +128,16 @@ function LoginForm() {
     setError(null);
     setSubmitting(true);
     try {
-      const outcome = await signInWithCenter({
-        email,
-        password,
-        code,
-        method: twoFactor.method,
-        ref: twoFactor.ref,
-      });
+      const outcome =
+        AUTH_MODE === "local"
+          ? await signInWithOtp({ email, password, code, ref: twoFactor.ref })
+          : await signInWithCenter({
+              email,
+              password,
+              code,
+              method: twoFactor.method,
+              ref: twoFactor.ref,
+            });
       if (outcome.status === "signed-in") {
         router.replace(next);
         return; // stay busy through the redirect.
@@ -220,7 +238,9 @@ function LoginForm() {
       </form>
 
       <p className="mt-6 text-center text-xs text-muted-foreground">
-        Sign in with your Center account.
+        {AUTH_MODE === "local"
+          ? "Enter your password — we'll email you a code to finish signing in."
+          : "Sign in with your Center account."}
       </p>
     </LoginShell>
   );
