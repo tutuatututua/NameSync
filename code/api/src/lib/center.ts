@@ -69,17 +69,24 @@ async function centerPost(path: string, body: unknown): Promise<CenterResponse> 
 
 /** The login request body Center expects, with the optional bits filled in only when present. */
 function loginBody(creds: CenterCredentials): Record<string, unknown> {
-  return {
+  const body: Record<string, unknown> = {
     username: creds.username,
     password: creds.password,
-    // "" rather than undefined for the second factors: Center's own client always sends the
-    // keys, and an authenticator resubmit sets `totp` while an OTP resubmit sets `otp`/`otpRef`.
-    totp: creds.totp ?? "",
-    otp: creds.otp ?? "",
-    otpRef: creds.otpRef ?? "",
     devicePlatform: "web",
-    groupIam2ID: env.CENTER_GROUP_IAM2_ID,
   };
+  // The second-factor fields are sent ONLY when they carry a real value — never as empty
+  // strings. Center reads an empty `otp` together with an empty `otpRef` as "an email code was
+  // submitted, and it's blank" and 401s the whole login (verified against the live API: a body
+  // with otp:"" + otpRef:"" is rejected, the same body without them succeeds). So a first login
+  // carries neither; an authenticator resubmit sets `totp`; an email-code resubmit sets
+  // `otp` + `otpRef`.
+  if (creds.totp) body.totp = creds.totp;
+  if (creds.otp) body.otp = creds.otp;
+  if (creds.otpRef) body.otpRef = creds.otpRef;
+  // Only when configured — some Center clients require the group id, others reject a login that
+  // carries an unexpected one, so an unset value is omitted rather than sent as null.
+  if (env.CENTER_GROUP_IAM2_ID) body.groupIam2ID = env.CENTER_GROUP_IAM2_ID;
+  return body;
 }
 
 /**
