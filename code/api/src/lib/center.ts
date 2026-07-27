@@ -1,5 +1,5 @@
 import { env } from "../config/env";
-import { BadRequest, ServiceUnavailable, Unauthorized } from "./errors";
+import { ServiceUnavailable, Unauthorized } from "./errors";
 
 /**
  * The Center (centerapp.io "PlayMe") auth API, as Network Intel talks to it.
@@ -35,7 +35,7 @@ export interface CenterCredentials {
 
 export type CenterLoginResult =
   | { kind: "success"; token: string; requiredReset: boolean }
-  | { kind: "twoFactor"; method: "totp" | "email"; ref: string | null };
+  | { kind: "twoFactor"; method: "totp" | "email" | "sms"; ref: string | null };
 
 /** The base URL, trailing slash guaranteed. Throws 503 if Center isn't configured at all. */
 function base(): string {
@@ -111,16 +111,15 @@ export async function centerLogin(creds: CenterCredentials): Promise<CenterLogin
 
   // A 2FA-protected account: Center refuses the plain password and names the second factor
   // in error_description — empty = authenticator app, "email:<ref>" = emailed code, and any
-  // other non-empty value is an SMS reference (which we don't support).
+  // other non-empty value is an SMS reference (Center texts the code; we relay it). The SMS
+  // ref is the whole description, unless Center prefixes it "sms:" — strip that if present.
   if (error === "Require TOTP" || error === "TOTP required but not provided") {
     if (!description) return { kind: "twoFactor", method: "totp", ref: null };
     if (description.startsWith("email:")) {
       return { kind: "twoFactor", method: "email", ref: description.slice("email:".length) };
     }
-    throw new BadRequest(
-      "This account uses SMS two-factor sign-in, which isn't supported here. " +
-        "Use an authenticator app or an email code, or contact an administrator."
-    );
+    const ref = description.startsWith("sms:") ? description.slice("sms:".length) : description;
+    return { kind: "twoFactor", method: "sms", ref };
   }
 
   // A locked account is worth its own message — the user can't fix it by retrying.
@@ -146,6 +145,24 @@ export async function centerSendEmailOtp(username: string): Promise<void> {
     phoneCountry: "",
     isVerifyAccount: false,
     isEmail: true,
+    groupIam2ID: env.CENTER_GROUP_IAM2_ID,
+  });
+}
+
+/**
+ * Ask Center to text a one-time code, for an account whose second factor is SMS. Like the
+ * email path, Center's challenge does not send it — the client must trigger the send. Center
+ * texts the account's own registered phone; we do not hold or pass the number (`isEmail:false`
+ * with empty phone fields), and the ref from the challenge ties the code to this login.
+ */
+export async function centerSendSmsOtp(username: string): Promise<void> {
+  await centerPost("auth/sendcode", {
+    email: username,
+    username,
+    phoneNumber: "",
+    phoneCountry: "",
+    isVerifyAccount: false,
+    isEmail: false,
     groupIam2ID: env.CENTER_GROUP_IAM2_ID,
   });
 }

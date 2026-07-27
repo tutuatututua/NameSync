@@ -1,0 +1,27 @@
+# Local hosting override. Run it EXPLICITLY so Compose does NOT auto-load the
+# auth-disabling docker-compose.override.yml (which would turn login off entirely):
+#
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
+#
+# It keeps NODE_ENV=production (from the base file — real Secure cookies, boot-time env
+# checks), adds the Center sign-in URL the base file doesn't pass through, and remaps the
+# published ports off 3000/4000 (both occupied on this host by another project).
+#
+# `!override` REPLACES the base file's port list rather than appending to it — without it,
+# Compose would publish both 4000 and 4005 and collide with the other project on 4000.
+services:
+  api:
+    environment:
+      # Dev mode for LAN sharing: over http://<IP> a `Secure` cookie (the production default)
+      # is dropped by the browser, so login can't stick. development => AUTH_COOKIE_SECURE
+      # defaults false, so the cookie is sent over plain http. Auth stays ON (no AUTH_DISABLED).
+      NODE_ENV: development
+      # The base file's api environment block doesn't include these; add them here so login
+      # can reach Center (it's optional in dev, but this stack uses it).
+      CENTER_PLAYME_URL: ${CENTER_PLAYME_URL:?set CENTER_PLAYME_URL in code/.env}
+      CENTER_GROUP_IAM2_ID: ${CENTER_GROUP_IAM2_ID:-}
+    ports: !override
+      - "4005:4000"
+  frontend:
+    ports: !override
+      - "3002:3000"

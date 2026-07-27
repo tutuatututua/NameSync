@@ -269,7 +269,9 @@ function TwoFactorForm({
   const hint =
     method === "email"
       ? `Enter the code we emailed to ${email}.`
-      : "Enter the 6-digit code from your authenticator app.";
+      : method === "sms"
+        ? "Enter the code we texted to your phone."
+        : "Enter the 6-digit code from your authenticator app.";
 
   return (
     <LoginShell title="Two-step verification" subtitle={hint}>
