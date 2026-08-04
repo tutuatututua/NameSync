@@ -1,6 +1,6 @@
 import type { TwoFactorChallenge } from "@extensions/contract";
 import { Forbidden, Unauthorized } from "../lib/errors";
-import { centerLogin, centerMe, centerSendEmailOtp, type CenterCredentials } from "../lib/center";
+import { centerLogin, centerMe, centerSendEmailOtp, centerSendSmsOtp, type CenterCredentials } from "../lib/center";
 import { UserModel } from "../models";
 import { issueSession } from "./auth.service";
 import type { LoginResult } from "./auth.service";
@@ -27,8 +27,8 @@ export interface CenterSignInInput {
   password: string;
   /** Present on the second step, once the user has entered their second factor. */
   code?: string;
-  method?: "totp" | "email";
-  /** The email-OTP reference echoed back from the challenge. */
+  method?: "totp" | "email" | "sms";
+  /** The OTP reference echoed back from an email/sms challenge. */
   ref?: string;
   meta?: { userAgent?: string; ip?: string };
 }
@@ -37,18 +37,21 @@ export interface CenterSignInInput {
 function toCredentials(input: CenterSignInInput): CenterCredentials {
   const base: CenterCredentials = { username: input.email, password: input.password };
   if (!input.code) return base;
-  // A code with method "email" is an emailed OTP (needs its ref); anything else is a TOTP.
-  if (input.method === "email") return { ...base, otp: input.code, otpRef: input.ref };
+  // A code delivered out-of-band — emailed or texted — is an OTP and needs its ref; a code
+  // from an authenticator app is a TOTP and stands alone.
+  if (input.method === "email" || input.method === "sms") return { ...base, otp: input.code, otpRef: input.ref };
   return { ...base, totp: input.code };
 }
 
 export async function signInWithCenter(input: CenterSignInInput): Promise<CenterSignInResult> {
   const result = await centerLogin(toCredentials(input));
 
-  // Center wants a second factor. Relay the challenge; for email, also trigger the send so a
-  // code is actually in the user's inbox by the time they're asked for it.
+  // Center wants a second factor. Relay the challenge; for an out-of-band code (email or sms),
+  // also trigger the send so it's in the user's inbox / on their phone by the time they're
+  // asked for it. (A TOTP needs no send — the authenticator app already has it.)
   if (result.kind === "twoFactor") {
     if (result.method === "email") await centerSendEmailOtp(input.email);
+    else if (result.method === "sms") await centerSendSmsOtp(input.email);
     return {
       kind: "twoFactor",
       challenge: { twoFactorRequired: true, method: result.method, ref: result.ref },

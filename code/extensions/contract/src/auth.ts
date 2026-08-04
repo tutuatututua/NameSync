@@ -92,9 +92,11 @@ export type AuthSessionData = z.infer<typeof AuthSessionDataSchema>;
 // Center's token is used once and discarded. See docs/AUTH.md and
 // docs/wayfinder/assets/06-center-sso-integration-spec.md.
 //
-// The two second factors Network Intel relays. SMS is deliberately excluded: a Center account
-// set to SMS 2FA is rejected with a clear message rather than half-supported.
-export const TwoFactorMethodSchema = z.enum(['totp', 'email']);
+// The second factors Network Intel relays. All three are delivered by Center itself — an
+// authenticator app (`totp`), an emailed code (`email`), or a texted code (`sms`). For email
+// and sms the code is one Center generates and sends; we only relay the challenge and the
+// user's answer.
+export const TwoFactorMethodSchema = z.enum(['totp', 'email', 'sms']);
 export type TwoFactorMethod = z.infer<typeof TwoFactorMethodSchema>;
 
 /**

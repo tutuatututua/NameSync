@@ -39,7 +39,7 @@ function centerStub(url: string, init?: RequestInit): Response {
     if (password !== GOOD_PASSWORD) return json({ error: "Invalid Username or Password life:4" }, 401);
     if (username === TOTP_USER && !totp) return json({ error: "Require TOTP", error_description: "" }, 401);
     if (username === EMAIL_USER && !otp) return json({ error: "Require TOTP", error_description: "email:REF123" }, 401);
-    if (username === SMS_USER) return json({ error: "Require TOTP", error_description: "SMS-REF-9" }, 401);
+    if (username === SMS_USER && !otp) return json({ error: "Require TOTP", error_description: "SMS-REF-9" }, 401);
     return json({ token: `tok:${username}`, tokenType: "Bearer", expiresDate: "2099-01-01" }, 200);
   }
   if (url.endsWith("/auth/me")) {
@@ -136,10 +136,17 @@ describe("Center sign-in", () => {
     expect(sendcodeCalls).toBe(1); // the code was actually requested
   });
 
-  it("refuses an SMS-2FA account with a clear message", async () => {
-    const res = await post({ email: SMS_USER, password: GOOD_PASSWORD });
-    expect(res.statusCode).toBe(400);
-    expect(res.json().message).toMatch(/SMS/i);
+  it("returns an SMS challenge with a ref, asks Center to text the code, then completes", async () => {
+    const first = await post({ email: SMS_USER, password: GOOD_PASSWORD });
+    expect(first.statusCode, first.body).toBe(200);
+    expect(first.json().data).toMatchObject({ twoFactorRequired: true, method: "sms", ref: "SMS-REF-9" });
+    expect(sendcodeCalls).toBe(1); // Center was asked to text the code
+    expect(sessionCookie(first.headers["set-cookie"])).toBeFalsy();
+
+    const second = await post({ email: SMS_USER, password: GOOD_PASSWORD, code: "987654", method: "sms", ref: "SMS-REF-9" });
+    expect(second.statusCode, second.body).toBe(200);
+    expect(second.json().data.user.email).toBe(SMS_USER);
+    expect(sessionCookie(second.headers["set-cookie"])).toBeTruthy();
   });
 
   it("401s a wrong password without revealing whether the account exists", async () => {
