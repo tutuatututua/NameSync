@@ -81,7 +81,7 @@ export async function buildApp(): Promise<FastifyInstance> {
     if (hasZodFastifySchemaValidationErrors(err)) {
       return reply
         .code(400)
-        .send({ success: false, message: "Validation failed", code: "VALIDATION", issues: err.validation });
+        .send({ success: false, message: "Login failed", code: "VALIDATION", issues: err.validation });
     }
     if (err instanceof AppError) {
       return reply.code(err.statusCode).send({ success: false, message: err.message, code: err.code });
