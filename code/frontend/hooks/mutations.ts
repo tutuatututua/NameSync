@@ -2,7 +2,7 @@
 
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import type { CreateSavedQueryBody, DbRow, RenameContactBody, SourceType } from "@extensions/contract";
+import type { CompareBy, CreateSavedQueryBody, DbRow, RenameContactBody, SourceType } from "@extensions/contract";
 import { api, ApiError } from "@/lib/api/client";
 import { qk } from "./queryKeys";
 
@@ -130,8 +130,44 @@ export function useTriggerComparison() {
 /** Start one comparison against the selected companies (no file upload). */
 export function useCompareByCompany() {
   return useMutation({
-    mutationFn: (companyNames: string[]) => api.comparisons.compareByCompany(companyNames),
+    mutationFn: ({
+      companyNames,
+      compareBy,
+      sources,
+    }: {
+      /** Which companies are in the run — null for every company on file. */
+      companyNames: string[] | null;
+      compareBy: CompareBy;
+      /** Which friends are in the run — null for every source. */
+      sources: string[] | null;
+    }) => api.comparisons.compareByCompany(companyNames, compareBy, sources),
     onError: (e) => toast.error(errMsg(e, "Failed to start the comparison")),
+  });
+}
+
+/**
+ * Add an import type, for good.
+ *
+ * Invalidates the list so the picker shows it immediately — and so a second tab that already had
+ * the picker open gets it on its next read, which is the "persists for the next user" the feature
+ * is for.
+ */
+export function useAddUploadSource() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (value: string) => api.uploadSources.create(value),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.uploadSources() }),
+    onError: (e) => toast.error(errMsg(e, "Couldn't add that type")),
+  });
+}
+
+/** Take a type out of the picker. Imports already filed under it keep it — there is no FK. */
+export function useRemoveUploadSource() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (value: string) => api.uploadSources.remove(value),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.uploadSources() }),
+    onError: (e) => toast.error(errMsg(e, "Couldn't remove that type")),
   });
 }
 

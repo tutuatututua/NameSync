@@ -1,6 +1,6 @@
 import { sql } from "kysely";
 import { DBModel } from "@extensions/sqldb";
-import type { RowVerdict } from "@extensions/contract";
+import { DEFAULT_COMPARE_BY, type CompareBy, type RowVerdict } from "@extensions/contract";
 import { isExternalMatcher } from "../config/env";
 import { rowVerdictSql } from "./row-status";
 import type { Comparison } from "../db.types";
@@ -16,8 +16,21 @@ export interface ComparisonCreate {
   /** The companies the run is pointed at. Omitted/empty for an import-driven run, which scores
    *  against everything on file rather than against a company anyone picked. */
   selected_companies?: string[] | null;
-  source?: string | null;
+  /**
+   * Which friend sources the run covers. Omitted/empty/null all mean EVERY source — the same
+   * convention `selected_companies` uses, and the reason the matcher's old no-WHERE behaviour is
+   * still exactly what a caller with no opinion gets.
+   *
+   * Pass it through `normalizeSources` before you get here. Storing an unfolded or unsorted array
+   * would defeat both the `lower(source)` filter and the duplicate check, neither of which can
+   * see that ['LinkedIn'] and ['linkedin'] are the same run.
+   */
+  sources?: string[] | null;
   status?: string;
+  /** How the run compares — see `CompareBy`. Defaulted rather than required so a caller that has
+   *  no opinion writes the mode that describes what the matcher has always done, which is also
+   *  what a stored NULL is read as. */
+  compare_by?: CompareBy;
   expected_batches?: number | null;
 }
 
@@ -38,8 +51,12 @@ export class ComparisonModel extends DBModel {
         // spellings of one fact is how a `cardinality(...) = 0` check and an `IS NULL` check end
         // up disagreeing about the same run. NULL is the one the schema documents.
         selected_companies: c.selected_companies?.length ? c.selected_companies : null,
-        source: c.source ?? null,
+        // Empty → NULL for the same reason as the line above, and it matters more here: '{}' would
+        // read as "this run covered no sources at all", which the matcher would honour by scoring
+        // nobody and reporting zero matches without erroring.
+        sources: c.sources?.length ? c.sources : null,
         status: c.status ?? "processing",
+        compare_by: c.compare_by ?? DEFAULT_COMPARE_BY,
         expected_batches: c.expected_batches ?? null,
       })
       .returningAll()
@@ -83,6 +100,10 @@ export class ComparisonModel extends DBModel {
       id: string;
       name: string | null;
       selected_companies: string[];
+      /** NULL stays NULL here, unlike selected_companies — see the mapper for why the two
+       *  deliberately differ. */
+      sources: string[] | null;
+      compare_by: string | null;
       status: string;
       created_at: string;
       row_count: number;
@@ -98,6 +119,8 @@ export class ComparisonModel extends DBModel {
         "comparison.id",
         "comparison.name",
         "comparison.selected_companies",
+        "comparison.sources",
+        "comparison.compare_by",
         "comparison.status",
         "comparison.created_at",
         eb.fn.count("comparison_result.id").as("row_count"),
@@ -135,7 +158,15 @@ export class ComparisonModel extends DBModel {
           )
           .as("match_count"),
       ])
-      .groupBy(["comparison.id", "comparison.name", "comparison.selected_companies", "comparison.status", "comparison.created_at"])
+      .groupBy([
+        "comparison.id",
+        "comparison.name",
+        "comparison.selected_companies",
+        "comparison.sources",
+        "comparison.compare_by",
+        "comparison.status",
+        "comparison.created_at",
+      ])
       .orderBy("comparison.created_at", "desc")
       .execute();
 
@@ -146,6 +177,17 @@ export class ComparisonModel extends DBModel {
       // whole way to the UI — "no companies" is a list with nothing in it, and every reader
       // downstream then gets to use `.length` instead of a null check it might forget.
       selected_companies: r.selected_companies ?? [],
+      /**
+       * NOT collapsed to [] the way selected_companies is one line up, and the asymmetry is the
+       * point rather than an oversight.
+       *
+       * For companies the two readings coincide: NULL means "no company was picked", and an empty
+       * list says that accurately. For sources they are opposites — NULL means "every source" —
+       * so flattening it here would hand every renderer a value that reads as "no sources" and let
+       * a run covering everything render as a run covering nothing.
+       */
+      sources: r.sources ?? null,
+      compare_by: r.compare_by ?? null,
       status: r.status,
       created_at: String(r.created_at),
       // Postgres count() is bigint, which the driver hands back as a string.
@@ -155,6 +197,91 @@ export class ComparisonModel extends DBModel {
       // looked at, and saying so would be worse than either number on its own.
       scored_count: Math.max(Number(r.scored_count) || 0, Number(r.row_count) || 0),
     }));
+  }
+
+  /**
+   * Runs that already asked this exact question — same companies, same mode, same sources.
+   *
+   * Advisory only. Nothing calls this to decide whether an INSERT may proceed; it feeds the "you
+   * already ran this" callout in the new-run dialog, and the user is free to run anyway. See
+   * `DuplicateRunQuerySchema` for why this is a sentence to read rather than a constraint.
+   *
+   * ── WHY THE THREE COMPARISONS LOOK DIFFERENT ──
+   *
+   * Companies are compared as a SET (`@>` both ways), because ['PTT','CP'] and ['CP','PTT'] are one
+   * question asked twice and the picker does not promise an order. Sources are compared as an
+   * ARRAY (`=`), because `normalizeSources` has already sorted and folded them — doing set logic on
+   * a value that is canonical by construction would be paying twice for the same guarantee.
+   *
+   * `compare_by` is compared through a coalesce to the default, matching how every reader resolves
+   * it (`parseCompareBy`). A run stored before the column existed holds NULL and IS an `en_full`
+   * run; treating it as a fourth value would report "no duplicate" for the one pair most likely to
+   * be one.
+   *
+   * Failed runs are EXCLUDED. "You already ran this" is only useful if the previous run produced
+   * something to look at, and pointing a user at a failure as a reason not to retry is precisely
+   * backwards — a failed run is the strongest reason to run again.
+   */
+  static async findDuplicates(
+    companies: string[],
+    compareBy: CompareBy,
+    sources: string[] | null
+  ): Promise<{ runs: { id: string; name: string | null; status: string; created_at: string; match_count: number; scored_count: number }[] }> {
+    const db = await this.getKyselyDB();
+
+    const rows = await db
+      .selectFrom("comparison")
+      .leftJoin("comparison_result", "comparison_result.comparison_id", "comparison.id")
+      .select((eb) => [
+        "comparison.id",
+        "comparison.name",
+        "comparison.status",
+        "comparison.created_at",
+        eb.fn.count("comparison_result.id").as("row_count"),
+        eb.fn
+          .count(
+            sql<string | null>`case when ${rowVerdictSql(
+              "comparison_result.status"
+            )} = ${sql.val<RowVerdict>("matched")} then 1 end`
+          )
+          .as("match_count"),
+      ])
+      .where("comparison.status", "!=", "failed")
+      .where((eb) =>
+        companies.length
+          ? eb.and([
+              // Mutual containment = set equality, without depending on the stored order.
+              sql<boolean>`comparison.selected_companies @> ${sql.val(companies)}::text[]`,
+              sql<boolean>`comparison.selected_companies <@ ${sql.val(companies)}::text[]`,
+            ])
+          : eb.or([
+              eb("comparison.selected_companies", "is", null),
+              sql<boolean>`cardinality(comparison.selected_companies) = 0`,
+            ])
+      )
+      .where(sql<boolean>`coalesce(comparison.compare_by, ${sql.val(DEFAULT_COMPARE_BY)}) = ${sql.val(compareBy)}`)
+      .where((eb) =>
+        sources === null
+          ? eb.or([
+              eb("comparison.sources", "is", null),
+              sql<boolean>`cardinality(comparison.sources) = 0`,
+            ])
+          : sql<boolean>`comparison.sources = ${sql.val(sources)}::text[]`
+      )
+      .groupBy(["comparison.id", "comparison.name", "comparison.status", "comparison.created_at"])
+      .orderBy("comparison.created_at", "desc")
+      .execute();
+
+    return {
+      runs: rows.map((r) => ({
+        id: String(r.id),
+        name: r.name,
+        status: r.status,
+        created_at: String(r.created_at),
+        match_count: Number(r.match_count) || 0,
+        scored_count: Number(r.row_count) || 0,
+      })),
+    };
   }
 
   static async rename(id: string, name: string): Promise<boolean> {

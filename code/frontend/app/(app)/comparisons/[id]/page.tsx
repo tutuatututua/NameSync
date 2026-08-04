@@ -11,7 +11,6 @@ import { PageHeader } from "@/components/page-header";
 import { EmptyState } from "@/components/empty-state";
 import { Callout } from "@/components/callout";
 import { ResultsView } from "@/components/results/ResultsView";
-import { RunOutcome } from "@/components/results/RunOutcome";
 import { RunProgress } from "@/components/results/RunProgress";
 import { useComparisonProgress, useResults } from "@/hooks/queries";
 import { qk } from "@/hooks/queryKeys";
@@ -31,12 +30,26 @@ import { formatCompanies } from "@/lib/format";
  * separate "your upload is processing" screen — that would be a second page showing the same
  * run, which would eventually disagree with this one. Same run, same page, whatever state it
  * is in.
+ *
+ * ── There is no threshold here any more (2026-07-31) ──
+ *
+ * This page carried the match-threshold slider, and it was tuning the wrong thing. A run is a
+ * historical event: re-reading run 3 at 0.9 answered a question about run 3 and moved nothing the
+ * reader acts on, because what they act on is the POOLED answer on the Network page — who reaches
+ * which company, whose friends were placed — assembled from every run on file. The bar now lives
+ * there, on the workspace, and grades everything at once (see `NetworkThreshold`).
+ *
+ * What this page shows is what the matcher decided. That is the honest thing for a page about one
+ * run to show, and it is now the only thing it shows: the endpoints still accept `?threshold=`
+ * (documented in the contract, exercised by threshold.test.ts), but nothing here sends one, so a
+ * run always reads at its own verdicts.
  */
 export default function ComparisonDetailPage() {
   const params = useParams<{ id: string }>();
   const id = String(params.id);
-  const { data, isLoading } = useResults(id);
   const qc = useQueryClient();
+
+  const { data, isLoading } = useResults(id);
 
   /**
    * Asked for unconditionally, not only while the run is going.
@@ -81,7 +94,10 @@ export default function ComparisonDetailPage() {
   const finished = progress.data?.status === "completed" || progress.data?.status === "failed";
   React.useEffect(() => {
     if (!finished) return;
-    qc.invalidateQueries({ queryKey: qk.results(id) });
+    // The PREFIX rather than the exact key. Nothing on this page reads a run at a bar any more, so
+    // in practice there is one reading to invalidate — but the endpoints still take `?threshold=`,
+    // and a prefix cannot be wrong about how many readings exist.
+    qc.invalidateQueries({ queryKey: qk.resultsAll(id) });
     qc.invalidateQueries({ queryKey: qk.comparisons() });
     // The rows too, and this one is easy to forget because it looks like it polls itself.
     //
@@ -135,9 +151,15 @@ export default function ComparisonDetailPage() {
           can say anything, and "Matching in progress…" is what there is to say.
         */
         description={running ? "Matching in progress…" : undefined}
-        /* The same badge, from the same fields, as the row you clicked to get here — so a run
-           cannot say one thing in the list and another on its own page. */
-        actions={<RunOutcome status={status} matchCount={data.matchCount} />}
+        /*
+          No badge in this corner. It carried the match count ("4 matches"), which is the same
+          finding the Verdict states two inches below — the repetition this header's own comment
+          above already refuses for the description line, applied inconsistently to the corner.
+
+          Its other job, naming a run that is still going or has failed, is not lost: a failed run
+          gets the callout directly below, and a running one gets both the description above and
+          the RunProgress panel. Both say more than a one-word pill could.
+        */
       />
 
       {status === "failed" && (

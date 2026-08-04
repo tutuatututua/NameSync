@@ -1,6 +1,7 @@
 import { DBModel } from "@extensions/sqldb";
+import { sameFriendSql } from "./friend-identity";
 import { sql, type RawBuilder, type SqlBool } from "kysely";
-import type { PaginatedResult, CompanyDataRow, RunRow } from "@extensions/contract";
+import { compareByAxes, type CompareBy, type PaginatedResult, type CompanyDataRow, type RunRow } from "@extensions/contract";
 import { isExternalMatcher } from "../config/env";
 import { BadRequest } from "../lib/errors";
 import { cleanPersonName, tidyText } from "../services/name-cleaner.service";
@@ -8,7 +9,10 @@ import {
   effectiveStatusSql,
   isMatchedSql,
   matchedFirstSql,
+  regradeVerdictSql,
+  regradedStatusSql,
   rowVerdictWithMatchSql,
+  runRowBucketSql,
   tallyVerdicts,
   type StatusCounts,
 } from "./row-status";
@@ -31,6 +35,46 @@ const contactHasMatch = (comparisonId: string): RawBuilder<SqlBool> => sql<SqlBo
     )
     and ${isMatchedSql("cr.status")}
 )`;
+
+/**
+ * The score of the pair this contact is SHOWING — the company side of `friendBestSimilarity`.
+ *
+ * Same job and same warning: its ORDER BY is a copy of the `best` lateral's in `findRunRows` and has
+ * to stay one, so that a row re-graded at the reader's bar and the number printed beside it are
+ * about the same match. A correlated subquery because the filter's WHERE and the tally's GROUP BY
+ * run over `company_contact` before any join exists.
+ */
+const contactBestSimilarity = (comparisonId: string): RawBuilder<number | null> => sql<number | null>`(
+  select cr.similarity from comparison_result as cr
+  where cr.comparison_id = ${comparisonId}
+    and (
+      cr.person_name_en = company_contact.person_name_en
+      or cr.person_name_th = company_contact.person_name_th
+    )
+  order by ${matchedFirstSql("cr.status")},
+           cr.similarity desc nulls last,
+           cr.id asc
+  limit 1
+)`;
+
+/**
+ * "Could this contact have been scored under the run's mode?"
+ *
+ * The company side of `isScorable`, and it asks a simpler question than the friend side does. A
+ * friend has one name, so whether it can be scored against the contact's Thai column is a matter
+ * of reading its script; a contact has the two columns explicitly, so the answer is just whether
+ * the one the run selected holds anything. No script detection, and no guessing — a contact with
+ * `person_name_th IS NULL` genuinely has no Thai name to compare, and a run comparing Thai names
+ * did not skip them out of an inference, it skipped them because there was nothing there.
+ *
+ * Never null. It used to be, for the `either` mode that scored both columns and so excluded
+ * nobody; that mode is gone, so every run has a column it did not look at.
+ */
+const contactScorable = (compareBy: CompareBy): RawBuilder<SqlBool> => {
+  const { language } = compareByAxes(compareBy);
+  const column = language === "th" ? "company_contact.person_name_th" : "company_contact.person_name_en";
+  return sql<SqlBool>`${sql.ref(column)} is not null`;
+};
 
 /**
  * `company_contact` — company people, stacked upload by upload (upload_id FK), so
@@ -172,31 +216,50 @@ export class CompanyContactModel extends DBModel {
    * identical runs could credit the same friend to two different companies. `id` alone is
    * enough to settle it, but ordering by company first also makes the tie-break *legible*:
    * the earlier-named company wins, which is at least a rule someone could predict.
+   *
+   * NULL IS EVERY COMPANY — no WHERE clause, the whole table. That is what a run with no
+   * `selected_companies` has always meant (`ComparisonModel.create`, and every import-driven run
+   * stores exactly that), and since 2026-08-04 it is what a user can ask for directly through
+   * `POST /compare` as well.
+   *
+   * An empty ARRAY is not "everything" and deliberately still returns nothing. The parameter is
+   * `string[] | null` and not `string[]` for the same reason `FriendModel.findAllForMatching`'s is:
+   * "every company" and "no companies" are different runs, the boundary folds empty to null so only
+   * one of them can ever reach here, and a type that could not tell them apart is one that would
+   * eventually answer the second question with the first.
    */
-  static async findByCompanies(companyNames: string[]): Promise<
+  static async findByCompanies(companyNames: string[] | null): Promise<
     {
+      id: string;
       company_name: string | null;
       person_name_en: string | null;
       person_name_th: string | null;
     }[]
   > {
-    if (companyNames.length === 0) return [];
+    if (companyNames !== null && companyNames.length === 0) return [];
     const db = await this.getKyselyDB();
-    const named = [...new Set(companyNames.map((c) => c.toLowerCase()))];
-    return db
+    const named = companyNames === null ? null : [...new Set(companyNames.map((c) => c.toLowerCase()))];
+    let q = db
       .selectFrom("company_contact")
-      .select(["company_name", "person_name_en", "person_name_th"])
-      .where(sql<string>`lower(company_name)`, "in", named)
-      .orderBy("company_name", "asc")
-      .orderBy("id", "asc")
-      .execute();
+      // The id rides along so the matcher can stamp `comparison_result.company_contact_id` —
+      // identity, which is immune to the name collisions the text columns cannot avoid. It is for
+      // counting and joining only; the names beside it stay the frozen record of what was compared.
+      .select(["id", "company_name", "person_name_en", "person_name_th"]);
+    if (named !== null) q = q.where(sql<string>`lower(company_name)`, "in", named);
+    return q.orderBy("company_name", "asc").orderBy("id", "asc").execute();
   }
 
   /**
    * How far the external workflow has got through one upload's rows. Counting unstamped rows
    * is the entire progress mechanism — see friend.model.ts and models/row-status.ts.
    */
-  static async statusCounts(uploadId: string, comparisonId: string): Promise<StatusCounts> {
+  static async statusCounts(
+    uploadId: string,
+    comparisonId: string,
+    compareBy: CompareBy,
+    /** The reader's chosen bar, or null for the workflow's own verdicts. See `regradeVerdict`. */
+    threshold: number | null = null
+  ): Promise<StatusCounts> {
     const db = await this.getKyselyDB();
 
     const rows = await db
@@ -204,7 +267,14 @@ export class CompanyContactModel extends DBModel {
         eb
           .selectFrom("company_contact")
           .select(
-            rowVerdictWithMatchSql("company_contact.status", contactHasMatch(comparisonId)).as("verdict")
+            runRowBucketSql(
+              regradeVerdictSql(
+                rowVerdictWithMatchSql("company_contact.status", contactHasMatch(comparisonId)),
+                contactBestSimilarity(comparisonId),
+                threshold
+              ),
+              contactScorable(compareBy)
+            ).as("verdict")
           )
           .where("company_contact.upload_id", "=", uploadId)
           .as("verdicts")
@@ -239,14 +309,22 @@ export class CompanyContactModel extends DBModel {
     page: number,
     limit: number,
     filter: RunRowFilter,
-    sort: RunRowSort
+    sort: RunRowSort,
+    compareBy: CompareBy,
+    /** The reader's chosen bar, or null for the workflow's own verdicts. See `regradeVerdict`. */
+    threshold: number | null = null
   ): Promise<PaginatedResult<RunRow>> {
     const db = await this.getKyselyDB();
     const offset = (page - 1) * limit;
     // Pair-aware, so the filter, the returned status and the sort all agree — see FriendModel.findRunRows.
     const hasMatch = contactHasMatch(comparisonId);
-    const verdict = rowVerdictWithMatchSql("company_contact.status", hasMatch);
-    const where = rowFilterWhere(verdict, filter);
+    // The score of the pair this row will DISPLAY, so a re-graded badge and the number beside it are
+    // about the same match. See `contactBestSimilarity`.
+    const bestSimilarity = contactBestSimilarity(comparisonId);
+    const stored = rowVerdictWithMatchSql("company_contact.status", hasMatch);
+    const verdict = regradeVerdictSql(stored, bestSimilarity, threshold);
+    const scorable = contactScorable(compareBy);
+    const where = rowFilterWhere(runRowBucketSql(verdict, scorable), filter);
 
     let rows = db.selectFrom("company_contact").where("company_contact.upload_id", "=", uploadId);
     if (where) rows = rows.where(where);
@@ -255,12 +333,19 @@ export class CompanyContactModel extends DBModel {
     if (where) count = count.where(where);
 
     const selected = rows
+      .innerJoin("upload", "upload.id", "company_contact.upload_id")
       .leftJoinLateral(
         (eb) =>
           eb
             .selectFrom("comparison_result")
             .select([
-              "comparison_result.friend_name",
+              // The identity columns `sameFriendSql` reads below, and since 2026-08-03c the only
+              // names on the row. They have to be projected out of the lateral to be referable as
+              // `best.*` — a lateral is a subquery, not an alias for the table, so a column it
+              // does not select simply does not exist outside it.
+              "comparison_result.friend_name_en",
+              "comparison_result.friend_name_th",
+              "comparison_result.friend_id",
               "comparison_result.upload_name",
               "comparison_result.similarity",
               "comparison_result.extra",
@@ -285,30 +370,73 @@ export class CompanyContactModel extends DBModel {
         "company_contact.id as id",
         "company_contact.person_name_en as name",
         "company_contact.person_name_th as nameTh",
+        // A friend column — a contact's pair is name/nameTh, which this row already carries.
+        sql<string | null>`null`.as("nameAlt"),
         "company_contact.company_name as context",
-        effectiveStatusSql("company_contact.status", hasMatch).as("status"),
-        "best.friend_name as matchedName",
-        // A friend has one name — there is no Thai twin to show.
-        sql<string | null>`null`.as("matchedNameTh"),
+        "upload.uploaded_by as uploaderName",
+        sql<string | null>`company_contact.updated_at`.as("updatedAt"),
+        // A matched contact is scored by definition, whichever column the run selected — the
+        // evidence beats the inference. See runRowBucketSql.
+        (scorable
+          ? sql<boolean>`(${scorable} or ${isMatchedSql("company_contact.status")} or ${hasMatch})`
+          : sql<boolean>`true`
+        ).as("scored"),
+        // The workflow's stamp, or the one the reader's bar implies — the badge is drawn from this,
+        // so it has to agree with the filter and the tabs. See regradedStatusSql.
+        regradedStatusSql(
+          effectiveStatusSql("company_contact.status", hasMatch),
+          bestSimilarity,
+          verdict,
+          threshold
+        ).as("status"),
+        // The matched friend, in the language this run compared. `comparison_result.friend_name`
+        // held that spelling outright until 2026-08-03c; the run's own mode says which of the two
+        // columns it was, and this reader is handed that mode directly rather than having to join
+        // for it. Coalesced, so a run in one language against a friend we hold only in the other
+        // still names somebody.
+        (compareByAxes(compareBy).language === "th"
+          ? sql<string | null>`coalesce(best.friend_name_th, best.friend_name_en)`
+          : sql<string | null>`coalesce(best.friend_name_en, best.friend_name_th)`
+        ).as("matchedName"),
+        // The matched friend's Thai spelling, where the run recorded one. This was structurally
+        // null while a friend had a single name; since 2026-07-28 they have two, and a company
+        // import matching a Thai contact has a Thai friend name worth showing beside it. Read off
+        // the result row (frozen evidence), never through `friend_id` — following the id would let
+        // a later rename rewrite what this run reported.
+        "best.friend_name_th as matchedNameTh",
         // How close the match was, carried from the result row — the only place an import's score
         // lives. See FriendModel.findRunRows.
         "best.similarity as similarity",
-        // Not another name: the person who uploaded that matched friend. Who they are is the
-        // match; whose they are is what you can act on.
+        // Not another name: the person whose relationship that matched friend is. Who they are is
+        // the match; whose they are is what you can act on.
         //
-        // The matcher's own value first, then the friend row it names — the same coalesce
-        // ComparisonResultModel uses, and needed for the same reason: `upload_name` is optional on
-        // the contract, and a workflow that leaves it null still matched a friend Network Intel has on
-        // file and knows the uploader of. Without the fallback a company import that found a match
-        // showed the friend's name beside an empty "Uploaded by", which is the one column that
-        // makes the match actionable. Scalar subquery, so a name two people share never multiplies
-        // the row; `friend`/`upload` are fresh aliases here (the outer query has neither).
-        sql<string | null>`coalesce(best.upload_name, (
-          select u.uploaded_by from friend f
-          join upload u on u.id = f.upload_id
-          where f.friend_name = best.friend_name and u.uploaded_by is not null
-          order by u.created_at asc limit 1
-        ))`.as("matchedContext"),
+        // THE FRIEND ROW FIRST, `upload_name` only as the fallback — flipped 2026-07-30, having
+        // read the other way round since this column existed. Both orders produce the same answer
+        // while the matcher does what docs/EXTERNAL-MATCHER.md §1 asks and fills `upload_name` from
+        // the owner. When it does not — ours filled it with `uploader_name`, the person who pressed
+        // import, which that section warns against by name — trusting it first puts the importer in
+        // the "go and ask this person" slot on every row of the monitor. Preferring the friend row
+        // trusts a value this app cleaned and stored over one that arrived on a webhook.
+        //
+        // `upload_name` is kept behind it, because it is the only answer left for a match whose
+        // friend row is gone (a rolled-back import) — an owner degraded to text beats a blank.
+        //
+        // Scalar subquery, so a name two people share never multiplies the row; `friend` is a fresh
+        // alias here (the outer query has none).
+        sql<string | null>`coalesce((
+          select f.relationship_owner from friend f
+          where ${sameFriendSql("best", "f")} and f.relationship_owner is not null
+          order by f.created_at asc limit 1
+        ), best.upload_name)`.as("matchedContext"),
+        // The same value under the name the layout reads, so the "go ask this person" slot is
+        // filled from one field whichever direction the run runs in. On this side the owner IS
+        // the counterpart's context — a contact is nobody's relationship, so the only owner in
+        // the row is the one belonging to the friend they matched.
+        sql<string | null>`coalesce((
+          select f.relationship_owner from friend f
+          where ${sameFriendSql("best", "f")} and f.relationship_owner is not null
+          order by f.created_at asc limit 1
+        ), best.upload_name)`.as("relationshipOwner"),
         sql<string | null>`best.extra::text`.as("extras"),
       ]);
 

@@ -3,7 +3,7 @@
 import * as React from "react";
 import Link from "next/link";
 import { ArrowUpRight, Building2, Loader2, Users } from "lucide-react";
-import type { UploadSessionRow } from "@extensions/contract";
+import { sourceLabel, type UploadSessionRow } from "@extensions/contract";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { DataManager, type Column } from "@/components/data-table/DataManager";
@@ -16,7 +16,7 @@ import {
   toUploadParams,
   type UploadFilterState,
 } from "@/components/uploads/UploadFilters";
-import { useUploadSessions } from "@/hooks/queries";
+import { useUploadSessions, useUploadSources } from "@/hooks/queries";
 import { formatDate } from "@/lib/format";
 import { UPLOAD_ACCEPT } from "@/lib/files";
 
@@ -41,7 +41,7 @@ export default function UploadsPage() {
     <div className="space-y-10">
       <PageHeader
         title="Uploads"
-        description="Import company or Facebook data, review what each import added, and undo one."
+        description="Import company data or friends, review what each import added, and undo one."
       />
 
       <ImportSection />
@@ -91,11 +91,15 @@ function ImportSection() {
         accept={UPLOAD_ACCEPT}
         onFile={(file) => setPicked({ source: "company", file })}
       />
+      {/* "Friends", not "Facebook": the social side takes LinkedIn exports and typed-up business
+          cards too. The `facebook` source value, the `facebookFile` form field and the `friend`
+          table keep their names — they are wire and schema identifiers with other systems on the
+          far end, and renaming them would buy a tidier grep for the cost of a migration. */}
       <DropCard
         source="facebook"
         icon={Users}
-        title="Facebook data"
-        subtitle="A Facebook friends export — Excel, CSV or JSON"
+        title="Friends"
+        subtitle="A friends export — Excel, CSV or JSON"
         accept={UPLOAD_ACCEPT}
         onFile={(file) => setPicked({ source: "facebook", file })}
       />
@@ -208,12 +212,23 @@ function SessionsList() {
 
   const params = React.useMemo(
     () => ({ page, limit: LIMIT, ...toUploadParams({ ...filters, search }, "uploadType") }),
-    [page, filters.type, filters.dateFrom, filters.dateTo, search] // eslint-disable-line react-hooks/exhaustive-deps
+    [page, filters.type, filters.source, filters.dateFrom, filters.dateTo, search] // eslint-disable-line react-hooks/exhaustive-deps
   );
   // Any filter change resets to page 1.
-  React.useEffect(() => setPage(1), [filters.type, filters.dateFrom, filters.dateTo, search]);
+  React.useEffect(
+    () => setPage(1),
+    [filters.type, filters.source, filters.dateFrom, filters.dateTo, search]
+  );
 
   const q = useUploadSessions(params);
+
+  // The pick-list, purely for display: it turns the stored 'linkedin' into the 'LinkedIn' the
+  // rest of the app shows. Cached hard and already loaded by the toolbar above.
+  const sources = useUploadSources();
+  const sourceLabels = React.useMemo(
+    () => new Map((sources.data ?? []).map((s) => [s.value, s.label])),
+    [sources.data]
+  );
 
   const columns: Column<UploadSessionRow>[] = [
     {
@@ -230,8 +245,20 @@ function SessionsList() {
     },
     { key: "upload_type", header: "Type", render: (r) => typeBadge(r.upload_type) },
     {
+      // WHERE the friends came from, beside WHICH SIDE they are. A dash on a company import is
+      // correct and not missing data: contacts came from no roster, which is why the server stores
+      // NULL there. Labelled through the pick-list so 'linkedin' reads as 'LinkedIn'.
+      key: "source",
+      header: "Source",
+      className: "text-muted-foreground",
+      render: (r) => (r.source ? (sourceLabels.get(r.source) ?? sourceLabel(r.source)) : "—"),
+    },
+    {
+      // "Uploaded by", not "Relationship owner". An import has ONE uploader but may carry many
+      // owners — a file can name a different one on every row — so this column can only honestly
+      // report who performed the import. Whose relationship each friend is lives on the friend.
       key: "uploaded_by",
-      header: "Relationship owner",
+      header: "Uploaded by",
       className: "text-muted-foreground",
       render: (r) => r.uploaded_by ?? "—",
     },
@@ -264,7 +291,7 @@ function SessionsList() {
         onPageChange={setPage}
         isLoading={q.isLoading}
         emptyTitle="No imports yet"
-        emptyText="Drop a company or Facebook export above (.xlsx, .csv or .json) to get started."
+        emptyText="Drop a company or friends export above (.xlsx, .csv or .json) to get started."
       />
     </div>
   );

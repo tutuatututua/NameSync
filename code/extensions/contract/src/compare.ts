@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { CompareBySchema } from './compare-by';
 
 /** POST /api/comparisons/compare — runs the match against Postgres. */
 export const TriggerCompareDataSchema = z.object({
@@ -35,6 +36,22 @@ export const ComparisonListItemSchema = z.object({
    * spanning several companies without either dropping the rest or inventing a name for the set.
    */
   selectedCompanies: z.array(z.string()),
+  /**
+   * The friend sources the run covered — null for every source.
+   *
+   * On the list and not only on the run itself because Past runs is where two runs get compared,
+   * and these are exactly the axes that decide whether comparing them is meaningful. Two rows
+   * reading "PTT · 12 matches" one above the other are the same finding twice if they cover the
+   * same friends and two different findings if they do not, and nothing else on the row can say
+   * which.
+   *
+   * NOT flattened to [] the way `selectedCompanies` is — for sources, null means EVERY source and
+   * an empty list would read as none. See `CompareSourcesSchema`.
+   */
+  sources: z.array(z.string()).nullable(),
+  /** The mode the run used, resolved — never null, since a stored NULL is the default. Beside
+   *  `sources` for the same reason: it is half of what makes two rows comparable. */
+  compareBy: CompareBySchema,
   status: z.string(),
   date: z.string(),
   rowCount: z.number(),

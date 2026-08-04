@@ -11,6 +11,9 @@ export async function truncateAll(): Promise<void> {
   await sql`TRUNCATE lakeshore.upload, lakeshore.friend, lakeshore.company_contact, lakeshore.comparison, lakeshore.comparison_result, lakeshore.saved_query RESTART IDENTITY CASCADE`.execute(
     db
   );
+  // NOT truncated: `upload_source` is seeded by the schema, and a suite that emptied it would be
+  // testing a state the app never boots into — the picker's three defaults are part of the schema
+  // in the same way the status vocabulary is. Tests that add one clean up after themselves.
 }
 
 /**
@@ -120,24 +123,86 @@ export async function previewUpload(
  *  relationship owner the import is filed under — the `uploadPersonName` field on the wire. */
 export async function importCompany(
   app: FastifyInstance,
-  opts: { csv?: string; owner?: string; format?: UploadFormat; name?: string } = {}
+  opts: {
+    csv?: string;
+    owner?: string;
+    format?: UploadFormat;
+    name?: string;
+    compareBy?: string;
+    /** Which friends the run this import starts should cover — the company side's compare scope.
+     *  Omitted means every source, which is what this path did before the field existed. NOT the
+     *  file's own provenance: a company file has none. */
+    compareSources?: string[];
+  } = {}
 ) {
   const form = new FormData();
   form.append("name", opts.name ?? "Company import");
   form.append("uploadPersonName", opts.owner ?? "Tester");
+  if (opts.compareBy) form.append("compareBy", opts.compareBy);
+  if (opts.compareSources) form.append("compareSources", JSON.stringify(opts.compareSources));
   await attach(form, { csv: opts.csv ?? DEFAULT_CSV, format: opts.format });
   return app.inject({ method: "POST", url: "/api/comparisons/run", payload: form, headers: form.getHeaders() });
 }
 
-/** Import one Facebook friends file via /run. */
+/**
+ * Import one friends file via /run.
+ *
+ * `owner` is the TYPED relationship owner — an override that files every row under one name,
+ * whatever the file itself says, and the only source of an owner for a file that carries no owner
+ * column (the default fixture). `ownedFriends` is the other case: a CSV with its own owner column,
+ * where each friend arrives with their own and nothing need be typed at all.
+ *
+ * Which is why the default only applies to a file that has no owner column: sending "Tester" with
+ * an `ownedFriends` fixture would overwrite the very column that fixture exists to exercise.
+ */
 export async function importFacebook(
   app: FastifyInstance,
-  opts: { friends?: [string, number][]; owner?: string; format?: UploadFormat; name?: string } = {}
+  opts: {
+    friends?: [string, number][];
+    /** `[name, owner]` — rendered as a CSV with a `relationship_owner` column. A null owner is a
+     *  blank cell, which is a row the import refuses unless a typed owner covers it. */
+    ownedFriends?: [string, string | null][];
+    /** A friends CSV written out in full, headers and all — for the shapes the two helpers above
+     *  cannot express, a bilingual file (`en_name` + `th_name`) chief among them. */
+    friendsCsv?: string;
+    owner?: string;
+    uploader?: string;
+    type?: string;
+    compareBy?: string;
+    format?: UploadFormat;
+    name?: string;
+  } = {}
 ) {
   const form = new FormData();
   form.append("name", opts.name ?? "Facebook import");
-  form.append("uploadPersonName", opts.owner ?? "Tester");
-  await attach(form, { friends: opts.friends ?? DEFAULT_FRIENDS, format: opts.format });
+
+  const body =
+    opts.friendsCsv ??
+    (opts.ownedFriends
+      ? "name,relationship_owner\n" +
+        opts.ownedFriends.map(([n, o]) => `"${n}",${o === null ? "" : `"${o}"`}`).join("\n") +
+        "\n"
+      : null);
+
+  // Only a file that names nobody gets the default. Read off the file that is actually being sent
+  // rather than off which option produced it, so a hand-written `friendsCsv` with an owner column
+  // is treated the same way an `ownedFriends` one is.
+  const fileHasOwner = /(^|,)\s*relationship_owner\s*(,|$)/m.test(body ?? "");
+  const typedOwner = opts.owner ?? (fileHasOwner ? null : "Tester");
+  if (typedOwner) form.append("uploadPersonName", typedOwner);
+
+  if (opts.uploader) form.append("uploaderName", opts.uploader);
+  if (opts.type) form.append("sourceType", opts.type);
+  if (opts.compareBy) form.append("compareBy", opts.compareBy);
+
+  if (body !== null) {
+    form.append("facebookFile", Buffer.from(body, "utf8"), {
+      filename: "friends.csv",
+      contentType: "text/csv",
+    });
+  } else {
+    await attach(form, { friends: opts.friends ?? DEFAULT_FRIENDS, format: opts.format });
+  }
   return app.inject({ method: "POST", url: "/api/comparisons/run", payload: form, headers: form.getHeaders() });
 }
 
@@ -152,17 +217,32 @@ export async function importFacebook(
  */
 export async function startCompare(
   app: FastifyInstance,
-  companies: string | string[] = "Acme Co"
+  /** NULL is every company on file — the whole-table run. See `CompareByCompanyBodySchema`. */
+  companies: string | string[] | null = "Acme Co",
+  compareBy?: string,
+  /** Which friend sources to compare. Omitted means every source — the same thing omitting the
+   *  field from the request body means, so a caller that has no opinion sends what it always did. */
+  sources?: string[] | null
 ): Promise<string> {
   const res = await app.inject({
     method: "POST",
     url: "/api/comparisons/compare",
     payload: JSON.stringify({
-      company_names: Array.isArray(companies) ? companies : [companies],
+      company_names: companies === null ? null : Array.isArray(companies) ? companies : [companies],
+      ...(compareBy ? { compare_by: compareBy } : {}),
+      ...(sources === undefined ? {} : { sources }),
     }),
     headers: { "content-type": "application/json" },
   });
-  return res.json().data.sessionId as string;
+  // A failed compare used to surface as `Cannot read properties of undefined (reading 'sessionId')`
+  // pointing at this line — the helper's own TypeError standing in front of the API's actual
+  // complaint. Report the status and body instead: the failure is nearly always a 400 the caller's
+  // fixture earned, and the message says which.
+  const body = res.json();
+  if (!body?.data?.sessionId) {
+    throw new Error(`compare failed (HTTP ${res.statusCode}): ${res.body}`);
+  }
+  return body.data.sessionId as string;
 }
 
 /**

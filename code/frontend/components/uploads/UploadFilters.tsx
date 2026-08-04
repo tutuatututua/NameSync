@@ -12,19 +12,36 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { ALL_SOURCES_LABEL } from "@extensions/contract";
+import { useUploadSources } from "@/hooks/queries";
 
 export type UploadFilterState = {
   search: string;
-  /** "all" | "company" | "facebook" */
+  /**
+   * WHICH SIDE — "all" | "company" | "facebook", where "facebook" means friends of any source.
+   * The value keeps its legacy spelling; the label on screen does not (see below).
+   */
   type: string;
+  /** WHERE the friends came from — "all" or an `upload_source` value. Independent of `type`. */
+  source: string;
   dateFrom: string;
   dateTo: string;
 };
 
-export const EMPTY_FILTERS: UploadFilterState = { search: "", type: "all", dateFrom: "", dateTo: "" };
+export const EMPTY_FILTERS: UploadFilterState = {
+  search: "",
+  type: "all",
+  source: "all",
+  dateFrom: "",
+  dateTo: "",
+};
 
 const isDirty = (f: UploadFilterState) =>
-  f.search !== "" || f.type !== "all" || f.dateFrom !== "" || f.dateTo !== "";
+  f.search !== "" || f.type !== "all" || f.source !== "all" || f.dateFrom !== "" || f.dateTo !== "";
+
+/** Sentinel for "no source filter". A Select cannot hold "" as a value, and "all" is already the
+ *  vocabulary the type filter beside it uses. */
+const ALL = "all";
 
 /** Search box + type / date-range filters shared by the upload sessions and history tables. */
 export function UploadFilters({
@@ -35,6 +52,7 @@ export function UploadFilters({
   onChange: (v: UploadFilterState) => void;
 }) {
   const set = (patch: Partial<UploadFilterState>) => onChange({ ...value, ...patch });
+  const sources = useUploadSources();
 
   return (
     <div className="flex flex-wrap items-end gap-3">
@@ -52,16 +70,48 @@ export function UploadFilters({
         </div>
       </div>
 
+      {/*
+        WHICH SIDE. Labelled "Friends" and not "Facebook", which is what it used to say and what
+        the value is still spelled: the option filtered kind=social AND source='facebook', so a
+        LinkedIn import appeared under neither option and was unreachable from this toolbar. It now
+        means every friends import whatever its source, and Source beside it is what narrows.
+      */}
       <div className="w-40">
-        <Label className="text-xs">Type</Label>
+        <Label className="text-xs">Data</Label>
         <Select value={value.type} onValueChange={(v) => set({ type: v })}>
           <SelectTrigger className="mt-1">
-            <SelectValue placeholder="All types" />
+            <SelectValue placeholder="Everything" />
           </SelectTrigger>
           <SelectContent>
-            <SelectItem value="all">All types</SelectItem>
-            <SelectItem value="company">Company</SelectItem>
-            <SelectItem value="facebook">Facebook</SelectItem>
+            <SelectItem value="all">Everything</SelectItem>
+            <SelectItem value="company">Company contacts</SelectItem>
+            <SelectItem value="facebook">Friends</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+
+      {/*
+        WHERE the friends came from — the axis this whole change is about, and the one the uploads
+        table had no way to filter on.
+
+        Offered even when Data is "Company contacts", where it can only ever match nothing, rather
+        than hidden or disabled. A control that appears and disappears as a neighbour changes costs
+        the reader more than the impossible combination does — and the combination is recoverable in
+        one click, where a vanished control has to be rediscovered.
+      */}
+      <div className="w-44">
+        <Label className="text-xs">Source</Label>
+        <Select value={value.source} onValueChange={(v) => set({ source: v })}>
+          <SelectTrigger className="mt-1">
+            <SelectValue placeholder="All sources" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={ALL}>{ALL_SOURCES_LABEL}</SelectItem>
+            {(sources.data ?? []).map((s) => (
+              <SelectItem key={s.value} value={s.value}>
+                {s.label}
+              </SelectItem>
+            ))}
           </SelectContent>
         </Select>
       </div>
@@ -113,6 +163,9 @@ export function toUploadParams(
   const params: Record<string, string> = {};
   if (f.search.trim()) params.search = f.search.trim();
   if (f.type !== "all") params[typeKey] = f.type;
+  // Its own param, not folded into `typeKey`: the two axes are independent now, and the server
+  // applies them as separate WHEREs — "friends, from LinkedIn" is a real and useful pair.
+  if (f.source !== ALL) params.source = f.source;
   if (f.dateFrom) params.dateFrom = f.dateFrom;
   if (f.dateTo) params.dateTo = `${f.dateTo}T23:59:59.999Z`;
   return params;

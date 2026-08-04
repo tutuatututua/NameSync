@@ -24,7 +24,14 @@ export function StatTile({
 }: {
   label: string;
   value: string;
-  hint?: string;
+  /**
+   * The line under the value — "of 120 on file", or a composition like "33 confirmed · 7 leads".
+   *
+   * A node rather than a string so a hint can tint one part of itself (the leads, in amber) without
+   * every caller having to hand-roll the paragraph. Backwards compatible: a plain string still
+   * works and still renders exactly as before.
+   */
+  hint?: React.ReactNode;
   isLoading?: boolean;
   /** The one number on the row that carries the story. At most one per group. */
   emphasis?: boolean;

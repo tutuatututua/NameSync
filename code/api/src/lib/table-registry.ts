@@ -1,5 +1,5 @@
 import type { ColumnType, DbColumn, DbTable } from "@extensions/contract";
-import { ROW_QUEUED, ROW_PENDING, ROW_MATCH, ROW_UNMATCH } from "@extensions/contract";
+import { ROW_QUEUED, ROW_PENDING, ROW_MATCH, ROW_UNMATCH, COMPARE_BY_VALUES } from "@extensions/contract";
 import { BadRequest, NotFound } from "./errors";
 
 /**
@@ -130,11 +130,26 @@ const TABLES: RegistryTable[] = [
       c("source", "string", { label: "Source" }),
       c("status", "string", { label: "Status", nullable: false, enumValues: UPLOAD_STATUS }),
       c("mode", "string", { label: "Mode", enumValues: ["fresh", "continue"] }),
+      // Who performed the import. Not the relationship owner — that is per friend row
+      // (friend.relationship_owner) since 2026-07-27, because one file can carry several.
       c("uploaded_by", "string", { label: "Uploaded by" }),
       c("total_records", "number", { label: "Total records", nullable: false }),
       c("duplicate_records", "number", { label: "Duplicates", nullable: false }),
       createdAt(),
       updatedAt(),
+    ],
+  },
+  {
+    name: "upload_source",
+    label: "Import types",
+    description:
+      "The pick-list behind an import's type. Nothing has a foreign key into it, so removing a row only takes the option off the picker.",
+    columns: [
+      idCol(),
+      c("value", "string", { label: "Value", nullable: false, required: true }),
+      c("label", "string", { label: "Label", nullable: false, required: true }),
+      c("created_by", "string", { label: "Added by" }),
+      createdAt(),
     ],
   },
   {
@@ -158,15 +173,30 @@ const TABLES: RegistryTable[] = [
   },
   {
     name: "friend",
-    label: "Facebook data",
-    description: "Social contacts. Each row belongs to the upload that added it.",
+    label: "Friends",
+    description: "Friends and social contacts. Each row belongs to the upload that added it.",
     importSource: "facebook",
     joins: [UPLOAD_JOIN],
     columns: [
       idCol(),
-      c("friend_name", "string", { label: "Facebook name" }),
+      // A column per language, symmetric with company_contact. Editable, because this console
+      // is the deliberate, visible way to change a stored name — an IMPORT may only fill a null
+      // spelling and never overwrite one (see FriendModel.mergeUpload), and that restriction
+      // exists so an import cannot silently orphan result rows that resolve back by name. A
+      // human doing it here is making that trade knowingly.
+      c("friend_name_en", "string", { label: "Name (English)" }),
+      c("friend_name_th", "string", { label: "Name (Thai)" }),
+      // The pre-2026-07-28 single `friend_name` was listed here, read-only and labelled "(legacy)",
+      // until 2026-07-28b-drop-friend-name.sql removed the column. `comparison_result` carried a
+      // `friend_name` of its own — same name, different fact (the spelling a run actually scored) —
+      // and that one is gone too, as of 2026-08-03c.
+      // Whose relationship this is — the row's OWN column since 2026-07-27, not the joined
+      // `uploaded_by` beneath it. Editable here on purpose: re-filing a friend under the
+      // right colleague is the one correction this table exists to make, and it moves the
+      // row between rosters (the dedup key is (owner, name)) rather than merely relabelling it.
+      c("relationship_owner", "string", { label: "Relationship owner" }),
       uploadedBy(),
-      c("source", "string", { label: "Source", nullable: false, required: true }),
+      c("source", "string", { label: "Type", nullable: false, required: true }),
       uploadName(),
       c("upload_id", "number", { label: "Upload ID", nullable: false, required: true }),
       verdict(),
@@ -195,8 +225,31 @@ const TABLES: RegistryTable[] = [
        * by the compare route.
        */
       c("selected_companies", "json", { label: "Companies", editable: false }),
-      c("source", "string", { label: "Source" }),
+      /**
+       * Which friends the run covered — `text[]`, NULL for every source.
+       *
+       * Read-only for the same two reasons `selected_companies` above is: node-postgres hands a
+       * text[] back as a JS array the grid renders fine, and the JSON editor cannot tell `["a"]`
+       * from `{"a":1}` on the way back in. There is a third reason here — like `compare_by` below,
+       * this describes what a finished run ALREADY DID. Editing it would relabel a run as having
+       * covered a population it never looked at, and every count on the run page reads this column
+       * to size its own denominator.
+       *
+       * Was a scalar `source varchar(100)` until 2026-08-03d. Nothing ever wrote it.
+       */
+      c("sources", "json", { label: "Sources", editable: false }),
       c("status", "string", { label: "Status", nullable: false, enumValues: COMPARISON_STATUS }),
+      /**
+       * How the run compared — `'<script>_<part>'`. Read-only, and that is the point: a run's
+       * mode describes what already happened, and editing it here would not re-run anything.
+       * It would just relabel a finished run as having asked a question it never asked, which
+       * is worse than an unhelpful label — every reader of this column treats it as the
+       * provenance of the verdicts beneath it.
+       *
+       * NULL reads as the default everywhere, so the grid showing a blank here is showing the
+       * truth rather than a gap.
+       */
+      c("compare_by", "string", { label: "Compared by", editable: false, enumValues: [...COMPARE_BY_VALUES] }),
       c("expected_batches", "number", { label: "Expected batches" }),
       createdAt(),
       updatedAt(),
@@ -211,14 +264,28 @@ const TABLES: RegistryTable[] = [
       idCol(),
       joined("comparison_name", "string", "comparison", "name", "Comparison"),
       c("comparison_id", "number", { label: "Comparison ID", nullable: false, required: true }),
-      c("friend_name", "string", { label: "Facebook name" }),
+      // The friend's two spellings as the run recorded them. Frozen evidence of what was
+      // compared, which is why they are text here and not a lookup through `friend_id`. A third
+      // column, `friend_name`, held the one spelling the run scored until 2026-08-03c; which of
+      // these two that was is read off the run's `compare_by` now.
+      c("friend_name_en", "string", { label: "Friend name (English)" }),
+      c("friend_name_th", "string", { label: "Friend name (Thai)" }),
       c("person_name_en", "string", { label: "English name" }),
       c("person_name_th", "string", { label: "Thai name" }),
+      // IDENTITY, for counting only — never resolve a display name through these. Read-only:
+      // hand-editing an identity link would silently move a run's history onto a different
+      // person, and the text columns beside them are what the UI actually renders.
+      c("friend_id", "number", { label: "Friend ID", editable: false }),
+      c("company_contact_id", "number", { label: "Contact ID", editable: false }),
       c("batch_number", "number", { label: "Batch" }),
       c("status", "string", { label: "Status", nullable: false, enumValues: RESULT_STATUS }),
       // Sort/display only — in [0, 1], NULL when unrecorded. Never the verdict; `status` is.
       c("similarity", "number", { label: "Similarity" }),
-      c("upload_name", "string", { label: "Upload" }),
+      // NOT the upload, despite the name, and not reliably the owner either — it is whatever the
+      // matcher claimed the owner was. Labelled for what it is: nothing groups by it any more (see
+      // models/network.model.ts), so a console reader must not take it for the answer to "whose
+      // friend is this". That lives on `friend.relationship_owner`.
+      c("upload_name", "string", { label: "Owner (as matcher reported)" }),
       c("company_name", "string", { label: "Company" }),
       c("extra", "json", { label: "Extra" }),
       createdAt(),

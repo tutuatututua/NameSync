@@ -2,9 +2,14 @@
 
 import { Building2, SearchX, Sparkles, Users } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
-import type { ComparisonProgress, RunRow } from "@extensions/contract";
+import {
+  DEFAULT_COMPARE_BY,
+  type CompareBy,
+  type ComparisonProgress,
+  type RunRow,
+} from "@extensions/contract";
 import { Card, CardContent } from "@/components/ui/card";
-import { formatCompanies } from "@/lib/format";
+import { CompareModeBadge } from "@/components/compare-mode";
 import type { MergeFacts } from "@/lib/match";
 import { cn } from "@/lib/utils";
 
@@ -30,35 +35,32 @@ export function Verdict({
   companies,
   kind,
   origin,
+  compareBy = DEFAULT_COMPARE_BY,
+  unscored = 0,
 }: {
   facts: MergeFacts;
   /** The companies the run was pointed at. Empty for a whole-table run. */
   companies: string[];
   kind: RunRow["kind"];
   origin: ComparisonProgress["origin"];
+  /** How this run compared. Shown beside the headline because the headline is a count, and a
+   *  count of last-name Thai matches is not the same finding as a count of full-name English
+   *  ones — two runs of this page put side by side would otherwise look directly comparable. */
+  compareBy?: CompareBy;
+  /** Rows the mode ruled out. Stated here so "12 of 40" is never read as "12 of everything". */
+  unscored?: number;
 }) {
   const { matches, scored, contacts, matchedUploaders } = facts;
   const none = matches === 0;
 
-  // What the rows are, and what they were held up against. A company import asks the mirror of the
-  // question a friends import asks, and answering both with one sentence is how you get a headline
-  // that is true of neither.
+  // What the rows are. Still needed below, where a run that matched nobody explains that every row
+  // has a closest counterpart — a sentence that has to know whether those rows are contacts or
+  // friends.
+  //
+  // The `target` that used to sit beside it ("someone you know", "someone at PTT or BANPU") went
+  // with the sentence-shaped headline. The run's scope is not lost with it: the page header names
+  // the companies, and every matched row names the company it landed at.
   const noun = kind === "company" ? "contact" : "friend";
-  // "someone at PTT" becomes "someone at PTT, BANPU or BLUEBIK" — one preposition, one list, and
-  // still one claim about each matched friend. "or" and not "and", which would say each of them
-  // works at all three.
-  const companyLabel = formatCompanies(companies);
-  const target =
-    kind === "company"
-      ? // A friend has no employer on file, so there is no "at X" to offer. What makes a matched
-        // contact worth anything is that somebody on your side already knows them.
-        "someone you know"
-      : companyLabel
-        ? `someone at ${companyLabel}`
-        : // An import-driven run picked no company: it scored against every contact on file. Saying
-          // "the company" here named a company that does not exist, and the page printed that
-          // fiction next to rows that named the real one.
-          "a contact on file";
 
   /**
    * A supporting number earns its place by saying something the headline does not.
@@ -132,29 +134,44 @@ export function Verdict({
           </span>
 
           <div className="min-w-0 space-y-1">
-            {/* The headline is a sentence, not a metric. A number on its own ("13") still
-                makes the reader do the work of deciding what it counted. */}
+            {/* The count, and nothing else.
+                This was a full sentence — "4 contacts match someone you know" — on the reasoning
+                that a bare number leaves the reader working out what it counted. What changed is
+                that the number no longer stands alone: the mode badge, the "out of N scored" line
+                directly beneath, and the table's own "Matches 4" tab all say what population it
+                came from, so the sentence was the fourth telling rather than the only one. */}
             <h2 className="font-display text-xl font-semibold leading-tight tracking-tight sm:text-2xl">
               {none ? (
-                <>
-                  No {noun} matches {target}
-                </>
+                "No match"
               ) : (
                 <>
-                  <span className="text-primary">
-                    {matches.toLocaleString()} {matches === 1 ? noun : `${noun}s`}
-                  </span>{" "}
-                  {matches === 1 ? "matches" : "match"} {target}
+                  <span className="text-primary">{matches.toLocaleString()}</span> match
                 </>
               )}
             </h2>
+            <div className="flex flex-wrap items-center gap-2">
+              <CompareModeBadge mode={compareBy} />
+              {/* A "read at 0.62" badge sat here while this page had a threshold slider, to stop a
+                  re-graded count being screenshotted as the run's own finding. The slider moved to
+                  the Network page and this count is the matcher's again, unconditionally — so the
+                  caption below can state that plainly rather than switching on a bar. */}
+              {/* The denominator's missing half. Without it "12 of 40" reads as a 30% hit rate
+                  over everything on file, when 280 names were never in the running. */}
+              {unscored > 0 && (
+                <span className="text-xs text-muted-foreground">
+                  {unscored.toLocaleString()} not compared
+                </span>
+              )}
+            </div>
             <p className="text-sm text-muted-foreground">
               out of {scored.toLocaleString()} scored ·{" "}
               {/* This used to name the bar — "a match is 80% similarity or better" — which kept
                   the headline honest by admitting the number rested on a threshold the reader
                   could disagree with. There is no threshold on this side any more: the matcher
                   decides, and we store the decision. Saying so is the honest version of the same
-                  disclosure, and it is a weaker one, because the reader can no longer check it. */}
+                  disclosure, and it is a weaker one, because the reader can no longer check it —
+                  what they CAN do is re-read the pooled answer at a bar of their own, on the
+                  Network page. */}
               <span className="whitespace-nowrap">as decided by the matcher</span>
             </p>
           </div>

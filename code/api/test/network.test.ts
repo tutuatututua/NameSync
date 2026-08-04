@@ -1,9 +1,17 @@
 import { beforeAll, afterAll, beforeEach, describe, it, expect } from "vitest";
 import type { FastifyInstance } from "fastify";
+import { sql } from "kysely";
+import { DBModel } from "@extensions/sqldb";
 import { buildApp } from "../src/app";
 import { startMockWebhook, type MockServer } from "./mockWebhook";
 import { MOCK_PORT } from "./setup";
-import { truncateAll, importCompany, importFacebook, startCompare } from "./helpers";
+import {
+  truncateAll,
+  importCompany,
+  importFacebook,
+  startCompare,
+  createComparison,
+} from "./helpers";
 
 /**
  * The Network workspace's read side (Overview + Search) and the contact-rename endpoint.
@@ -73,10 +81,12 @@ describe("network overview (GET /api/network/overview)", () => {
     expect(ov.uploader).toBeNull();
     expect(ov.friends).toBe(2); // Noppamas + Stranger were uploaded
     expect(ov.friendsMatched).toBe(1); // only Noppamas matched; "no match" = 2 − 1 = 1
+    // The run compared whole names (the default), so the one match is confirmed rather than a lead.
+    expect(ov.friendsConfirmed).toBe(1);
     expect(ov.companiesOnFile).toBe(2); // MCKINSEY + BLUEBIK
     expect(ov.connections).toBe(1); // one (person, company) match
     // Only companies actually reached, and only by a MATCH — BLUEBIK produced none.
-    expect(ov.connected).toEqual([{ company: "MCKINSEY", connections: 1 }]);
+    expect(ov.connected).toEqual([{ company: "MCKINSEY", connections: 1, confirmed: 1 }]);
   });
 
   it("scopes to one roster's matched/no-match names, and reports an untouched roster as empty", async () => {
@@ -86,7 +96,7 @@ describe("network overview (GET /api/network/overview)", () => {
     expect(alex.uploader).toBe("Alex");
     expect(alex.friends).toBe(2); // uploaded 2 friends
     expect(alex.friendsMatched).toBe(1); // 1 matched → 1 no match
-    expect(alex.connected).toEqual([{ company: "MCKINSEY", connections: 1 }]);
+    expect(alex.connected).toEqual([{ company: "MCKINSEY", connections: 1, confirmed: 1 }]);
 
     // A roster nobody uploaded is empty across the board.
     const bob = await overview("Bob");
@@ -119,8 +129,23 @@ describe("network search (GET /api/network/search)", () => {
     expect(row.companyConnections).toBe(1); // one person reaches MCKINSEY
     // Who knows them, and how close the match that says so was — the chip carries both, so an
     // exact name and a near miss cannot read as the same claim. Alex's friend IS Noppamas: 1.
-    expect(row.connectedUploaders).toEqual([{ name: "Alex", similarity: 1 }]);
-    expect(row.companyUploaders).toEqual(["Alex"]); // Alex reaches MCKINSEY (via Noppamas)
+    // `mode` rides along so the chip can say what the number measured — a bare 94% reads the same
+    // whether it came from two whole names or two surnames.
+    //
+    // `name` is the relationship OWNER and `uploadedBy` is who imported their roster — the same
+    // person here, because this fixture's importer typed their own contacts. They are separate
+    // fields because they are separate people whenever an assistant imports on someone's behalf,
+    // and the chip used to show only the second while claiming to show the first.
+    //
+    // `friend` is the OTHER HALF OF THE PAIRING — the friend as this run compared them, so the
+    // company page can state "noppamas ↔ noppamas" rather than asserting a match between a score
+    // and a name the reader cannot see. Cleaned and lower-cased like every stored name, because it
+    // is the string that was actually scored and not a display copy of it.
+    expect(row.connectedUploaders).toEqual([
+      { name: "Alex", friend: "noppamas", uploadedBy: "Alex", similarity: 1, mode: "en_full", corroborated: false },
+    ]);
+    // Alex reaches MCKINSEY (via Noppamas), on a whole-name match.
+    expect(row.companyUploaders).toEqual([{ name: "Alex", uploadedBy: "Alex", confirmed: true }]);
   });
 
   it("reports a company nobody reaches as zero connections, contact known by no one", async () => {
@@ -144,10 +169,16 @@ describe("network search (GET /api/network/search)", () => {
     const row = (await search("Noppamas")).data[0];
     // Both know Noppamas, each with their own score — one chip per person, not a shared verdict.
     expect(row.connectedUploaders).toEqual([
-      { name: "Alex", similarity: 1 },
-      { name: "Bee", similarity: 1 },
+      // One English run only — a second language agreeing is what `corroborated` reports, and
+      // there is no second language here.
+      { name: "Alex", friend: "noppamas", uploadedBy: "Alex", similarity: 1, mode: "en_full", corroborated: false },
+      { name: "Bee", friend: "noppamas", uploadedBy: "Bee", similarity: 1, mode: "en_full", corroborated: false },
     ]);
-    expect(row.companyUploaders).toEqual(["Alex", "Bee"]); // both reach MCKINSEY
+    // Both reach MCKINSEY, both on whole names.
+    expect(row.companyUploaders).toEqual([
+      { name: "Alex", uploadedBy: "Alex", confirmed: true },
+      { name: "Bee", uploadedBy: "Bee", confirmed: true },
+    ]);
   });
 
   it("matches on the company name too, so searching a company lists its people", async () => {
@@ -162,7 +193,9 @@ describe("network search (GET /api/network/search)", () => {
     // Every row is a MCKINSEY contact, and the company-level uploaders are on the row.
     expect(res.data.length).toBeGreaterThan(0);
     expect(res.data.every((r: { company_name: string }) => r.company_name === "MCKINSEY")).toBe(true);
-    expect(res.data[0].companyUploaders).toEqual(["Alex"]);
+    expect(res.data[0].companyUploaders).toEqual([
+      { name: "Alex", uploadedBy: "Alex", confirmed: true },
+    ]);
   });
 
   it("400s a search with neither a query nor a company", async () => {
@@ -176,7 +209,7 @@ describe("network uploaders (GET /api/network/uploaders)", () => {
     await seedAndCompare();
 
     const rows = await uploaders();
-    expect(rows).toEqual([{ uploader: "Alex", friends: 2, matched: 1, noMatch: 1 }]);
+    expect(rows).toEqual([{ uploader: "Alex", friends: 2, matched: 1, confirmed: 1, noMatch: 1 }]);
   });
 
   it("lists a roster with zero matches (so 'who have I placed nobody for' is answerable)", async () => {
@@ -186,7 +219,7 @@ describe("network uploaders (GET /api/network/uploaders)", () => {
     await startCompare(app, ["MCKINSEY", "BLUEBIK"]);
 
     const rows = await uploaders();
-    expect(rows).toEqual([{ uploader: "Bee", friends: 2, matched: 0, noMatch: 2 }]);
+    expect(rows).toEqual([{ uploader: "Bee", friends: 2, matched: 0, confirmed: 0, noMatch: 2 }]);
   });
 
   it("is empty when no friend lists have been uploaded", async () => {
@@ -203,15 +236,17 @@ describe("network uploader detail (GET /api/network/uploader)", () => {
     expect(alex.uploader).toBe("Alex");
     expect(alex.friends).toBe(2);
     expect(alex.matched).toBe(1);
+    expect(alex.confirmed).toBe(1); // whole names were compared, so the match is confirmed
     expect(alex.noMatch).toBe(1);
     // One company section, the matched contact's English + Thai names alongside the uploaded name.
     // Everything is stored lower-cased except the company, which keeps its case.
     expect(alex.matchedByCompany).toEqual([
       {
         company: "MCKINSEY",
-        // With how close the match was: this list is every pairing a run called a match, and
-        // without the score an exact name and a near miss read as the same claim.
-        people: [{ friend: "noppamas", en: "noppamas", th: "นพมาศ", similarity: 1 }],
+        // With how close the match was AND what it compared: this list is every pairing a run
+        // called a match, and without either an exact name and a near miss read as the same claim.
+        people: [{ friend: "noppamas", en: "noppamas", th: "นพมาศ", similarity: 1, mode: "en_full" }],
+        confirmed: 1,
       },
     ]);
     // The unplaced friend, with whatever the matcher looked at before turning them down: it keeps
@@ -250,8 +285,11 @@ describe("network uploader detail (GET /api/network/uploader)", () => {
     // finding about the friend: the entry is still listed, with nothing attached to it.
 
     const alex = await uploader("Alex");
+    // `mode` is the one field that is not null here: the contract promises it is never null, and
+    // with no run to take one from it resolves to the default. Harmless, because with all four
+    // other fields null there is no near miss on screen for it to describe.
     expect(alex.noMatchPeople).toEqual([
-      { friend: "stranger", en: null, th: null, company: null, similarity: null },
+      { friend: "stranger", en: null, th: null, company: null, similarity: null, mode: "en_full" },
     ]);
   });
 
@@ -264,7 +302,11 @@ describe("network uploader detail (GET /api/network/uploader)", () => {
     expect(nobody).toEqual({
       uploader: "Nobody",
       friends: 0,
+      // Nobody owns nothing, so nobody imported anything for them — an empty list, not an absent
+      // field. The page reads its length to decide whether to print the "Imported by" line at all.
+      importedBy: [],
       matched: 0,
+      confirmed: 0,
       noMatch: 0,
       matchedByCompany: [],
       noMatchPeople: [],
@@ -274,6 +316,336 @@ describe("network uploader detail (GET /api/network/uploader)", () => {
   it("400s a request with no name", async () => {
     const res = await app.inject({ method: "GET", url: "/api/network/uploader?name=" });
     expect(res.statusCode).toBe(400);
+  });
+});
+
+/**
+ * A MATCHER THAT WRITES THE WRONG PERSON INTO `upload_name` — reproduced exactly.
+ *
+ * docs/EXTERNAL-MATCHER.md §1 tells the workflow to fill that column from `upload_person_name` /
+ * `relationship_owner` and warns, by name, "Do not switch that write to `uploader_name`. It is a
+ * different person." A live workflow did precisely that, and because the whole Network workspace
+ * was keyed on the column, one off-contract string broke three things at once with nothing logged:
+ * every chip named the importer, every chip linked to a roster page that came back EMPTY, and
+ * `count(distinct friend)` collapsed to 0 — a company page reading "Connections 0" directly beside
+ * "Reachable by 1".
+ *
+ * This is the regression test for all three. It is deliberately written from the OUTSIDE: it says
+ * only "a matcher posted results naming the wrong person", which is the one thing that is genuinely
+ * outside this app's control, and then asserts the app is right anyway. Nothing here asserts what
+ * `upload_name` contains — the point is that the answer no longer depends on it.
+ */
+describe("an off-contract upload_name cannot break a roster", () => {
+  const db = async () => (await DBModel.getPool()).connect();
+
+  /**
+   * The production shape, exactly: Win owns the relationship, Local dev pressed import, and the
+   * matcher reports Local dev as the owner. Every column is real; only the last is wrong.
+   *
+   * The result row goes in by direct INSERT rather than through the callback route, because that is
+   * how the real workflow writes (docs/EXTERNAL-MATCHER.md §2b is a plain INSERT into
+   * `comparison_result`) and only the direct path can reproduce the two things that matter here:
+   * `friend_id` left NULL, and `company_name` set. Going through the callback would have tested a
+   * writer that is not the one that broke.
+   */
+  async function seedMisattributed(): Promise<void> {
+    const co = await importCompany(app, { csv: CO_CSV, owner: "Local dev" });
+    expect(co.statusCode, co.body).toBe(200);
+    // Asserted, not fired and forgotten: a rejected import leaves an empty roster, and an empty
+    // roster is indistinguishable from the bug this file is about — the assertion below would fail
+    // for the wrong reason and read as a regression.
+    const fb = await importFacebook(app, {
+      friends: [["Noppamas", 1]],
+      owner: "Win", // the relationship owner, per friend row
+      uploader: "Local dev", // who performed the import — a different person
+    });
+    expect(fb.statusCode, fb.body).toBe(200);
+    const comparisonId = await createComparison("MCKINSEY");
+    await sql`
+      insert into lakeshore.comparison_result
+        (comparison_id, friend_name_en, person_name_en, person_name_th,
+         status, similarity, company_name, batch_number, upload_name)
+      values (${comparisonId}, 'noppamas', 'noppamas', 'นพมาศ',
+              'match', 1, 'MCKINSEY', 1,
+              -- THE BUG, verbatim: the importer where the owner belongs. friend_id is left NULL,
+              -- as the workflow leaves it, so the friend can only be found by name.
+              'Local dev')
+    `.execute(await db());
+    await sql`update lakeshore.comparison set compare_by = 'en_full', status = 'completed'
+               where id = ${comparisonId}`.execute(await db());
+  }
+
+  it("attributes the match to the owner, not to whoever the matcher named", async () => {
+    await seedMisattributed();
+
+    // The roster exists under the OWNER, with the match counted against it. `matched: 0` here was
+    // the visible symptom on the Uploaders tab.
+    const rosters = await uploaders();
+    expect(rosters).toEqual([
+      { uploader: "Win", friends: 1, matched: 1, confirmed: 1, noMatch: 0 },
+    ]);
+    // And the importer is not a roster. They own no relationships; having pressed a button is not
+    // a reason to appear in a list of people you can ask for an introduction.
+    expect(rosters.map((r: { uploader: string }) => r.uploader)).not.toContain("Local dev");
+  });
+
+  it("opens a roster page with friends on it — the empty page this fixes", async () => {
+    await seedMisattributed();
+
+    const win = await uploader("Win");
+    expect(win.friends).toBe(1);
+    expect(win.matched).toBe(1);
+    expect(win.matchedByCompany[0].company).toBe("MCKINSEY");
+    // Provenance, kept and reported rather than conflated with ownership.
+    expect(win.importedBy).toEqual(["Local dev"]);
+
+    // The name the chip used to carry leads nowhere, and now says so honestly instead of 404ing.
+    const localDev = await uploader("Local dev");
+    expect(localDev.friends).toBe(0);
+  });
+
+  it("counts the connection — 'Connections 0' beside 'Reachable by 1' cannot recur", async () => {
+    await seedMisattributed();
+
+    const row = (await searchCompany("MCKINSEY")).data[0];
+    // The count and the chips are two reads of one fact and must agree. They disagreed because the
+    // count resolved a friend row (and failed) while the chips just echoed the string.
+    expect(row.companyConnections).toBe(1);
+    expect(row.connectedUploaders).toEqual([
+      // The owner is Win, the importer is Local dev, and the friend is neither of them — three
+      // facts the row used to compress into one name, which is how the wrong one went unnoticed.
+      { name: "Win", friend: "noppamas", uploadedBy: "Local dev", similarity: 1, mode: "en_full", corroborated: false },
+    ]);
+    expect(row.companyUploaders).toEqual([
+      { name: "Win", uploadedBy: "Local dev", confirmed: true },
+    ]);
+  });
+
+  /**
+   * A CHIP IS A LINK, so a name it cannot open is worse than no chip.
+   *
+   * The tempting design is `coalesce(friend.relationship_owner, upload_name)` — same answer when the
+   * two agree, and something rather than nothing when the friend row is gone (a rolled-back import
+   * deletes it and nulls `friend_id`). It is the wrong trade for this file: a name only the fallback
+   * can supply is, by construction, a name with no friend rows behind it, so its chip is guaranteed
+   * to open the empty roster page this whole change exists to remove. And on a database where the
+   * workflow writes the importer into that column, every name it could supply is the wrong person.
+   *
+   * So: no friend row, no owner, no chip. The evidence of what was compared is untouched — it lives
+   * in the result row's own name columns, which is what the readers that render this as plain text
+   * (`findByComparisonId`, both `findRunRows`) still fall back to.
+   */
+  it("shows no owner at all for a result naming a friend who is not on file", async () => {
+    const co = await importCompany(app, { csv: CO_CSV, owner: "Local dev" });
+    expect(co.statusCode, co.body).toBe(200);
+    // No friend import: the result below names somebody this database has never heard of, which is
+    // what a rolled-back import leaves behind.
+    const comparisonId = await createComparison("MCKINSEY");
+    await sql`
+      insert into lakeshore.comparison_result
+        (comparison_id, friend_name_en, person_name_en, person_name_th,
+         status, similarity, company_name, batch_number, upload_name)
+      values (${comparisonId}, 'ghost', 'noppamas', 'นพมาศ',
+              'match', 1, 'MCKINSEY', 1, 'Local dev')
+    `.execute(await db());
+    await sql`update lakeshore.comparison set compare_by = 'en_full', status = 'completed'
+               where id = ${comparisonId}`.execute(await db());
+
+    const row = (await searchCompany("MCKINSEY")).data[0];
+    // No chip — not one reading "Local dev" that opens an empty page.
+    expect(row.connectedUploaders).toEqual([]);
+    expect(row.companyUploaders).toEqual([]);
+    // And the count agrees with the chips, which is the invariant that broke last time. Both are
+    // zero here, and they are zero for the same reason rather than by coincidence.
+    expect(row.companyConnections).toBe(0);
+    // No phantom roster either: the Uploaders tab is built from friend rows, and there are none.
+    expect(await uploaders()).toEqual([]);
+  });
+});
+
+/**
+ * Grading the evidence — the Network page pools runs that asked different questions.
+ *
+ * A full-name run and a surname run write rows of the same shape, and until these tests existed the
+ * page rendered both as the same green "Alex knows this person" chip. What is asserted here is the
+ * grade, the invariants that must survive it, and the one case where a correct fix makes a number
+ * on screen go DOWN.
+ */
+describe("network match grading (confirmed vs lead)", () => {
+  const db = async () => (await DBModel.getPool()).connect();
+
+  /** Narong Jaidee at ACME; Somchai Jaidee on the roster. Shares a surname, not a whole name. */
+  const SURNAME_CSV = "company_name,thai_name,eng_name\nACME,,Narong Jaidee\n";
+  /** The same person on both sides — matches under a full run AND a surname run. */
+  const SAME_CSV = "company_name,thai_name,eng_name\nACME,,Somchai Jaidee\n";
+
+  const seedSurnameOnly = async () => {
+    await importCompany(app, { csv: SURNAME_CSV, owner: "Alex" });
+    await importFacebook(app, { friends: [["Somchai Jaidee", 1]], owner: "Alex" });
+  };
+
+  it("grades a run with no mode as confirmed — those rows were written when every run compared whole names", async () => {
+    await importCompany(app, { csv: SAME_CSV, owner: "Alex" });
+    await importFacebook(app, { friends: [["Somchai Jaidee", 1]], owner: "Alex" });
+    const id = await startCompare(app, ["ACME"], "en_full");
+
+    // A legacy run: the column is nullable and rows predating it have no mode.
+    await sql`update lakeshore.comparison set compare_by = null where id = ${id}`.execute(await db());
+
+    const ov = await overview("Alex");
+    expect(ov.friendsMatched).toBe(1);
+    // Grading it a lead would invent doubt about a run that never had any.
+    expect(ov.friendsConfirmed).toBe(1);
+    const row = (await search("Somchai")).data[0];
+    expect(row.connectedUploaders[0].mode).toBe("en_full"); // resolved, never null on the wire
+  });
+
+  it("grades an unrecognised mode as confirmed rather than dropping the row", async () => {
+    await importCompany(app, { csv: SAME_CSV, owner: "Alex" });
+    await importFacebook(app, { friends: [["Somchai Jaidee", 1]], owner: "Alex" });
+    const id = await startCompare(app, ["ACME"], "en_full");
+
+    // The Database console writes this column too, and it has no CHECK constraint.
+    await sql`update lakeshore.comparison set compare_by = 'sideways_middle' where id = ${id}`.execute(
+      await db()
+    );
+
+    const ov = await overview("Alex");
+    expect(ov.friendsMatched).toBe(1); // still a match — an unknown mode is not a reason to hide a run
+    expect(ov.friendsConfirmed).toBe(1);
+  });
+
+  it("grades a surname run as a lead, and keeps it inside `matched` rather than restating it as a non-match", async () => {
+    await seedSurnameOnly();
+    await startCompare(app, ["ACME"], "en_surname");
+
+    const ov = await overview("Alex");
+    expect(ov.friendsMatched).toBe(1); // it IS a match — narrowing this would break the tile below
+    expect(ov.friendsConfirmed).toBe(0); // but not one to act on without checking
+    // Nobody is left unplaced: the lead counts as matched, so `friends − matched` is zero. This is
+    // the assertion that pins the decision — had "matched" been narrowed to confirmed-only, this
+    // friend would have fallen into `noMatch` and the page would report a match as a non-match.
+    expect(ov.friends - ov.friendsMatched).toBe(0);
+
+    const [stats] = await uploaders();
+    expect(stats).toEqual({ uploader: "Alex", friends: 1, matched: 1, confirmed: 0, noMatch: 0 });
+
+    const alex = await uploader("Alex");
+    expect(alex.matched).toBe(1);
+    expect(alex.confirmed).toBe(0);
+    // The lead stays under matchedByCompany — moving it to noMatchPeople would decouple the
+    // section from the tile that links to it.
+    expect(alex.matchedByCompany).toHaveLength(1);
+    expect(alex.matchedByCompany[0].confirmed).toBe(0);
+    expect(alex.matchedByCompany[0].people[0].mode).toBe("en_surname");
+    expect(alex.noMatchPeople).toEqual([]);
+  });
+
+  it("company reach reports a surname-only connection as unconfirmed", async () => {
+    await seedSurnameOnly();
+    await startCompare(app, ["ACME"], "en_surname");
+
+    const ov = await overview("Alex");
+    // "ACME · 1 connection" is true, and it is a lead — the case that used to read as a placement.
+    expect(ov.connected).toEqual([{ company: "ACME", connections: 1, confirmed: 0 }]);
+
+    const row = (await search("Narong")).data[0];
+    expect(row.companyUploaders).toEqual([{ name: "Alex", uploadedBy: "Alex", confirmed: false }]);
+    expect(row.connectedUploaders[0].mode).toBe("en_surname");
+  });
+
+  /**
+   * THE PAIRING, NOT JUST THE VERDICT — what the company page needs to make a lead checkable.
+   *
+   * This fixture is the exact shape the grade exists for: the contact is `narong jaidee`, the
+   * friend is `somchai jaidee`, and a surname run matched them on `jaidee` alone. Everything the
+   * row carried before this named one side or neither — "Alex · surname 100%" beside narong's name
+   * is a claim the reader cannot check, and the obvious reading of it ("Alex knows narong") is
+   * wrong. Carrying the friend's name turns it into a sentence with both halves in it, which the
+   * reader can then reject in one glance.
+   */
+  it("names the friend a connection came from, so the pairing can be read off the row", async () => {
+    await seedSurnameOnly();
+    await startCompare(app, ["ACME"], "en_surname");
+
+    const [conn] = (await searchCompany("ACME")).data[0].connectedUploaders;
+    expect(conn).toEqual({
+      name: "Alex",
+      // Alex's friend — NOT the contact, and not the owner. The two names share only a surname.
+      friend: "somchai jaidee",
+      uploadedBy: "Alex",
+      similarity: expect.any(Number),
+      mode: "en_surname",
+      corroborated: false,
+    });
+  });
+
+  it("shows the FULL run's score even when a partial run scored higher", async () => {
+    await importCompany(app, { csv: SAME_CSV, owner: "Alex" });
+    await importFacebook(app, { friends: [["Somchai Jaidee", 1]], owner: "Alex" });
+
+    const fullRun = await startCompare(app, ["ACME"], "en_full");
+    const surnameRun = await startCompare(app, ["ACME"], "en_surname");
+
+    // Forced rather than contrived out of trigram arithmetic, so the test asserts the RULE and not
+    // a property of two particular strings: the surname run now scores this pairing higher than the
+    // full-name run did.
+    const conn = await db();
+    await sql`update lakeshore.comparison_result set similarity = 0.88 where comparison_id = ${fullRun}`.execute(
+      conn
+    );
+    await sql`update lakeshore.comparison_result set similarity = 0.99 where comparison_id = ${surnameRun}`.execute(
+      conn
+    );
+
+    const alex = await uploader("Alex");
+    const [person] = alex.matchedByCompany[0].people;
+    // The old `max(similarity)` fold returned 0.99 here and rendered it beside a full-name claim —
+    // a number and a claim from two different runs. The displayed percent DROPS, and that is the
+    // fix: 0.88 is what the whole names actually scored.
+    expect(person.similarity).toBeCloseTo(0.88, 5);
+    expect(person.mode).toBe("en_full");
+    expect(alex.confirmed).toBe(1);
+
+    // The same fold in Search, which reaches it by a different query.
+    const row = (await search("Somchai")).data[0];
+    expect(row.connectedUploaders[0].mode).toBe("en_full");
+    expect(row.connectedUploaders[0].similarity).toBeCloseTo(0.88, 5);
+  });
+
+  it("holds matched = confirmed + leads and friends = matched + noMatch across every surface", async () => {
+    // One friend confirmed at ACME, one friend a surname-only lead at BETA, one unplaced.
+    await importCompany(
+      app,
+      { csv: "company_name,thai_name,eng_name\nACME,,Somchai Jaidee\nBETA,,Narong Wongsa\n", owner: "Alex" }
+    );
+    await importFacebook(app, {
+      friends: [["Somchai Jaidee", 1], ["Pichai Wongsa", 2], ["Stranger Person", 3]],
+      owner: "Alex",
+    });
+    await startCompare(app, ["ACME", "BETA"], "en_full"); // places Somchai only
+    await startCompare(app, ["ACME", "BETA"], "en_surname"); // adds Pichai as a lead on "wongsa"
+
+    const ov = await overview("Alex");
+    expect(ov.friends).toBe(3);
+    expect(ov.friendsMatched).toBe(2);
+    expect(ov.friendsConfirmed).toBe(1);
+    expect(ov.friends - ov.friendsMatched).toBe(1); // exactly one unplaced
+
+    const [stats] = await uploaders();
+    expect(stats.friends).toBe(stats.matched + stats.noMatch);
+    expect(stats.matched).toBe(2);
+    expect(stats.confirmed).toBe(1);
+
+    const alex = await uploader("Alex");
+    expect(alex.friends).toBe(alex.matched + alex.noMatch);
+    expect(alex.matched).toBe(2);
+    expect(alex.confirmed).toBe(1);
+    expect(alex.noMatchPeople).toHaveLength(1);
+    // Every surface agrees on the same three numbers — the tab you press and the number on it
+    // answer the same question.
+    expect([ov.friendsMatched, stats.matched, alex.matched]).toEqual([2, 2, 2]);
+    expect([ov.friendsConfirmed, stats.confirmed, alex.confirmed]).toEqual([1, 1, 1]);
   });
 });
 

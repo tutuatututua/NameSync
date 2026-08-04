@@ -43,8 +43,8 @@ const friendRows = (names: string[]): [string, number][] =>
  * actually uploads has capitals in it — that is the input worth handing the import, and folding it
  * here is exactly the behaviour under test.
  *
- * It matters beyond cosmetics: every join in this path (`comparison_result.friend_name` to
- * `friend.friend_name`, `person_name_en` to `company_contact.person_name_en`) is an exact string
+ * It matters beyond cosmetics: every join in this path (`comparison_result.friend_name_en` /
+ * `friend_name_th` to `friend`'s two, `person_name_en` to `company_contact.person_name_en`) is an exact string
  * match, on the strength of the column being written folded. A fixture that stamped or inserted a
  * capitalised name would not fail loudly — it would match no row, and the test would read as a
  * workflow that never ran.
@@ -102,7 +102,7 @@ async function workflowStamps(
 
     await sql`
       UPDATE lakeshore.friend SET status = ${v.matched ? "match" : "unmatch"}
-       WHERE friend_name = ${name}
+       WHERE coalesce(friend_name_en, friend_name_th) = ${name}
     `.execute(conn);
 
     if (!v.matched) continue;
@@ -119,7 +119,7 @@ async function workflowStamps(
     // match everywhere, which is exactly what these tests now go on to assert.
     await sql`
       INSERT INTO lakeshore.comparison_result
-        (comparison_id, friend_name, person_name_en, person_name_th,
+        (comparison_id, friend_name_en, person_name_en, person_name_th,
          batch_number, status, upload_name, similarity)
       VALUES (${comparisonId}, ${name}, ${name}, ${"ชื่อ"},
               1, ${"match"}, ${"Alex"}, ${v.similarity ?? null})
@@ -282,7 +282,7 @@ describe("external matcher — an import starts a run", () => {
     // The verdict lives only here: a match pair for Somchai, none for Anong.
     await sql`
       INSERT INTO lakeshore.comparison_result
-        (comparison_id, friend_name, person_name_en, person_name_th,
+        (comparison_id, friend_name_en, person_name_en, person_name_th,
          batch_number, status, upload_name)
       VALUES (${comparisonId}, ${stored("Somchai")}, ${stored("Somchai")}, ${"ชื่อ"},
               1, ${"match"}, ${"Alex"})
@@ -411,43 +411,83 @@ describe("external matcher — an import starts a run", () => {
     expect(mock.state.company).toHaveLength(0);
   });
 
-  it("fails the run when the workflow never receives the file", async () => {
-    // No webhook can reach a dead mock. The import request itself fails loudly — the rows are
-    // stored, but the run is marked failed rather than left waiting forever on a workflow that
-    // was never given anything to do.
+  it("discards the whole import when the workflow never receives the file", async () => {
+    // No webhook can reach a dead mock, and an import the matcher never received produced no
+    // data. It used to be marked `failed` and left in place, which described the state honestly
+    // and was still the wrong outcome: the rows were in the cumulative table, where every later
+    // dedup, roster and count treats them as real, waiting on a verdict from a workflow that was
+    // never handed anything to decide.
     mock.state.failNext = true;
     const res = await importFacebook(app, { friends: friendRows(["Somchai"]), owner: "Alex" });
-    expect(res.statusCode).toBeGreaterThanOrEqual(400);
+    expect(res.statusCode).toBe(502);
+    // The message answers "what happened to my file", which is the question the cause alone left
+    // open — and the one the old behaviour answered badly.
+    expect(res.json().message).toContain("nothing was imported");
+    // And it carries the receiver's OWN words. A bare status cannot distinguish a platform quota
+    // from a flow that chose to answer that status, and only the far side knows which it was.
+    expect(res.json().message).toContain(`{"ok":false}`);
 
-    const runs = (await app.inject({ method: "GET", url: "/api/comparisons" })).json().data;
-    expect(runs).toHaveLength(1);
-    expect(runs[0].status).toBe("failed");
+    // Nothing stored.
+    const stats = (await app.inject({ method: "GET", url: "/api/comparisons/data-stats" })).json().data;
+    expect(stats.facebook.total).toBe(0);
 
-    const upload = (await app.inject({ method: "GET", url: "/api/upload-sessions" })).json().data[0];
-    expect(upload.status).toBe("failed");
-
-    expect((await progress(runs[0].id)).status).toBe("failed");
+    // No run to watch, and no history row — the same stance an import that added nothing takes:
+    // a history of non-events reads as events, and this import is a non-event.
+    expect((await app.inject({ method: "GET", url: "/api/comparisons" })).json().data).toHaveLength(0);
+    expect(
+      (await app.inject({ method: "GET", url: "/api/upload-sessions" })).json().data
+    ).toHaveLength(0);
   });
 
-  it("un-fails the run when the handover is retried through POST /:id/send-webhook", async () => {
+  it("leaves an earlier import's friend untouched when a failed import had enriched it", async () => {
+    // The half a cascade cannot reach: an enriched friend belongs to the import that CREATED it,
+    // so deleting the failed import's own rows leaves this one holding a spelling that no
+    // successful import ever put there — and stuck at 'processing', which holds the earlier
+    // import's run open forever.
+    const { comparisonId } = await importAndForward(["Somchai"]);
+    await workflowStamps(comparisonId, [{ name: "Somchai", matched: false }]);
+    expect((await progress(comparisonId)).status).toBe("completed");
+
+    // A bilingual file naming the same friend: matches on the English spelling, fills the Thai one.
     mock.state.failNext = true;
-    await importFacebook(app, { friends: friendRows(["Somchai"]), owner: "Alex" });
-
-    const upload = (await app.inject({ method: "GET", url: "/api/upload-sessions" })).json().data[0];
-    expect(upload.status).toBe("failed");
-
-    mock.state.facebook.length = 0;
-    const retry = await app.inject({
-      method: "POST",
-      url: `/api/comparisons/${upload.id}/send-webhook`,
+    const res = await importFacebook(app, {
+      friendsCsv: `en_name,th_name\nSomchai,สมชาย\n`,
+      owner: "Alex",
     });
-    expect(retry.statusCode, retry.body).toBe(200);
+    expect(res.statusCode).toBeGreaterThanOrEqual(400);
+
+    const conn = await db();
+    const row = await sql<{
+      friend_name_en: string | null;
+      friend_name_th: string | null;
+      status: string;
+    }>`SELECT friend_name_en, friend_name_th, status FROM lakeshore.friend`.execute(conn);
+
+    // One row, as it was before the failed import touched it: no Thai spelling, verdict intact.
+    expect(row.rows).toHaveLength(1);
+    expect(row.rows[0]).toMatchObject({
+      friend_name_en: stored("Somchai"),
+      friend_name_th: null,
+      status: "unmatch",
+    });
+
+    // And the earlier run is still finished, not reopened by a row it never sent.
+    expect((await progress(comparisonId)).status).toBe("completed");
+  });
+
+  it("re-sends a stored import's rows through POST /:id/send-webhook", async () => {
+    // The endpoint outlives the failure it was written for: POST /run now discards an import whose
+    // handover failed, so there is no failed import left to retry. What it is still for is handing
+    // the same rows over again — a workflow that lost the file, a run being re-driven.
+    const { uploadId, comparisonId } = await importAndForward(["Somchai"]);
+    mock.state.facebook.length = 0;
+
+    const resend = await app.inject({ method: "POST", url: `/api/comparisons/${uploadId}/send-webhook` });
+    expect(resend.statusCode, resend.body).toBe(200);
     expect(mock.state.facebook).toHaveLength(1);
 
-    // The import and its run are live again, waiting on the workflow — not failed forever
-    // for a handover that has since succeeded.
-    const p = await progress(upload.comparison_id);
-    expect(p).toMatchObject({ status: "processing", pending: 1 });
+    // Both back to 'processing': the workflow has been handed the rows and has not stamped them.
+    expect(await progress(comparisonId)).toMatchObject({ status: "processing", pending: 1 });
     const after = (await app.inject({ method: "GET", url: "/api/upload-sessions" })).json().data[0];
     expect(after.status).toBe("processing");
   });
@@ -528,14 +568,14 @@ describe("external matcher — watching the rows", () => {
 
     const conn = await db();
     await sql`
-      UPDATE lakeshore.friend SET status='match' WHERE friend_name = ${stored("Somchai")}
+      UPDATE lakeshore.friend SET status='match' WHERE coalesce(friend_name_en, friend_name_th) = ${stored("Somchai")}
     `.execute(conn);
     // `person_name_en` is what the contact lookup joins on, and the contact was stored folded by
     // the company import above — so the workflow's result row has to carry the folded spelling or
     // it names a company nobody works at.
     await sql`
       INSERT INTO lakeshore.comparison_result
-        (comparison_id, friend_name, person_name_en, person_name_th,
+        (comparison_id, friend_name_en, person_name_en, person_name_th,
          batch_number, status, upload_name)
       VALUES (${comparisonId}, ${stored("Somchai")}, ${stored("Somchai")}, ${"สมชาย"},
               1, ${"match"}, ${"Alex"})
@@ -568,7 +608,7 @@ describe("external matcher — watching the rows", () => {
     `.execute(conn);
     await sql`
       INSERT INTO lakeshore.comparison_result
-        (comparison_id, friend_name, person_name_en, person_name_th,
+        (comparison_id, friend_name_en, person_name_en, person_name_th,
          batch_number, status, upload_name)
       VALUES (${comparisonId}, ${stored("Somchai Jaidee")}, ${stored("Somchai")}, ${"สมชาย"},
               1, ${"match"}, ${"Nadhee"})
@@ -606,7 +646,7 @@ describe("external matcher — watching the rows", () => {
     // No upload_name written — the workflow matched the friend but didn't say whose.
     await sql`
       INSERT INTO lakeshore.comparison_result
-        (comparison_id, friend_name, person_name_en, person_name_th, batch_number, status)
+        (comparison_id, friend_name_en, person_name_en, person_name_th, batch_number, status)
       VALUES (${comparisonId}, ${stored("Somchai Jaidee")}, ${stored("Somchai")}, ${"สมชาย"}, 1, ${"match"})
     `.execute(conn);
 
@@ -654,10 +694,10 @@ describe("external matcher — watching the rows", () => {
     // and folding the two together would report a broken pipeline as a clean negative result.
     const conn = await db();
     await sql`
-      UPDATE lakeshore.friend SET status = 'error' WHERE friend_name = ${stored("Anong")}
+      UPDATE lakeshore.friend SET status = 'error' WHERE coalesce(friend_name_en, friend_name_th) = ${stored("Anong")}
     `.execute(conn);
     await sql`
-      UPDATE lakeshore.friend SET status = 'unmatch' WHERE friend_name = ${stored("Malee")}
+      UPDATE lakeshore.friend SET status = 'unmatch' WHERE coalesce(friend_name_en, friend_name_th) = ${stored("Malee")}
     `.execute(conn);
 
     const p = await progress(comparisonId);
@@ -684,17 +724,17 @@ describe("external matcher — watching the rows", () => {
     // confidence.
     const conn = await db();
     await sql`
-      UPDATE lakeshore.friend SET status = 'FAILED' WHERE friend_name = ${stored("Anong")}
+      UPDATE lakeshore.friend SET status = 'FAILED' WHERE coalesce(friend_name_en, friend_name_th) = ${stored("Anong")}
     `.execute(conn);
     await sql`
-      UPDATE lakeshore.friend SET status = 'Processing ' WHERE friend_name = ${stored("Malee")}
+      UPDATE lakeshore.friend SET status = 'Processing ' WHERE coalesce(friend_name_en, friend_name_th) = ${stored("Malee")}
     `.execute(conn);
     // 'Match ' now DECIDES. It used to be an opinion that the absence of a result row overruled —
     // no row, no score, no match — and since the score was dropped there is nothing left to
     // overrule it with. So this row counts as a match on the strength of the stamp alone, with no
     // counterpart to show for it, and the trailing space and capital must not change that.
     await sql`
-      UPDATE lakeshore.friend SET status = 'Match ' WHERE friend_name = ${stored("Somchai")}
+      UPDATE lakeshore.friend SET status = 'Match ' WHERE coalesce(friend_name_en, friend_name_th) = ${stored("Somchai")}
     `.execute(conn);
 
     const p = await progress(comparisonId);
@@ -948,5 +988,163 @@ describe("external matcher — watching the rows", () => {
     });
     expect(patched.statusCode, patched.body).toBe(200);
     expect(patched.json().data.status).toBe("match");
+  });
+});
+
+/**
+ * The comparison mode, on the path that actually reaches a workflow.
+ *
+ * This is the ONLY place the import-side `unscored` SQL runs — `runRowBucketSql` over
+ * `hasScriptSql`, in friend.model and company-contact.model. The compare-by-company path counts
+ * its unscored rows from the friend table instead (the matcher writes no row for them), so it
+ * exercises a different query entirely and would not catch a mistake here.
+ */
+describe("compare_by on an import-driven run", () => {
+  it("sends the mode as a header and a column, and stamps it on the run", async () => {
+    const form = (await import("form-data")).default;
+    const f = new form();
+    f.append("name", "Friends");
+    f.append("uploadPersonName", "Alex");
+    f.append("compareBy", "th_surname");
+    f.append("facebookFile", Buffer.from("name\nSomchai Jaidee\n", "utf8"), {
+      filename: "friends.csv",
+      contentType: "text/csv",
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/comparisons/run",
+      payload: f,
+      headers: f.getHeaders(),
+    });
+    const { comparisonId } = res.json().data;
+
+    const hit = mock.state.facebook[0];
+    expect(hit.headers["x-compare-type"]).toBe("surname");
+    expect(hit.headers["x-compare-language"]).toBe("th");
+    expect(hit.headers["x-compare-by"]).toBe("th_surname");
+    // The axes as their own per-row columns, so a row-wise workflow branches on a cell that says
+    // `surname` rather than substring-splitting `th_surname`.
+    expect(hit.body).toContain("surname,th,th_surname");
+
+    const progress = (
+      await app.inject({ method: "GET", url: `/api/comparisons/${comparisonId}/progress` })
+    ).json().data;
+    expect(progress.compareBy).toBe("th_surname");
+  });
+
+  it("buckets a row the mode could not score as `unscored`, and filters to it", async () => {
+    const { comparisonId } = await (async () => {
+      const form = (await import("form-data")).default;
+      const f = new form();
+      f.append("name", "Friends");
+      f.append("uploadPersonName", "Alex");
+      f.append("compareBy", "th_full");
+      // One Thai-script friend, one Latin. Under a Thai run the Latin one had nothing to be held
+      // up against — the workflow may still stamp it, but our reading of the text is what decides
+      // whether the row is reported as a finding or as a question never asked.
+      f.append("facebookFile", Buffer.from("name\nสมชาย ใจดี\nPreecha Wong\n", "utf8"), {
+        filename: "friends.csv",
+        contentType: "text/csv",
+      });
+      const res = await app.inject({
+        method: "POST",
+        url: "/api/comparisons/run",
+        payload: f,
+        headers: f.getHeaders(),
+      });
+      return res.json().data as { comparisonId: string };
+    })();
+
+    // The workflow decides both rows against.
+    const conn = await db();
+    await sql`UPDATE lakeshore.friend SET status = 'unmatch'`.execute(conn);
+
+    const progress = (
+      await app.inject({ method: "GET", url: `/api/comparisons/${comparisonId}/progress` })
+    ).json().data;
+    // Carved out of `unmatched`, not added to the total: both rows are still counted.
+    expect(progress.total).toBe(2);
+    expect(progress.unscored).toBe(1);
+    expect(progress.unmatched).toBe(1);
+
+    // The tab and the count come from one expression, so filtering to it returns exactly the row
+    // it promised — the invariant that keeps "Matches 4" from labelling a filter that returns five.
+    const rows = (
+      await app.inject({
+        method: "GET",
+        url: `/api/comparisons/${comparisonId}/rows?page=1&limit=10&filter=unscored`,
+      })
+    ).json();
+    expect(rows.pagination.total).toBe(1);
+    expect(rows.data[0].name).toBe("preecha wong");
+    expect(rows.data[0].scored).toBe(false);
+
+    // …and the Thai row is a plain unmatch, scored and found nobody.
+    const un = (
+      await app.inject({
+        method: "GET",
+        url: `/api/comparisons/${comparisonId}/rows?page=1&limit=10&filter=unmatched`,
+      })
+    ).json();
+    expect(un.pagination.total).toBe(1);
+    expect(un.data[0].scored).toBe(true);
+  });
+
+  it("never re-labels a matched row as unscored — the evidence beats the inference", async () => {
+    const form = (await import("form-data")).default;
+    const f = new form();
+    f.append("name", "Friends");
+    f.append("uploadPersonName", "Alex");
+    f.append("compareBy", "th_full");
+    f.append("facebookFile", Buffer.from("name\nPreecha Wong\n", "utf8"), {
+      filename: "friends.csv",
+      contentType: "text/csv",
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/comparisons/run",
+      payload: f,
+      headers: f.getHeaders(),
+    });
+    const { comparisonId } = res.json().data;
+
+    // A workflow that ignored compare_by and matched the row anyway. Our inference says it could
+    // not have been scored; the verdict says it was. The verdict wins.
+    const conn = await db();
+    await sql`UPDATE lakeshore.friend SET status = 'match'`.execute(conn);
+
+    const progress = (
+      await app.inject({ method: "GET", url: `/api/comparisons/${comparisonId}/progress` })
+    ).json().data;
+    expect(progress.matched).toBe(1);
+    expect(progress.unscored).toBe(0);
+  });
+
+  it("carries the per-row owner and the uploader onto every run row", async () => {
+    const form = (await import("form-data")).default;
+    const f = new form();
+    f.append("name", "Friends");
+    // No `uploadPersonName`: the file names an owner per row, so there is nothing to type. Sending
+    // one would OVERWRITE the file's column rather than back it up, which is the other test.
+    f.append("uploaderName", "Assistant");
+    f.append("facebookFile", Buffer.from('name,relationship_owner\n"Somchai Jaidee","Mint"\n', "utf8"), {
+      filename: "friends.csv",
+      contentType: "text/csv",
+    });
+    const res = await app.inject({
+      method: "POST",
+      url: "/api/comparisons/run",
+      payload: f,
+      headers: f.getHeaders(),
+    });
+    const { comparisonId } = res.json().data;
+
+    const rows = (
+      await app.inject({ method: "GET", url: `/api/comparisons/${comparisonId}/rows?page=1&limit=10` })
+    ).json();
+    // The row's own owner reaches the results table, and the uploader is a different person.
+    expect(rows.data[0].relationshipOwner).toBe("Mint");
+    expect(rows.data[0].uploaderName).toBe("Assistant");
+    expect(rows.data[0].updatedAt).toBeTruthy();
   });
 });

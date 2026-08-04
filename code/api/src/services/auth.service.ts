@@ -209,7 +209,10 @@ export async function createUser(input: {
     email,
     passwordHash: await hashPassword(input.password),
     name: input.name ?? null,
-    roles: input.roles ?? [],
+    // Defaults to `user`, not `[]`. Since lib/roles.ts default-denies, an account created
+    // with no roles would be able to sign in and then be refused every endpoint — a
+    // confusing way to spell "full access", which is what an omitted `roles` used to mean.
+    roles: input.roles?.length ? input.roles : ["user"],
   });
 
   return toSessionUser(user);

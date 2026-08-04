@@ -4,10 +4,13 @@ Upload **Company data** and **Facebook friends** (either as `.xlsx`, `.csv` or `
 both to an external name-matching service, watch progress live over WebSocket, and review the
 **name matches** it found — with history and saved comparisons.
 
-Every import is filed under a **relationship owner** — the person whose contacts they are. It is
-required for a friends import (it is half the dedup key: same owner + same name = duplicate) and an
-audit note on a company one. On the wire and in the database it is still `uploadPersonName` /
-`uploaded_by`; "relationship owner" is what the screens call it.
+Every friend is filed under a **relationship owner** — the person whose contact they are — and no
+friend may be imported without one, since it is half the dedup key (same owner + same name =
+duplicate). A friends file may name an owner per row in its own column, in which case the import
+screen's owner box is **optional**: leave it empty and each row keeps its own. Typing a name there
+**overrides** the file on every row, and it is required whenever the file leaves an importable row
+unowned. Company rows have no owner at all — a contact is nobody's relationship. On the wire it is
+still `uploadPersonName`; "relationship owner" is what the screens call it.
 
 The home page is the **Network** workspace, two tabs over the same stored data (a run is created by
 importing — the external matcher matches each import against everything on file — so there is no

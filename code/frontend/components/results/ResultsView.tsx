@@ -61,6 +61,9 @@ export function ResultsView({
   live: boolean;
 }) {
   const rows = React.useMemo(() => results.map(fromResultRow), [results]);
+  // Always at the run's own verdicts. `summarize` still takes a bar — the rule lives there and is
+  // worth keeping in one place — but this view no longer has one to give it: the threshold moved to
+  // the Network page, where it grades the pooled answer rather than one historical run.
   const facts = React.useMemo(() => summarize(rows, scoredCount), [rows, scoredCount]);
 
   const kind = progress?.kind ?? "facebook";
@@ -114,8 +117,21 @@ export function ResultsView({
         The rows are the live view; the finding arrives when the run does.
       */}
       {!live && (
-        <Verdict facts={facts} companies={selectedCompanies} kind={kind} origin={origin} />
+        <Verdict
+          facts={facts}
+          companies={selectedCompanies}
+          kind={kind}
+          origin={origin}
+          compareBy={progress?.compareBy}
+          unscored={progress?.unscored ?? 0}
+        />
       )}
+      {/*
+        The threshold slider used to sit here, between the finding and the rows. It moved to the
+        Network page — a run is a historical event and re-grading one of them moved nothing anybody
+        acts on; the pooled answer is what people read, and that is where the bar can change it.
+        See `NetworkThreshold`.
+      */}
       <RunRows comparisonId={comparisonId} progress={progress} live={live} company={companyLabel} />
     </div>
   );

@@ -2,13 +2,16 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { NAV_ITEMS, isActive } from "./nav-items";
+import { navItemsFor, isActive } from "./nav-items";
 import { ThemeToggle } from "./theme-toggle";
 import { UserMenu } from "./user-menu";
+import { usePermissions } from "./auth-provider";
 import { cn } from "@/lib/utils";
 
 export function AppSidebar() {
   const pathname = usePathname() ?? "";
+  const { roles } = usePermissions();
+  const navItems = navItemsFor(roles);
   return (
     <aside className="sticky top-0 hidden h-screen w-60 shrink-0 flex-col border-r bg-card md:flex">
       <Link
@@ -20,7 +23,7 @@ export function AppSidebar() {
       </Link>
 
       <nav className="flex-1 space-y-0.5 px-2 py-2">
-        {NAV_ITEMS.map(({ href, label, icon: Icon }) => (
+        {navItems.map(({ href, label, icon: Icon }) => (
           <NavLink key={href} href={href} label={label} icon={Icon} active={isActive(pathname, href)} />
         ))}
       </nav>

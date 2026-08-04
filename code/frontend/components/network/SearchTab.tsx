@@ -3,7 +3,7 @@
 import * as React from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { Building2, Pencil, Search, Users } from "lucide-react";
+import { Building2, Pencil, Search, UserCheck, UserSearch, Users } from "lucide-react";
 import type { NameSearchRow } from "@extensions/contract";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -14,6 +14,8 @@ import { SectionHeader } from "@/components/page-header";
 import { KnownByBadge } from "@/components/network/KnownByBadge";
 import { RenameContactDialog, type EditableContact } from "@/components/network/RenameContactDialog";
 import { useNetworkSearch } from "@/hooks/queries";
+import { withThreshold } from "@/hooks/useThreshold";
+import { cn } from "@/lib/utils";
 
 const PAGE_SIZE = 20;
 
@@ -35,8 +37,13 @@ function useDebouncedValue<T>(value: T, delay: number): T {
  *
  * A company name deep-links here from the Overview (`?tab=search&q=<company>`), which is why the
  * box seeds from the URL — searching a company name lists its people.
+ *
+ * The workspace bar (`threshold`) grades the two connection facts and NOT the result set: who is on
+ * file at a company is a fact about `company_contact`, so tightening the bar empties the chips
+ * beside a contact rather than removing the contact. "Nobody you know is here" and "nobody is here"
+ * are different answers and this page has to keep being able to say the first one.
  */
-export function SearchTab() {
+export function SearchTab({ threshold = null }: { threshold?: number | null }) {
   const urlQ = useSearchParams().get("q") ?? "";
   const [input, setInput] = React.useState(urlQ);
   // Follow the URL when Overview deep-links a company into the box.
@@ -48,7 +55,12 @@ export function SearchTab() {
   const [page, setPage] = React.useState(1);
   React.useEffect(() => setPage(1), [q]);
 
-  const { data, isLoading, isFetching } = useNetworkSearch({ q, page, limit: PAGE_SIZE });
+  const { data, isLoading, isFetching } = useNetworkSearch({
+    q,
+    page,
+    limit: PAGE_SIZE,
+    threshold: threshold ?? undefined,
+  });
   const [editing, setEditing] = React.useState<EditableContact | null>(null);
 
   const rows = data?.data ?? [];
@@ -97,9 +109,21 @@ export function SearchTab() {
           <p className="text-sm text-muted-foreground">
             {total.toLocaleString()} {total === 1 ? "result" : "results"}
           </p>
-          <div className="overflow-hidden rounded-lg border">
+          {/* Dimmed while a new bar (or page) is in flight — the chips are what move, and swapping
+              them under the reader with no signal reads as the data having changed. */}
+          <div
+            className={cn(
+              "overflow-hidden rounded-lg border transition-opacity",
+              isFetching && "opacity-60"
+            )}
+          >
             {rows.map((row) => (
-              <ResultRow key={row.id} row={row} onEdit={() => setEditing(toEditable(row))} />
+              <ResultRow
+                key={row.id}
+                row={row}
+                threshold={threshold}
+                onEdit={() => setEditing(toEditable(row))}
+              />
             ))}
           </div>
 
@@ -151,7 +175,17 @@ function toEditable(row: NameSearchRow): EditableContact {
   };
 }
 
-function ResultRow({ row, onEdit }: { row: NameSearchRow; onEdit: () => void }) {
+function ResultRow({
+  row,
+  threshold,
+  onEdit,
+}: {
+  row: NameSearchRow;
+  /** Carried onto every link out of this row, so a roster or company opened from here is read at
+   *  the same bar the chips beside it were graded at. */
+  threshold: number | null;
+  onEdit: () => void;
+}) {
   const name = row.person_name_en || row.person_name_th || "(no name)";
   const secondary = row.person_name_en && row.person_name_th ? row.person_name_th : null;
 
@@ -163,7 +197,7 @@ function ResultRow({ row, onEdit }: { row: NameSearchRow; onEdit: () => void }) 
           {/* Who in the network actually knows THIS person — by name, each a link to their roster,
               each with how close the match that connects them was. */}
           {row.connectedUploaders.map((u) => (
-            <Link key={u.name} href={`/uploaders/${encodeURIComponent(u.name)}`}>
+            <Link key={u.name} href={withThreshold(`/uploaders/${encodeURIComponent(u.name)}`, threshold)}>
               <KnownByBadge uploader={u} />
             </Link>
           ))}
@@ -173,7 +207,7 @@ function ResultRow({ row, onEdit }: { row: NameSearchRow; onEdit: () => void }) 
           {row.company_name ? (
             // The company is a place you can go — same destination as an Overview company row.
             <Link
-              href={`/companies/${encodeURIComponent(row.company_name)}`}
+              href={withThreshold(`/companies/${encodeURIComponent(row.company_name)}`, threshold)}
               className="truncate font-medium text-foreground underline-offset-2 hover:underline"
             >
               {row.company_name}
@@ -188,10 +222,24 @@ function ResultRow({ row, onEdit }: { row: NameSearchRow; onEdit: () => void }) 
           <div className="flex flex-wrap items-center gap-1.5 text-sm text-muted-foreground">
             <Users className="h-3.5 w-3.5 shrink-0" />
             <span>Reached by</span>
+            {/* The same grading as KnownByBadge, minus the score — company reach is not one
+                pairing, so there is no single number for it, but strength still folds. An owner
+                whose only way in is a shared surname must not look like one whose friend IS
+                somebody here. `outline` stays the confirmed look so a clean result set is
+                unchanged; only the leads pick up amber. */}
             {row.companyUploaders.map((u) => (
-              <Link key={u} href={`/uploaders/${encodeURIComponent(u)}`}>
-                <Badge variant="outline" title="Connects to someone at this company" className="cursor-pointer">
-                  {u}
+              <Link key={u.name} href={withThreshold(`/uploaders/${encodeURIComponent(u.name)}`, threshold)}>
+                <Badge
+                  variant={u.confirmed ? "outline" : "warning"}
+                  title={
+                    u.confirmed
+                      ? "Connects to someone at this company on a whole-name match."
+                      : "Only reaches this company on a partial-name match — check before asking for an introduction."
+                  }
+                  className="cursor-pointer"
+                >
+                  {u.confirmed ? <UserCheck className="h-3 w-3" /> : <UserSearch className="h-3 w-3" />}
+                  {u.name}
                 </Badge>
               </Link>
             ))}

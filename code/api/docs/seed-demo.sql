@@ -264,8 +264,11 @@ RETURNING id INTO cmp_kbank;
 -- transport flag riding on every row of the batch, which is why identical rows carried different
 -- values. The flag still exists on the callback payload, where it belongs; what a row stores now
 -- is what is true of the row.
+-- The friend side is `friend_name_en` and not the single `friend_name` this file used to name:
+-- that column went on 2026-08-03c. Every friend below is spelled in Latin characters, so English
+-- is where the backfill would have put them — the same rule, applied by hand at the source.
 INSERT INTO lakeshore.comparison_result
-  (comparison_id, friend_name, person_name_en, person_name_th, batch_number, status, upload_name, extra, created_at)
+  (comparison_id, friend_name_en, person_name_en, person_name_th, batch_number, status, upload_name, extra, created_at)
 VALUES
   -- ── batch 1 ──
   (cmp_bluebik, 'pochara arayakarnkul',  'pochara arayakarnkul',     'พชร อารยะการกุล',     1, 'match', 'ploy.suwanna@lakeshore.demo', '{"algorithm":"jaro_winkler","score_en":0.98,"score_th":0.95,"matched_on":"en"}'::jsonb, now() - interval '19 days'),
@@ -307,7 +310,7 @@ VALUES
 -- HAVE arrived are decided rows — a batch in flight is one that has not been written yet, not one
 -- written unstamped, which is why nothing here sits at 'pending'.
 INSERT INTO lakeshore.comparison_result
-  (comparison_id, friend_name, person_name_en, person_name_th, batch_number, status, upload_name, extra, created_at)
+  (comparison_id, friend_name_en, person_name_en, person_name_th, batch_number, status, upload_name, extra, created_at)
 VALUES
   (cmp_kbank, 'kattiya indaravijaya',   'kattiya indaravijaya', 'ขัตติยา อินทรวิชัย', 1, 'match', NULL, NULL, now() - interval '2 hours'),
   (cmp_kbank, 'pipit aneaknithi',       'pipit aneaknithi',     'พิพิธ เอนกนิธิ',        1, 'match', NULL, NULL, now() - interval '2 hours'),
@@ -364,7 +367,7 @@ VALUES
   -- nothing to order by. The question the console can still answer is the one that survived: which
   -- pairs did the matcher call a match?
   ('Matches by run', 'sql',
-   'SELECT c.name AS comparison, r.friend_name, r.person_name_en, r.person_name_th
+   'SELECT c.name AS comparison, r.friend_name_en, r.friend_name_th, r.person_name_en, r.person_name_th
 FROM comparison_result r
 JOIN comparison c ON c.id = r.comparison_id
 WHERE lower(trim(r.status)) IN (''match'', ''matched'')

@@ -6,6 +6,7 @@ import {
   UploadListQuerySchema,
   UploadSessionRowSchema,
   UploadPreviewSchema,
+  ColumnOverridesFieldSchema,
   RollbackDataSchema,
   paginated,
 } from "@extensions/contract";
@@ -41,6 +42,9 @@ export default async function uploadSessionsRoutes(fastify: FastifyInstance): Pr
           id: u.id,
           name: u.name,
           upload_type: uploadType(u.kind, u.source),
+          // Raw, not through `uploadType` — that collapses kind and source into one label, and
+          // this column exists to carry the source on its own.
+          source: u.source,
           uploaded_by: u.uploaded_by,
           records_uploaded: u.total_records,
           duplicate_records: u.duplicate_records,
@@ -72,14 +76,28 @@ export default async function uploadSessionsRoutes(fastify: FastifyInstance): Pr
     "/preview",
     { schema: { response: { 200: apiSuccess(UploadPreviewSchema) } } },
     async (req) => {
-      const { companyPath, facebookPath, companyFileName, facebookFileName } = await parseUpload(req);
+      const { companyPath, facebookPath, companyFileName, facebookFileName, fields } = await parseUpload(req);
+
+      // The columns the user mapped by hand, if they have started mapping any. The screen
+      // re-previews after each choice rather than patching the table it already has, so the
+      // sample rows, the cleaning notes and the "not found" warnings all describe the file as
+      // it will actually be read — including the choice just made.
+      const overrides = ColumnOverridesFieldSchema.safeParse(fields.columnOverrides);
+      if (!overrides.success) {
+        unlinkQuiet(companyPath, facebookPath);
+        throw new BadRequest(overrides.error.issues[0]?.message ?? "Invalid column choices");
+      }
 
       try {
         if (companyPath) {
-          return ok(await FileParserService.previewCompanyFile(companyPath, companyFileName ?? "file"));
+          return ok(
+            await FileParserService.previewCompanyFile(companyPath, companyFileName ?? "file", overrides.data)
+          );
         }
         if (facebookPath) {
-          return ok(await FileParserService.previewFacebookFile(facebookPath, facebookFileName ?? "file"));
+          return ok(
+            await FileParserService.previewFacebookFile(facebookPath, facebookFileName ?? "file", overrides.data)
+          );
         }
         throw new BadRequest(`Attach a company or Facebook file (${UPLOAD_FORMATS}).`);
       } finally {

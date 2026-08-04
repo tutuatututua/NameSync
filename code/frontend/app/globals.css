@@ -217,3 +217,21 @@
     );
   }
 }
+
+@layer base {
+  /*
+   * Thai text set beside Latin at the same font-size reads noticeably smaller and sits badly:
+   * Thai has no case, so it has no cap-height to align on, and its tone marks and vowel signs
+   * stack above and below the baseline in a way Latin metrics do not leave room for. At 14px the
+   * marks on "สมชาย ใจดี" clip against the line above.
+   *
+   * So any element tagged `lang="th"` gets a little more size and a lot more leading. This is a
+   * base rule rather than a utility class because the tag is already there — the results row and
+   * the import preview both mark Thai spellings so the browser picks a Thai face — and a rule that
+   * follows the tag cannot be forgotten at a new call site the way a class can.
+   */
+  :lang(th) {
+    font-size: 1.08em;
+    line-height: 1.7;
+  }
+}

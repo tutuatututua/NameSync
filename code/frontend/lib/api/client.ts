@@ -37,9 +37,15 @@ import type {
   DataStats,
   SourceType,
   CompaniesData,
+  CompareBy,
   CompareByCompanyBody,
+  DuplicateRunData,
+  CreateUploadSourceBody,
+  UploadSource,
+  UploadSourcesData,
   UploadSessionRow,
   RollbackData,
+  NetworkGradingData,
   NetworkOverviewData,
   NameSearchRow,
   UploadersData,
@@ -71,6 +77,14 @@ export type RunRowsParams = {
   /** Server-side, because the list is paged: sorting 25 rows here would order the page, not the
    *  run, and then call it "best first". See RunRowsQuerySchema. */
   sort?: RunRowsQuery["sort"];
+  /**
+   * Read the run at this bar instead of at its stored verdicts — see `regradeVerdict`.
+   *
+   * Server-side for the same reason `sort` is, and more so: it drives the FILTER. Re-labelling the
+   * 25 rows on screen would give you the matches among the 25 oldest and leave the tab above them
+   * still counting the matcher's bar. Undefined means the stored verdicts, which is the default.
+   */
+  threshold?: number;
 };
 
 /** Search/filter params for the upload-history and upload-session tables. */
@@ -219,8 +233,10 @@ export const api = {
       request<Envelope<CreateComparisonData>>(`/comparisons/${id}/merge`, { method: "POST", body: form }).then((r) => r.data),
     /** How far the external workflow has got. Polled while a run is in flight; also what
      *  completes the run — see the route's comment. */
-    progress: (id: string) =>
-      request<Envelope<ComparisonProgress>>(`/comparisons/${id}/progress`).then((r) => r.data),
+    progress: (id: string, threshold?: number) =>
+      request<Envelope<ComparisonProgress>>(`/comparisons/${id}/progress${qs({ threshold })}`).then(
+        (r) => r.data
+      ),
     /** The run's own rows and what the workflow decided about each — the live monitor's table.
      *  `progress` says how far along; this says which rows, and what happened to them. */
     rows: (id: string, params: RunRowsParams) =>
@@ -230,13 +246,48 @@ export const api = {
     companies: () => request<Envelope<CompaniesData>>(`/comparisons/companies`).then((r) => r.data),
     /** One run against one or more companies — every friend scored against the union of their
      *  contacts, keeping each friend's single closest match. Not one run per company. */
-    compareByCompany: (company_names: string[]) =>
+    compareByCompany: (
+      /** Null is every company on file — see `CompareByCompanyBodySchema`. */
+      company_names: string[] | null,
+      compare_by: CompareBy,
+      sources: string[] | null
+    ) =>
       request<Envelope<TriggerCompareData>>(`/comparisons/compare`, {
         method: "POST",
-        body: JSON.stringify({ company_names } satisfies CompareByCompanyBody),
+        // `sources: null` is sent explicitly rather than omitted. Both mean "every source" to the
+        // schema, but sending it keeps the request a faithful record of what the dialog showed —
+        // and an omitted field is the shape a future default would silently fill in.
+        body: JSON.stringify({ company_names, compare_by, sources } satisfies CompareByCompanyBody),
       }).then((r) => r.data),
-    results: (id: string) =>
-      request<Envelope<ResultsData>>(`/comparisons/${id}/results`).then((r) => r.data),
+    /**
+     * "Have I already run exactly this?" — the new-run dialog's advisory check.
+     *
+     * Built by hand rather than through `qs`, which is `URLSearchParams.set` and therefore keeps
+     * only the last value of a repeated key: `company` and `source` are both lists here, and a
+     * three-company run would ask about one company.
+     *
+     * `sources: null` sends NO `source` param, which is how the server reads "every source". An
+     * empty `source=` would fold to null anyway, but sending nothing is the honest encoding.
+     *
+     * `company_names: null` encodes the same way and for the same reason: no `company` param at
+     * all, which `findDuplicates` reads as the whole-table run. There is no spelling of "every
+     * company" to send — its absence IS the value.
+     */
+    duplicateRun: (
+      company_names: string[] | null,
+      compare_by: CompareBy,
+      sources: string[] | null
+    ) => {
+      const sp = new URLSearchParams();
+      for (const c of company_names ?? []) sp.append("company", c);
+      sp.set("compare_by", compare_by);
+      for (const s of sources ?? []) sp.append("source", s);
+      return request<Envelope<DuplicateRunData>>(`/comparisons/duplicate?${sp.toString()}`).then(
+        (r) => r.data
+      );
+    },
+    results: (id: string, threshold?: number) =>
+      request<Envelope<ResultsData>>(`/comparisons/${id}/results${qs({ threshold })}`).then((r) => r.data),
     companyData: (id: string, page: number, limit: number) =>
       request<Paginated<CompanyDataRow>>(`/comparisons/${id}/company-data${qs({ page, limit })}`),
     facebookData: (id: string, page: number, limit: number) =>
@@ -265,17 +316,34 @@ export const api = {
    * Search (find a person, see their company and its connections). Both read stored results; the
    * matcher is never re-run here.
    */
+  /**
+   * The Network workspace. Every call takes the workspace-wide `threshold` — the bar the reader
+   * tuned on the Network page, undefined for the matchers' own verdicts (the default).
+   *
+   * It is a parameter on all four rather than on the ones that obviously need it, because these
+   * four render one answer between them: the Overview's "40 matched" links to a roster page that
+   * lists the names, which links to a company page that counts the same people again. A bar honoured
+   * by three of them is a workspace that contradicts itself one click deep.
+   */
   network: {
-    overview: (uploader?: string) =>
-      request<Envelope<NetworkOverviewData>>(`/network/overview${qs({ uploader })}`).then((r) => r.data),
+    /** What the threshold control has to work on — how many stored results carry a score. A fact
+     *  about the evidence, so it takes no bar of its own. */
+    grading: () => request<Envelope<NetworkGradingData>>(`/network/grading`).then((r) => r.data),
+    overview: (uploader?: string, threshold?: number) =>
+      request<Envelope<NetworkOverviewData>>(`/network/overview${qs({ uploader, threshold })}`).then(
+        (r) => r.data
+      ),
     /** Search by free text (`q`) OR by an exact company name (`company`, for the company page). */
-    search: (params: { q?: string; company?: string; page: number; limit: number }) =>
+    search: (params: { q?: string; company?: string; page: number; limit: number; threshold?: number }) =>
       request<Paginated<NameSearchRow>>(`/network/search${qs({ ...params })}`),
     /** Every uploader with a roster, and their matched / no-match tallies — the Uploaders tab. */
-    uploaders: () => request<Envelope<UploadersData>>(`/network/uploaders`).then((r) => r.data),
+    uploaders: (threshold?: number) =>
+      request<Envelope<UploadersData>>(`/network/uploaders${qs({ threshold })}`).then((r) => r.data),
     /** One uploader's matched and no-match names in full — the uploader detail page. */
-    uploader: (name: string) =>
-      request<Envelope<UploaderDetailData>>(`/network/uploader${qs({ name })}`).then((r) => r.data),
+    uploader: (name: string, threshold?: number) =>
+      request<Envelope<UploaderDetailData>>(`/network/uploader${qs({ name, threshold })}`).then(
+        (r) => r.data
+      ),
   },
   sessions: {
     list: () => request<Envelope<SessionSummary[]>>("/sessions").then((r) => r.data),
@@ -294,6 +362,17 @@ export const api = {
       request<Envelope<UploadPreview>>("/upload-sessions/preview", { method: "POST", body: form }).then(
         (r) => r.data
       ),
+  },
+  /** The import "type" pick-list — the values the schema starts with plus whatever users added. */
+  uploadSources: {
+    list: () => request<Envelope<UploadSourcesData>>("/upload-sources").then((r) => r.data.sources),
+    create: (value: string) =>
+      request<Envelope<UploadSource>>("/upload-sources", {
+        method: "POST",
+        body: JSON.stringify({ value } satisfies CreateUploadSourceBody),
+      }).then((r) => r.data),
+    remove: (value: string) =>
+      request<Envelope<never>>(`/upload-sources/${encodeURIComponent(value)}`, { method: "DELETE" }),
   },
   /** The Database console — row editor, read-only SQL, saved queries. */
   db: {

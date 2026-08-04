@@ -148,6 +148,19 @@ async function testWebhook(name, target) {
           `    the URL/token is stale. A content-type fix alone will NOT help — you need\n` +
           `    a fresh webhook URL from promptxai for this workflow.`
       );
+    } else if (response.status === 402) {
+      // Seen for real on 2026-07-30: {"code":"QUOTA_EXCEEDED","params":{"metric":"tasks"}}
+      console.log(
+        `  ⚠ 402 Payment Required — the workflow PLATFORM refused the request before the\n` +
+          `    flow ran; the body above names the exhausted limit (expect\n` +
+          `    {"code":"QUOTA_EXCEEDED","params":{"metric":"tasks"}}). Nothing is wrong with\n` +
+          `    the file, the content type or the URL — the project is out of task quota, so\n` +
+          `    raise/reset it on the promptxai side. Tasks are consumed per step per row, so\n` +
+          `    a flow that grew extra steps drains the quota far faster than it used to.\n` +
+          `    A 402 the FLOW returned itself (respond-and-stop, e.g. relaying a paid API)\n` +
+          `    looks different: it leaves a run in the flow's history and its body is the\n` +
+          `    flow's own, not this envelope.`
+      );
     } else if (response.status === 502) {
       console.log(
         `  ⚠ 502 Bad Gateway came directly from the webhook host — the upstream\n` +

@@ -51,6 +51,7 @@ describe("table registry", () => {
     const tables = res.json().data.tables as { name: string; columns: { name: string; editable: boolean; pk: boolean }[] }[];
     expect(tables.map((t) => t.name)).toEqual([
       "upload",
+      "upload_source",
       "company_contact",
       "friend",
       "comparison",
@@ -119,11 +120,11 @@ describe("table registry", () => {
     const friend = await insertRow("friend", {
       upload_id: upload.id,
       source: "facebook",
-      friend_name: "Kim",
+      friend_name_en: "Kim",
     });
     expect(friend.id).not.toBe(upload.id); // the setup above is doing its job
 
-    const res = await queryRows("friend", { filters: [{ column: "friend_name", op: "eq", value: "Kim" }] });
+    const res = await queryRows("friend", { filters: [{ column: "friend_name_en", op: "eq", value: "Kim" }] });
     expect(res.statusCode, res.body).toBe(200);
     const [row] = res.json().data as Record<string, unknown>[];
 
@@ -389,12 +390,12 @@ describe("SQL console", () => {
 
   it("rejects DELETE / UPDATE / INSERT / DROP, and the table is untouched", async () => {
     const upload = await seedUpload();
-    await insertRow("friend", { upload_id: upload.id, source: "facebook", friend_name: "Somchai" });
+    await insertRow("friend", { upload_id: upload.id, source: "facebook", friend_name_en: "Somchai" });
     expect(await friendCount()).toBe(1);
 
     for (const sql of [
       "delete from friend",
-      "update friend set friend_name = 'hacked'",
+      "update friend set friend_name_en = 'hacked'",
       "insert into friend (upload_id, source) values (1, 'x')",
       "drop table friend",
       "truncate friend",
@@ -409,7 +410,7 @@ describe("SQL console", () => {
 
   it("rejects a second statement smuggled in after a semicolon", async () => {
     const upload = await seedUpload();
-    await insertRow("friend", { upload_id: upload.id, source: "facebook", friend_name: "Somchai" });
+    await insertRow("friend", { upload_id: upload.id, source: "facebook", friend_name_en: "Somchai" });
 
     const res = await runSql("select 1; drop table friend");
     expect(res.statusCode).toBe(400);
@@ -418,7 +419,7 @@ describe("SQL console", () => {
 
   it("rejects a data-modifying CTE — the read-only transaction catches what the prefix check can't", async () => {
     const upload = await seedUpload();
-    await insertRow("friend", { upload_id: upload.id, source: "facebook", friend_name: "Somchai" });
+    await insertRow("friend", { upload_id: upload.id, source: "facebook", friend_name_en: "Somchai" });
 
     // Starts with WITH, so the "is it a SELECT" prefix check passes it through. Only the
     // subquery wrap + READ ONLY transaction stop it. This is the test that proves the
@@ -455,7 +456,7 @@ describe("saved queries", () => {
     const created = await post("/api/db/saved-queries", {
       name: "Friends by uploader",
       kind: "sql",
-      sql_text: "select friend_name from friend",
+      sql_text: "select friend_name_en from friend",
     });
     expect(created.statusCode, created.body).toBe(200);
     const id = created.json().data.id;

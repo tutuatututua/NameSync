@@ -1,4 +1,4 @@
-import { rowVerdict, type ComparisonResultRow } from "@extensions/contract";
+import { regradeVerdict, rowVerdict, type ComparisonResultRow } from "@extensions/contract";
 
 /**
  * A comparison row, un-merged.
@@ -124,8 +124,18 @@ export interface MergeFacts {
  * we hold, which is right for the internal matcher (it keeps a row per name it scores) and
  * wrong for a workflow that only writes back its matches — that one would otherwise report
  * "5 friends match, out of 5 scored".
+ * @param threshold Read the rows at a bar the reader picked instead of at their stored verdicts.
+ * Null/undefined is the default and a straight pass-through — see `regradeVerdict`, which owns the
+ * rule, and which the server applies to the counts and the row list from the same definition. Every
+ * derived fact here goes through it, not just the headline: a contact who is only a contact because
+ * of a match that no longer clears the bar must drop out of the supporting numbers too, or the
+ * card would say "3 matches, 4 contacts".
  */
-export function summarize(rows: MatchRow[], scoredCount?: number): MergeFacts {
+export function summarize(
+  rows: MatchRow[],
+  scoredCount?: number,
+  threshold?: number | null
+): MergeFacts {
   const matchedUploaders = new Set<string>();
   const contacts = new Set<string>();
   let matches = 0;
@@ -134,7 +144,7 @@ export function summarize(rows: MatchRow[], scoredCount?: number): MergeFacts {
     // Counting contacts over every row — as this once did — counts the contact that each
     // stranger happened to sit closest to, which is not a contact anybody matched.
     // Only a match names a contact.
-    if (rowVerdict(r.status) !== "matched") continue;
+    if (regradeVerdict(rowVerdict(r.status), r.similarity, threshold) !== "matched") continue;
 
     matches++;
     if (r.uploadedBy) matchedUploaders.add(r.uploadedBy);

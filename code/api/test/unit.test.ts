@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { ColumnOverridesFieldSchema } from "@extensions/contract";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -44,7 +45,7 @@ describe("FileParserService", () => {
     const rows = await FileParserService.parseFacebookFile(p);
     fs.unlinkSync(p);
     expect(rows).toHaveLength(1);
-    expect(rows[0]).toEqual({ friend_name: "nok" });
+    expect(rows[0]).toEqual({ friend_name_en: "nok", friend_name_th: null, relationship_owner: null });
   });
 
   // The export's "friended on" clock used to be read into friend.source_timestamp. Nothing ever
@@ -55,7 +56,7 @@ describe("FileParserService", () => {
     const p = await tmp("f3.xlsx", xlsxBuffer(["name", "timestamp"], [["Nok", iso]]));
     const rows = await FileParserService.parseFacebookFile(p);
     fs.unlinkSync(p);
-    expect(rows[0]).toEqual({ friend_name: "nok" });
+    expect(rows[0]).toEqual({ friend_name_en: "nok", friend_name_th: null, relationship_owner: null });
 
     const p2 = await tmp("f4.xlsx", xlsxBuffer(["name", "added"], [["Nok", iso]]));
     const preview = await FileParserService.previewFacebookFile(p2, "f4.xlsx");
@@ -104,7 +105,7 @@ describe("FileParserService", () => {
     const rows = await FileParserService.parseFacebookFile(p);
     fs.unlinkSync(p);
 
-    expect(rows[0]).toEqual({ friend_name: "somchai jaidee" });
+    expect(rows[0]).toEqual({ friend_name_en: "somchai jaidee", friend_name_th: null, relationship_owner: null });
   });
 
   it("warns in the preview that names will be cleaned", async () => {
@@ -197,7 +198,7 @@ describe("FileParserService", () => {
     const [a, b] = [await FileParserService.parseFacebookFile(bare), await FileParserService.parseFacebookFile(wrapped)];
     fs.unlinkSync(bare);
     fs.unlinkSync(wrapped);
-    expect(a).toEqual([{ friend_name: "somchai jaidee" }]);
+    expect(a).toEqual([{ friend_name_en: "somchai jaidee", friend_name_th: null, relationship_owner: null }]);
     expect(b).toEqual(a);
   });
 
@@ -208,7 +209,10 @@ describe("FileParserService", () => {
     fs.unlinkSync(p);
     // The invented column is shown in the preview, so the guess is visible before anything lands.
     expect(preview.mapping.find((m) => m.target === "friend_name")?.sourceColumn).toBe("name");
-    expect(rows).toEqual([{ friend_name: "somchai" }, { friend_name: "anong" }]);
+    expect(rows).toEqual([
+      { friend_name_en: "somchai", friend_name_th: null, relationship_owner: null },
+      { friend_name_en: "anong", friend_name_th: null, relationship_owner: null },
+    ]);
   });
 
   it("keeps a column a later record omits, and warns about the columns it ignores", async () => {
@@ -238,6 +242,176 @@ describe("FileParserService", () => {
     const notAList = await text("bad2.json", JSON.stringify({ company: "Acme" }));
     await expect(FileParserService.parseCompanyFile(notAList)).rejects.toThrow(/list of records/i);
     fs.unlinkSync(notAList);
+  });
+
+  // ── columns mapped by hand ─────────────────────────────────────────────────
+  // Detection only knows the exports this app was written against. A file that calls its name
+  // column something else is not a broken file, and "not found" used to be the end of the
+  // conversation about it: the column was dropped and the fix was to re-export. These pin the
+  // escape hatch — the preview screen's pickers land here — and, just as importantly, that a
+  // caller sending no choices is affected in no way at all.
+
+  // A bilingual export writes its language first as readily as last, and both files come out of
+  // the same exporters. Detection has to know both orders on both sides — a header the app could
+  // have recognised itself is not what the picker is for, and a file of them arrives at the
+  // preview screen as four questions nobody should have been asked.
+  it("reads en_name/th_name as readily as name_en/thai_name, on both sides", async () => {
+    const f = await tmp("f8.xlsx", xlsxBuffer(["en_name", "timestamp", "th_name"], [["Somchai", 1700000000, "สมชาย"]]));
+    const friends = await FileParserService.parseFacebookFile(f);
+    const preview = await FileParserService.previewFacebookFile(f, "f8.xlsx");
+    fs.unlinkSync(f);
+    expect(friends[0]).toEqual({ friend_name_en: "somchai", friend_name_th: "สมชาย", relationship_owner: null });
+    // Nothing left for the user to map but the owner the file genuinely doesn't carry.
+    expect(preview.ignoredColumns).toEqual(["timestamp"]);
+
+    const c = await tmp("c6.xlsx", csvToXlsx("company_name,en_name,th_name\nAcme,Somchai,สมชาย\n"));
+    const company = await FileParserService.parseCompanyFile(c);
+    fs.unlinkSync(c);
+    expect(company[0]).toEqual({ company_name: "Acme", person_name_th: "สมชาย", person_name_en: "somchai" });
+  });
+
+  // The unlabelled slot has no column behind it — it is the "which language is this?" route, and
+  // `routeFriendNames` answers by script. Detection may fill it; a person may not, because
+  // "let the app guess" is a worse answer than the two rows either side of it that say outright.
+  it("won't let the unlabelled name slot be mapped by hand", async () => {
+    const p = await tmp("f9.xlsx", xlsxBuffer(["contact"], [["Somchai"]]));
+    const preview = await FileParserService.previewFacebookFile(p, "f9.xlsx");
+    const rows = await FileParserService.parseFacebookFile(p, { friend_name: "contact" });
+    fs.unlinkSync(p);
+
+    // The preview says so, and the parser holds to it even if a caller asks anyway.
+    expect(preview.mapping.find((m) => m.target === "friend_name")?.pickable).toBe(false);
+    expect(preview.mapping.find((m) => m.target === "friend_name_en")?.pickable).toBe(true);
+    expect(rows[0]).toEqual({ friend_name_en: null, friend_name_th: null, relationship_owner: null });
+
+    // The language columns are where an unrecognised name column is mapped, and they take it.
+    const p2 = await tmp("f10.xlsx", xlsxBuffer(["contact"], [["Somchai"]]));
+    const mapped = await FileParserService.parseFacebookFile(p2, { friend_name_en: "contact" });
+    fs.unlinkSync(p2);
+    expect(mapped[0].friend_name_en).toBe("somchai");
+  });
+
+  it("takes a column the user mapped by hand, where nothing matched", async () => {
+    const p = await tmp("c5.xlsx", csvToXlsx("Organisation,ชื่อ-นามสกุล\nAcme,นายสมชาย ใจดี\n"));
+    // Untouched, this file maps nothing: neither header is on any alias list.
+    const before = await FileParserService.parseCompanyFile(p);
+    expect(before[0]).toEqual({ company_name: null, person_name_th: null, person_name_en: null });
+
+    const overrides = { company_name: "Organisation", person_name_th: "ชื่อ-นามสกุล" };
+    const rows = await FileParserService.parseCompanyFile(p, overrides);
+    const preview = await FileParserService.previewCompanyFile(p, "c5.xlsx", overrides);
+    fs.unlinkSync(p);
+
+    // Named columns are read, and read the same way a detected one would be — the Thai name is
+    // still cleaned, the company name still tidied and case-preserving.
+    expect(rows[0]).toEqual({ company_name: "Acme", person_name_th: "สมชาย ใจดี", person_name_en: null });
+    // The preview agrees with the import, which is the whole point of the screen.
+    expect(preview.mapping.find((m) => m.target === "person_name_th")?.sourceColumn).toBe("ชื่อ-นามสกุล");
+    expect(preview.sampleRows[0].person_name_th_clean).toBe("สมชาย ใจดี");
+    // A mapped column is no longer ignored, and no longer warned about...
+    expect(preview.ignoredColumns).not.toContain("ชื่อ-นามสกุล");
+    expect(preview.warnings.some((w) => w.includes("Thai name"))).toBe(false);
+    // ...while the one still nobody supplies is.
+    expect(preview.warnings.some((w) => w.includes("English name"))).toBe(true);
+  });
+
+  it("lets a hand-mapped column beat detection, and a header the file lacks change nothing", async () => {
+    const p = await tmp("f6.xlsx", xlsxBuffer(["eng_name", "nickname"], [["Somchai", "Tui"]]));
+
+    // An explicit choice wins over the alias that found `eng_name` on its own. Detection is a
+    // guess about a header's meaning; the person looking at the file is not.
+    const picked = await FileParserService.parseFacebookFile(p, { friend_name_en: "nickname" });
+    expect(picked[0].friend_name_en).toBe("tui");
+
+    // A choice naming a header this file doesn't have is inert — detection runs as usual rather
+    // than the column resolving to nothing. This is the file-swapped-underneath case.
+    const stale = await FileParserService.parseFacebookFile(p, { friend_name_en: "ชื่อ" });
+    expect(stale[0].friend_name_en).toBe("somchai");
+
+    // And a header matched the same forgiving way an alias is: case, spaces and underscores.
+    const loose = await FileParserService.parseFacebookFile(p, { friend_name_th: "Nick Name" });
+    expect(loose[0]).toEqual({ friend_name_en: "somchai", friend_name_th: "tui", relationship_owner: null });
+
+    fs.unlinkSync(p);
+  });
+
+  it("routes a hand-mapped owner column exactly as a detected one", async () => {
+    const p = await tmp("f7.xlsx", xlsxBuffer(["name", "ผู้แนะนำ"], [["Somchai", "Khun Alex"]]));
+    const rows = await FileParserService.parseFacebookFile(p, { relationship_owner: "ผู้แนะนำ" });
+    fs.unlinkSync(p);
+    // Cleaned (the title is gone) but NOT lower-cased — the rule cleanOwnerName holds for every
+    // owner column, however it was chosen.
+    expect(rows[0].relationship_owner).toBe("Alex");
+  });
+
+  /**
+   * `ownerlessRows` is what makes the import screen's "Relationship owner" required or optional,
+   * and it has to agree with the gate in comparisons.route.ts that actually refuses the import —
+   * a box that says "optional" above a request the server will reject is worse than one that
+   * always asked. So it counts the same rows the same way: importable ones, without an owner.
+   */
+  it("counts the rows the file leaves unowned, which is what makes the typed owner required", async () => {
+    // Every row unowned: the file has no owner column at all — the ordinary Facebook export, and
+    // the case where one typed name is the only answer there is.
+    const none = await tmp("f11.xlsx", xlsxBuffer(["name"], [["Somchai"], ["Anong"]]));
+    expect((await FileParserService.previewFacebookFile(none, "f11.xlsx")).ownerlessRows).toBe(2);
+    fs.unlinkSync(none);
+
+    // The file answers for every row — nothing to type, and the box goes optional.
+    const all = await tmp(
+      "f12.xlsx",
+      xlsxBuffer(["name", "relationship_owner"], [["Somchai", "Mint"], ["Anong", "Nadhee"]])
+    );
+    expect((await FileParserService.previewFacebookFile(all, "f12.xlsx")).ownerlessRows).toBe(0);
+    fs.unlinkSync(all);
+
+    // One blank cell in an otherwise-answered column. Still required, for that row alone.
+    const some = await tmp(
+      "f13.xlsx",
+      xlsxBuffer(["name", "relationship_owner"], [["Somchai", "Mint"], ["Anong", ""]])
+    );
+    const partial = await FileParserService.previewFacebookFile(some, "f13.xlsx");
+    fs.unlinkSync(some);
+    expect(partial.ownerlessRows).toBe(1);
+    expect(partial.warnings.some((w) => w.includes("no relationship owner in the file"))).toBe(true);
+
+    // A NAMELESS row is not counted: it will not be imported either way, so requiring an owner for
+    // it would block a file with nothing wrong with it. The `usable` gate drops it on both sides.
+    const nameless = await tmp(
+      "f14.xlsx",
+      xlsxBuffer(["name", "relationship_owner"], [["Somchai", "Mint"], ["", ""]])
+    );
+    expect((await FileParserService.previewFacebookFile(nameless, "f14.xlsx")).ownerlessRows).toBe(0);
+    fs.unlinkSync(nameless);
+
+    // A company file has no owner at all — a contact is nobody's relationship.
+    const co = await tmp("c9.xlsx", csvToXlsx("company_name,eng_name\nAcme,Somchai\n"));
+    expect((await FileParserService.previewCompanyFile(co, "c9.xlsx")).ownerlessRows).toBe(0);
+    fs.unlinkSync(co);
+  });
+});
+
+// ── the wire form of a hand-mapped column ────────────────────────────────────
+// The choices reach the server as one JSON multipart field, sent identically by the preview and
+// the import — which is what lets the screen promise what the import will do. This pins that
+// field: absent and empty both mean "no choices" (never undefined, so no caller downstream has
+// to spell the two apart), and a malformed one is refused rather than silently ignored.
+
+describe("ColumnOverridesFieldSchema", () => {
+  it("reads the map, and treats absent and empty alike", () => {
+    expect(ColumnOverridesFieldSchema.parse(JSON.stringify({ thai_name: "ชื่อ" }))).toEqual({ thai_name: "ชื่อ" });
+    expect(ColumnOverridesFieldSchema.parse(undefined)).toEqual({});
+    expect(ColumnOverridesFieldSchema.parse("")).toEqual({});
+    expect(ColumnOverridesFieldSchema.parse("   ")).toEqual({});
+  });
+
+  it("refuses what it can't read rather than importing under a guess", () => {
+    expect(ColumnOverridesFieldSchema.safeParse("{ nope").success).toBe(false);
+    expect(ColumnOverridesFieldSchema.safeParse(JSON.stringify(["thai_name"])).success).toBe(false);
+    // A target pointing at nothing is not a way to blank a column — clearing a choice drops the
+    // key, and every other spelling of "empty" is a bug in the caller.
+    expect(ColumnOverridesFieldSchema.safeParse(JSON.stringify({ thai_name: "" })).success).toBe(false);
+    expect(ColumnOverridesFieldSchema.safeParse(JSON.stringify({ thai_name: null })).success).toBe(false);
   });
 });
 

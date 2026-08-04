@@ -1,4 +1,5 @@
 import { DBModel } from "@extensions/sqldb";
+import { sql } from "kysely";
 import type { PaginatedResult, UploadListQuery } from "@extensions/contract";
 import type { Upload } from "../db.types";
 
@@ -97,14 +98,24 @@ export class UploadModel extends DBModel {
     await db.deleteFrom("upload").where("id", "=", id).execute();
   }
 
-  /** Delete all imports of a source (used when wiping all company/facebook data). */
-  static async deleteImportsBySource(sourceType: "company" | "facebook"): Promise<number> {
+  /**
+   * Delete every import on one side (used when wiping all company data or all friends).
+   *
+   * Keyed on `kind` alone. The social branch also required `source = 'facebook'` until
+   * 2026-07-27, which was harmless only while 'facebook' was the sole value that column ever
+   * held. Now that an import can be typed 'linkedin' or 'business card', that predicate made
+   * "clear all friends" delete the friend ROWS (FriendModel.deleteAll takes no such filter) and
+   * leave the LinkedIn imports behind, pointing at nothing — a history of imports whose rows are
+   * gone and whose undo button does nothing.
+   *
+   * `kind` is the question this is actually asking: which side of the app is being wiped.
+   */
+  static async deleteImportsBySource(side: "company" | "facebook"): Promise<number> {
     const db = await this.getKyselyDB();
-    let q = db.deleteFrom("upload");
-    q = sourceType === "company"
-      ? q.where("kind", "=", "company")
-      : q.where("kind", "=", "social").where("source", "=", "facebook");
-    const result = await q.executeTakeFirst();
+    const result = await db
+      .deleteFrom("upload")
+      .where("kind", "=", side === "company" ? "company" : "social")
+      .executeTakeFirst();
     return Number(result?.numDeletedRows ?? 0);
   }
 
@@ -145,7 +156,15 @@ export class UploadModel extends DBModel {
     const applyFilters = (query: any): any => {
       let x = query.where("kind", "in", ["company", "social"] as const);
       if (typeFilter === "company") x = x.where("kind", "=", "company");
-      else if (typeFilter === "facebook") x = x.where("kind", "=", "social").where("source", "=", "facebook");
+      // `kind = 'social'` ALONE, as of 2026-08-03d. It used to also require source='facebook',
+      // which meant a LinkedIn or business-card import matched neither branch and could not be
+      // found from this toolbar at all — invisible rather than misfiled. The source axis is its
+      // own filter now (below), which is what makes narrowing to Facebook still possible without
+      // making it mandatory.
+      else if (typeFilter === "facebook") x = x.where("kind", "=", "social");
+      // Folded on both sides: the picker stores 'facebook' and the Database console can write
+      // 'Facebook' into the same column.
+      if (q.source) x = x.where(sql`lower(source)`, "=", q.source.toLowerCase());
       if (q.status) x = x.where("status", "=", q.status);
       if (q.uploadedBy) x = x.where("uploaded_by", "ilike", `%${q.uploadedBy}%`);
       if (q.dateFrom) x = x.where("created_at", ">=", q.dateFrom);

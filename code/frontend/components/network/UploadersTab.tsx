@@ -9,7 +9,10 @@ import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/empty-state";
 import { SectionHeader } from "@/components/page-header";
+import { ReachLeads, reachBadgeVariant, rosterMatchTitle } from "@/components/network/match-grade";
 import { useNetworkUploaders } from "@/hooks/queries";
+import { withThreshold } from "@/hooks/useThreshold";
+import { cn } from "@/lib/utils";
 
 /**
  * Relationship owners (Feature 2a) — search an owner, see how many of their friends matched and how
@@ -20,9 +23,13 @@ import { useNetworkUploaders } from "@/hooks/queries";
  * in one list with its tally, filterable by name, and each row opens the roster's actual names
  * (matched, and — the useful half — not). The counts here are the same numbers the Overview shows
  * for a single roster, so the two never disagree.
+ *
+ * That agreement is why `threshold` (the workspace bar) is threaded to the query rather than only
+ * to the links: the Overview reads one roster at the reader's bar, and a tab reading every roster
+ * at the matchers' would put two different answers about the same person on two tabs of one page.
  */
-export function UploadersTab() {
-  const { data, isLoading } = useNetworkUploaders();
+export function UploadersTab({ threshold = null }: { threshold?: number | null }) {
+  const { data, isLoading, isFetching } = useNetworkUploaders(threshold ?? undefined);
   const [query, setQuery] = React.useState("");
 
   const uploaders = data?.uploaders ?? [];
@@ -66,9 +73,16 @@ export function UploadersTab() {
           description="Try a different spelling, or clear the search to see everyone."
         />
       ) : (
-        <div className="overflow-hidden rounded-lg border">
+        // Dimmed while a new bar is in flight — see OverviewTab for why the previous answer stays
+        // on screen rather than being replaced by skeletons on every step of a drag.
+        <div
+          className={cn(
+            "overflow-hidden rounded-lg border transition-opacity",
+            isFetching && !isLoading && "opacity-60"
+          )}
+        >
           {filtered.map((u) => (
-            <UploaderRow key={u.uploader} stats={u} />
+            <UploaderRow key={u.uploader} stats={u} threshold={threshold} />
           ))}
         </div>
       )}
@@ -76,10 +90,12 @@ export function UploadersTab() {
   );
 }
 
-function UploaderRow({ stats }: { stats: UploaderStats }) {
+function UploaderRow({ stats, threshold }: { stats: UploaderStats; threshold: number | null }) {
   return (
     <Link
-      href={`/uploaders/${encodeURIComponent(stats.uploader)}`}
+      // The bar rides along, so the roster page lists the names behind THIS row's tally rather
+      // than the matchers' — the badge and the page it opens have to be the same answer.
+      href={withThreshold(`/uploaders/${encodeURIComponent(stats.uploader)}`, threshold)}
       className="group flex items-center gap-3 border-b p-4 outline-none transition-colors last:border-b-0 hover:bg-muted/40 focus-visible:bg-muted/40"
     >
       <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border bg-muted text-sm font-medium text-muted-foreground">
@@ -92,9 +108,21 @@ function UploaderRow({ stats }: { stats: UploaderStats }) {
         </p>
       </div>
       <div className="flex shrink-0 items-center gap-2">
-        <Badge variant={stats.matched > 0 ? "success" : "outline"} title="Friends with a connection">
+        {/* Amber when every one of this roster's matches is a lead — a roster placed entirely on
+            surnames is the case that most needs to stop reading as a placed roster. The count
+            itself does not move: leads are matches, and narrowing this number would push them into
+            "no match" and restate a match as a non-match. */}
+        <Badge
+          variant={stats.matched === 0 ? "outline" : reachBadgeVariant(stats.confirmed)}
+          title={
+            stats.matched === 0
+              ? "Friends with a connection"
+              : rosterMatchTitle(stats.matched, stats.confirmed)
+          }
+        >
           <UserCheck className="h-3 w-3" />
           {stats.matched} matched
+          <ReachLeads connections={stats.matched} confirmed={stats.confirmed} />
         </Badge>
         <Badge variant="outline" title="Friends with no connection yet" className="text-muted-foreground">
           <UserX className="h-3 w-3" />

@@ -9,8 +9,12 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { ConfirmButton } from "@/components/confirm-button";
 import { SectionHeader } from "@/components/page-header";
 import { EmptyState } from "@/components/empty-state";
-import { useComparisons } from "@/hooks/queries";
+import { CompareModeBadge } from "@/components/compare-mode";
+import { SourcesBadge } from "@/components/sources-badge";
+import { sourcesLabel } from "@extensions/contract";
+import { useComparisons, useUploadSources } from "@/hooks/queries";
 import { useDeleteComparison } from "@/hooks/mutations";
+import { usePermissions } from "@/components/auth-provider";
 import { formatDate, runTitle } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
@@ -27,13 +31,26 @@ const SEARCH_THRESHOLD = 5;
 export function RecentRuns() {
   const { data, isLoading } = useComparisons();
   const del = useDeleteComparison();
+  const { canWrite } = usePermissions();
   const [query, setQuery] = React.useState("");
+
+  const sourceList = useUploadSources();
+  const sourceLabels = React.useMemo(
+    () => new Map((sourceList.data ?? []).map((s) => [s.value, s.label])),
+    [sourceList.data]
+  );
 
   const runs = data ?? [];
   const needle = query.trim().toLowerCase();
+  // The filter searches the SOURCES TOO, because they are now part of how a run is identified —
+  // typing "linkedin" to find the LinkedIn runs is the obvious move once the chips are on screen,
+  // and a filter that ignored the thing it just showed you would read as broken. Matched on the
+  // rendered label as well as the stored value, so "LinkedIn" and "linkedin" both find it.
   const shown = needle
     ? runs.filter((h) =>
-        [h.name, ...h.selectedCompanies].some((v) => v?.toLowerCase().includes(needle))
+        [h.name, ...h.selectedCompanies, ...(h.sources ?? []), sourcesLabel(h.sources, sourceLabels)].some(
+          (v) => v?.toLowerCase().includes(needle)
+        )
       )
     : runs;
 
@@ -68,13 +85,19 @@ export function RecentRuns() {
         <EmptyState
           icon={History}
           title="No comparisons yet"
-          description="Import a friend list and some company data — a run is kept here automatically."
+          description={
+            canWrite
+              ? "Import a friend list and some company data — a run is kept here automatically."
+              : "No runs have been recorded yet."
+          }
           action={
-            <Button asChild variant="outline" size="sm">
-              <Link href="/uploads">
-                <UploadCloud className="h-4 w-4" /> Import data
-              </Link>
-            </Button>
+            canWrite ? (
+              <Button asChild variant="outline" size="sm">
+                <Link href="/uploads">
+                  <UploadCloud className="h-4 w-4" /> Import data
+                </Link>
+              </Button>
+            ) : undefined
           }
         />
       ) : shown.length === 0 ? (
@@ -96,12 +119,32 @@ export function RecentRuns() {
               className="group relative flex items-center gap-4 border-b p-4 transition-colors last:border-b-0 hover:bg-muted/40 focus-within:bg-muted/40"
             >
               <div className="flex min-w-0 flex-1 flex-col gap-x-4 gap-y-0.5 sm:flex-row sm:items-center sm:justify-between">
-                <Link
-                  href={`/comparisons/${h.id}`}
-                  className="min-w-0 outline-none after:absolute after:inset-0 after:content-[''] focus-visible:underline"
-                >
-                  <p className="truncate font-medium">{runTitle(h)}</p>
-                </Link>
+                <div className="min-w-0">
+                  <Link
+                    href={`/comparisons/${h.id}`}
+                    className="min-w-0 outline-none after:absolute after:inset-0 after:content-[''] focus-visible:underline"
+                  >
+                    <p className="truncate font-medium">{runTitle(h)}</p>
+                  </Link>
+                  {/*
+                    THE TWO AXES, ON EVERY ROW. This list is the only place runs are seen side by
+                    side, and since a run can be repeated with a different mode or a different set
+                    of sources, the title alone stopped identifying one: three rows reading "PTT ·
+                    2026-08-03" are three different questions with the same name, and without these
+                    chips the only way to tell them apart is to open all three.
+
+                    That is also the whole reason re-running is allowed rather than blocked — the
+                    feature only works if its results are distinguishable afterwards, so the chips
+                    are the other half of that decision, not decoration on it.
+
+                    `relative z-10` keeps them above the row's stretched link so the title's click
+                    target does not swallow the tooltip on the sources chip.
+                  */}
+                  <div className="relative z-10 mt-1 flex flex-wrap items-center gap-1.5">
+                    <CompareModeBadge mode={h.compareBy} className="text-2xs" />
+                    <SourcesBadge sources={h.sources} labels={sourceLabels} className="text-2xs" />
+                  </div>
+                </div>
 
                 <p className="shrink-0 text-sm tabular-nums text-muted-foreground sm:text-right">
                   {formatDate(h.date)}
@@ -128,19 +171,21 @@ export function RecentRuns() {
                 </p>
               </div>
 
-              <ConfirmButton
-                variant="ghost"
-                size="icon-sm"
-                aria-label={`Delete ${runTitle(h)}`}
-                title="Delete this comparison?"
-                description="The run and its results are removed. This cannot be undone."
-                confirmLabel="Delete"
-                isLoading={del.isPending}
-                onConfirm={() => del.mutateAsync(h.id)}
-                className="relative z-10 shrink-0 opacity-0 transition-opacity hover:text-destructive focus-visible:opacity-100 group-hover:opacity-100"
-              >
-                <Trash2 className="h-4 w-4" />
-              </ConfirmButton>
+              {canWrite && (
+                <ConfirmButton
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label={`Delete ${runTitle(h)}`}
+                  title="Delete this comparison?"
+                  description="The run and its results are removed. This cannot be undone."
+                  confirmLabel="Delete"
+                  isLoading={del.isPending}
+                  onConfirm={() => del.mutateAsync(h.id)}
+                  className="relative z-10 shrink-0 opacity-0 transition-opacity hover:text-destructive focus-visible:opacity-100 group-hover:opacity-100"
+                >
+                  <Trash2 className="h-4 w-4" />
+                </ConfirmButton>
+              )}
             </div>
           ))}
         </div>

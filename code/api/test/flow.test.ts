@@ -87,14 +87,17 @@ describe("import (/run)", () => {
     return app.inject({ method: "POST", url: "/api/comparisons/run", payload: form, headers: form.getHeaders() });
   }
 
-  it("accepts a company file with no relationship owner — the name is only an audit note there", async () => {
+  it("accepts a company file with nobody named — the uploader comes from the session", async () => {
     const res = await importWithoutUploader("companyFile");
     expect(res.statusCode).toBe(200);
     expect(res.json().data.companyAdded).toBe(1);
 
-    // Stored as NULL, and the row still reads back fine.
+    // It used to store NULL here. A company contact is still nobody's relationship — there is no
+    // owner to ask for on that side — but who *performed* the import is always knowable, so it is
+    // filled from the signed-in user rather than left blank. Under AUTH_DISABLED that is the dev
+    // user, which is what this asserts.
     const rows = (await app.inject({ method: "GET", url: "/api/comparisons/company-data/all?page=1&limit=50" })).json();
-    expect(rows.data[0].upload_person_name).toBeNull();
+    expect(rows.data[0].upload_person_name).toBe("Local dev");
   });
 
   it("400s a friends file with no relationship owner — the owner is half its dedup key", async () => {
@@ -339,14 +342,29 @@ describe("ingestion webhook — the import forwards itself", () => {
     expect(hit.headers["x-upload-id"]).toBe(id);
     expect(hit.headers["x-session-id"]).toBe(id);
     expect(hit.headers["x-row-count"]).toBe("2");
+    // Always sent, even with no run behind it — unlike x-comparison-id. A workflow with no mode
+    // would have to guess, and the harmless-looking guess (whole names) is the wrong answer for
+    // any run that asked for something else.
+    expect(hit.headers["x-compare-type"]).toBe("full");
+    expect(hit.headers["x-compare-language"]).toBe("en");
+    expect(hit.headers["x-compare-by"]).toBe("en_full");
 
     const lines = filePart(hit.body).trim().split("\n");
     // `comparison_id` is the run the external workflow writes its results into. Empty here:
     // the internal matcher is on in tests, so this import started no run. There is one column
     // per name and it carries the cleaned spelling — the `_clean` twins the workflow used to
     // be told to match on are gone, so it matches on the name it is handed.
+    //
+    // Everything after `comparison_id` is appended rather than slotted in beside its relatives,
+    // so a receiver reading this CSV positionally keeps working. `compare_sources` is the newest
+    // (2026-08-03) and is therefore last.
+    //
+    // It is EMPTY here and that is its documented reading: this import named no compare scope, so
+    // every friend on file is a candidate. Note it is a different column from `type` — that one is
+    // this FILE's provenance and is empty for the other reason (a company file has none), where
+    // this one is the RUN's scope over the friends it will be matched against.
     expect(lines[0]).toBe(
-      "uuid,company_name,person_name_th,person_name_en,upload_person_name,status,session_id,comparison_id"
+      "uuid,company_name,person_name_th,person_name_en,upload_person_name,status,session_id,comparison_id,uploader_name,type,compare_type,compare_language,compare_by,compare_sources"
     );
     expect(lines).toHaveLength(3); // header + the 2 imported rows
     expect(lines[1]).toContain("MCKINSEY"); // the company keeps its case
@@ -365,11 +383,21 @@ describe("ingestion webhook — the import forwards itself", () => {
     expect(hit.body).toContain("Content-Type: text/csv");
 
     const lines = filePart(hit.body).trim().split("\n");
-    // No `fb_name_clean` twin, and no `timestamp`: the friend row is a name, an uploader and
-    // a status, which is all anything downstream ever read.
-    expect(lines[0]).toBe("uuid,fb_name,upload_person_name,status,session_id,comparison_id");
+    // No `fb_name_clean` twin, and no `timestamp`. `upload_person_name` still carries the
+    // RELATIONSHIP OWNER, as it always has — it is sourced from friend.relationship_owner now
+    // rather than upload.uploaded_by, which is the same fact per row instead of per file. The
+    // workflow writes it to comparison_result.upload_name, and every roster in the product groups
+    // by that, so re-pointing this at the uploader would have re-filed everyone silently.
+    expect(lines[0]).toBe(
+      // The two bilingual columns are APPENDED last, and `fb_name` survives beside them — a
+      // positional parser on the far side keeps working, which is what makes this half of the
+      // change shippable without a coordination round. See docs/EXTERNAL-MATCHER.md.
+      "uuid,fb_name,upload_person_name,status,session_id,comparison_id,relationship_owner,uploader_name,type,compare_type,compare_language,compare_by,friend_name_en,friend_name_th"
+    );
     expect(lines[1]).toContain("somchai");
-    expect(lines[1]).toContain("Alice");
+    // The owner, under both the legacy alias and its honest name.
+    expect(lines[1].split(",")[2]).toBe("Alice");
+    expect(lines[1].split(",")[6]).toBe("Alice");
   });
 
   it("forwards only the NEW rows of a partly-duplicate import", async () => {
@@ -983,10 +1011,13 @@ describe("import preview", () => {
     expect(p.kind).toBe("company");
     expect(p.totalRows).toBe(2);
     // `cleaned` marks the person-name columns — the ones with a `_clean` twin in each row.
+    // `pickable` is true on all three: every company target is a real column somebody can point
+    // at, so the preview offers a picker for any the file doesn't supply. Only the unlabelled
+    // friend name is false, and it doesn't exist on this side of the import.
     expect(p.mapping).toEqual([
-      { target: "company_name", label: "Company", sourceColumn: "company_name", cleaned: false },
-      { target: "person_name_th", label: "Thai name", sourceColumn: "thai_name", cleaned: true },
-      { target: "person_name_en", label: "English name", sourceColumn: "eng_name", cleaned: true },
+      { target: "company_name", label: "Company", sourceColumn: "company_name", cleaned: false, pickable: true },
+      { target: "person_name_th", label: "Thai name", sourceColumn: "thai_name", cleaned: true, pickable: true },
+      { target: "person_name_en", label: "English name", sourceColumn: "eng_name", cleaned: true, pickable: true },
     ]);
     // `<target>` is the file's own cell and `<target>_clean` is what will be stored. This
     // pairing is now the only place the original is ever visible — it is not kept — so the
@@ -1152,8 +1183,29 @@ describe("import preview", () => {
     const p = raw.json().data;
 
     expect(p.mapping.find((m: { target: string }) => m.target === "friend_name").sourceColumn).toBeNull();
-    expect(p.warnings.join(" ")).toMatch(/Facebook name/);
+    expect(p.warnings.join(" ")).toMatch(/No column matched a friend's name/);
     expect(p.ignoredColumns).toContain("nickname");
+  });
+
+  // The mirror of the test above, and the reason it is asked as one question rather than one per
+  // name column: a file that labels both spellings answers "where are the names?" completely, and
+  // leaves the unlabelled slot empty *because* it did. Warning about that slot fired on a perfectly
+  // good file and told the reader to pick a column for the one row that offers no picker.
+  it("does not warn about the unlabelled name slot when the file labels its name columns", async () => {
+    const raw = await previewUpload(app, {
+      raw: {
+        field: "facebookFile",
+        body: await xlsxBuffer(
+          ["eng_name", "thai_name"],
+          [["Somchai Prasert", "สมชาย ประเสริฐ"]]
+        ),
+        filename: "friends.xlsx",
+      },
+    });
+    const p = raw.json().data;
+
+    expect(p.mapping.find((m: { target: string }) => m.target === "friend_name").sourceColumn).toBeNull();
+    expect(p.warnings.join(" ")).not.toMatch(/No column matched|will not be imported/);
   });
 
   // Two columns under one header is refused rather than resolved. A row is keyed by its header

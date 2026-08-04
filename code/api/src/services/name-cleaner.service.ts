@@ -23,6 +23,11 @@
  * are one person — and folding it on the way in means the dedup key, the matcher and the grid
  * all read one spelling rather than each lower-casing defensively at their own end.
  *
+ * `cleanOwnerName` is the one exception, and the exception proves the rule: a relationship
+ * owner gets rules 1–4 and not rule 5, because that name is never matched — it is grouped
+ * (case-insensitively, at each reader's own end) and then shown to somebody as the person to go
+ * and ask. See its own comment.
+ *
  * The rules, in order:
  *   1. normalize   NFKC, kill zero-width/NBSP, collapse runs of spaces, trim
  *   2. de-decorate strip quotes and bracketed nicknames:  Somchai "Tui" Jaidee → Somchai Jaidee
@@ -132,6 +137,14 @@ function deSuffix(tokens: string[]): string[] {
  * cannot return.
  */
 export function cleanPersonName(raw: string | null | undefined): string | null {
+  const cleaned = cleanNameKeepingCase(raw);
+  return cleaned === null ? null : cleaned.toLowerCase();
+}
+
+/** Rules 1–4, without rule 5. Shared by the two exports so they cannot drift into stripping
+ *  different things — the case fold is the only difference between them, and it is applied by
+ *  the caller rather than duplicated here. */
+function cleanNameKeepingCase(raw: string | null | undefined): string | null {
   const tidied = tidyText(raw);
   if (tidied === null) return null;
 
@@ -139,8 +152,30 @@ export function cleanPersonName(raw: string | null | undefined): string | null {
   if (decorated === "") return null;
 
   const tokens = deSuffix(deTitle(decorated.split(" ").filter(Boolean)));
-  const cleaned = tokens.join(" ").trim().toLowerCase();
+  const cleaned = tokens.join(" ").trim();
   return cleaned === "" ? null : cleaned;
+}
+
+/**
+ * A relationship owner's or uploader's name: the same clean, with its capitalisation left alone.
+ *
+ * It needs the clean. An owner typed as "Alex" and an owner a file spells "Khun Alex" are one
+ * person, and every roster in the app is grouped on this string — so without de-titling they
+ * become two rosters, two sets of tallies, and two different answers to "who should I ask".
+ * That is the same reason friend names are cleaned, and it applies here for the first time now
+ * that an owner can arrive from a file instead of only from a text box.
+ *
+ * It must NOT be lower-cased, which is where it parts company with `cleanPersonName`. That
+ * function folds case because a name it produces is *matched* — trigram-scored against another
+ * name — and case carries no identity for matching. An owner is never matched. It is grouped,
+ * and every grouping already folds case at its own end (`lower(relationship_owner)` in the
+ * roster queries), and then it is DISPLAYED — as the person to go and ask. Folding it here would
+ * turn every roster label, every "ask" line and every picker entry into "nadhee", permanently
+ * and with no raw twin to restore from. Same stance, and the same reasoning, as `company_name`:
+ * compared case-insensitively, shown as written.
+ */
+export function cleanOwnerName(raw: string | null | undefined): string | null {
+  return cleanNameKeepingCase(raw);
 }
 
 /** Whether cleaning would change the text — drives the preview's "N names will be cleaned" note. */

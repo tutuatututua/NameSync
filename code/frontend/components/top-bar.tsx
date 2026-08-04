@@ -9,7 +9,8 @@ import { Sheet, SheetContent, SheetTitle, SheetTrigger } from "@/components/ui/s
 import { ThemeToggle } from "./theme-toggle";
 import { UserMenu } from "./user-menu";
 import { NavLink } from "./app-sidebar";
-import { NAV_ITEMS, isActive } from "./nav-items";
+import { navItemsFor, isActive } from "./nav-items";
+import { usePermissions } from "./auth-provider";
 
 /**
  * Mobile only.
@@ -23,6 +24,8 @@ import { NAV_ITEMS, isActive } from "./nav-items";
 export function TopBar() {
   const pathname = usePathname() ?? "";
   const [open, setOpen] = React.useState(false);
+  const { roles } = usePermissions();
+  const navItems = navItemsFor(roles);
 
   // Navigating inside the sheet has to close it — otherwise the panel stays open over the
   // page you just asked for.
@@ -43,7 +46,7 @@ export function TopBar() {
             <span className="font-display text-md font-semibold tracking-tight">Network Intel</span>
           </div>
           <nav className="space-y-0.5 px-2 py-2">
-            {NAV_ITEMS.map(({ href, label, icon: Icon }) => (
+            {navItems.map(({ href, label, icon: Icon }) => (
               <NavLink
                 key={href}
                 href={href}

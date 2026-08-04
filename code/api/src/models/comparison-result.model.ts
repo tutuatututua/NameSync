@@ -1,7 +1,24 @@
 import { DBModel } from "@extensions/sqldb";
+import { otherNameSql, sameFriendSql, scoredNameSql } from "./friend-identity";
 import { sql, type SqlBool } from "kysely";
-import type { ComparisonResultRow, PaginatedResult, RunRow } from "@extensions/contract";
-import { matchedFirstSql, rowVerdictSql, tallyVerdicts, type StatusCounts } from "./row-status";
+import {
+  compareByAxes,
+  hasThai,
+  type CompareBy,
+  type ComparisonResultRow,
+  type PaginatedResult,
+  type RunRow,
+} from "@extensions/contract";
+import {
+  hasScriptSql,
+  matchedFirstSql,
+  regradeVerdictSql,
+  regradedStatusSql,
+  rowVerdictSql,
+  runRowBucketSql,
+  tallyVerdicts,
+  type StatusCounts,
+} from "./row-status";
 import {
   rowFilterWhere,
   toRunRow,
@@ -40,8 +57,22 @@ import {
  * through an equality test of its own.
  */
 
-/** The verdict rule, over this table's own status. See models/row-status.ts. */
-const verdict = () => rowVerdictSql("comparison_result.status");
+/**
+ * The verdict rule, over this table's own status — optionally seen at a bar the reader picked.
+ *
+ * One function rather than two so the threshold cannot be honoured by the tally and forgotten by
+ * the filter, which is the shape this bug would take: a "Matches 41" tab that pages through 18 rows.
+ * `null` is the default and a straight pass-through — the stored verdict, exactly as before.
+ *
+ * Every row in this table carries its own `similarity` (the internal matcher scores a pair to decide
+ * it and keeps the number), so unlike the import readers there is nothing to look up.
+ */
+const verdict = (threshold: number | null = null) =>
+  regradeVerdictSql(
+    rowVerdictSql("comparison_result.status"),
+    sql<number | null>`comparison_result.similarity`,
+    threshold
+  );
 
 export interface ComparisonResultInput {
   comparison_id: string;
@@ -71,7 +102,44 @@ export interface ComparisonResultInput {
   /** Where the matched contact works. Optional: an external matcher posts results through the
    *  callback route and is not obliged to say. */
   company_name?: string | null;
+  /**
+   * The friend's two spellings as they read at the time, and the identity of the two rows.
+   *
+   * All optional, and all separate from `fb_name`, which stays "the spelling this run scored".
+   * The internal matcher fills every one of them; the callback route (an external workflow) fills
+   * whichever it was given, which is often none — so nothing may be REQUIRED here without
+   * breaking the writer we do not control.
+   *
+   * Text is evidence, ids are identity. The ids exist so counting can be exact — two spellings of
+   * one person must not count as two friends — and must never be followed to render a name.
+   */
+  friend_name_en?: string | null;
+  friend_name_th?: string | null;
+  friend_id?: string | null;
+  company_contact_id?: string | null;
   extra?: Record<string, unknown> | null;
+}
+
+/**
+ * File one scored name into the two columns that now hold names, by script.
+ *
+ * The twin of `routeFriendNames` in file-parser.service.ts, deliberately identical in behaviour:
+ * Thai characters anywhere put it in the Thai column, otherwise English, and an explicit value
+ * from the writer always wins over the inference. It is not shared code because the two read
+ * different inputs — that one takes a mapped spreadsheet row, this one a callback record — but
+ * they must not diverge, since one files the friend and the other files the result that has to
+ * find it again through `sameFriendSql`.
+ */
+function routeScoredName(
+  scored: string | null,
+  en: string | null,
+  th: string | null
+): { friend_name_en: string | null; friend_name_th: string | null } {
+  if (scored) {
+    if (hasThai(scored)) th = th ?? scored;
+    else en = en ?? scored;
+  }
+  return { friend_name_en: en, friend_name_th: th };
 }
 
 export class ComparisonResultModel extends DBModel {
@@ -80,7 +148,18 @@ export class ComparisonResultModel extends DBModel {
     const db = await this.getKyselyDB();
     const data = records.map((r) => ({
       comparison_id: r.comparison_id,
-      friend_name: r.fb_name,
+      // `fb_name` is still the wire field, and still required — an external workflow posting to
+      // the callback route sends one name and knows nothing about the two columns. There is no
+      // longer a column of its own to put it in, so it is FILED by script into whichever of the
+      // two its characters indicate, unless the writer named that column itself.
+      //
+      // The same rule the import applies to an unlabelled name cell (`routeFriendNames`) and the
+      // same one 2026-08-03b applied to the stored values when the column was dropped. Keeping
+      // the three in step matters more than the rule being clever: a name filed one way at
+      // import and another way here would stop `sameFriendSql` from resolving its own writes.
+      ...routeScoredName(r.fb_name, r.friend_name_en ?? null, r.friend_name_th ?? null),
+      friend_id: r.friend_id ?? null,
+      company_contact_id: r.company_contact_id ?? null,
       person_name_en: r.person_name_en,
       person_name_th: r.person_name_th,
       batch_number: r.batch_number,
@@ -112,9 +191,16 @@ export class ComparisonResultModel extends DBModel {
     const db = await this.getKyselyDB();
     return db
       .selectFrom("comparison_result")
+      // For `compare_by`, and only that: the wire's `fb_name` is the spelling this run scored, and
+      // since 2026-08-03c the row no longer says which of its two that was. An inner join on the
+      // primary key of one row — a result without a run cannot exist.
+      .innerJoin("comparison", "comparison.id", "comparison_result.comparison_id")
       .select([
         "comparison_result.id as uuid",
-        "comparison_result.friend_name as fb_name",
+        // Unchanged on the wire, reconstructed underneath. External readers of this payload asked
+        // for "the Facebook side of the pair" and still get it; see `scoredNameSql` for the one
+        // case where the reconstruction is a guess rather than a record.
+        scoredNameSql("comparison_result", "comparison.compare_by").as("fb_name"),
         "comparison_result.person_name_en",
         "comparison_result.person_name_th",
         "comparison_result.batch_number",
@@ -132,18 +218,24 @@ export class ComparisonResultModel extends DBModel {
       .select((eb) => [
         eb
           .fn<string | null>("coalesce", [
-            "comparison_result.upload_name",
+            // The friend row's own owner, not its importer. `upload.uploaded_by` used to serve
+            // here and now names a different person — who performed the import, which on a file
+            // carrying several owners is nobody's relationship in particular.
+            //
+            // AHEAD of `comparison_result.upload_name` since 2026-07-30, not behind it. Both are
+            // meant to be the owner; only one of them is written by this app. See the same flip in
+            // CompanyContactModel.findRunRows for what preferring the external value cost.
             sql<string | null>`(
-              select u.uploaded_by from friend f
-              join upload u on u.id = f.upload_id
-              where f.friend_name = comparison_result.friend_name and u.uploaded_by is not null
-              order by u.created_at asc limit 1
+              select f.relationship_owner from friend f
+              where ${sameFriendSql("comparison_result", "f")} and f.relationship_owner is not null
+              order by f.created_at asc limit 1
             )`,
+            "comparison_result.upload_name",
           ])
           .as("upload_name"),
         sql<string | null>`comparison_result.extra::text`.as("extra"),
       ])
-      .where("comparison_id", "=", comparisonId)
+      .where("comparison_result.comparison_id", "=", comparisonId)
       .orderBy(matchedFirstSql("comparison_result.status"))
       .orderBy(sql`comparison_result.similarity desc nulls last`)
       .orderBy("comparison_result.id", "asc")
@@ -183,14 +275,21 @@ export class ComparisonResultModel extends DBModel {
     page: number,
     limit: number,
     filter: RunRowFilter,
-    sort: RunRowSort
+    sort: RunRowSort,
+    /** The reader's chosen bar, or null for the run's own verdicts. See `regradeVerdict`. */
+    threshold: number | null = null
   ): Promise<PaginatedResult<RunRow>> {
     const db = await this.getKyselyDB();
     const offset = (page - 1) * limit;
-    const where = rowFilterWhere(verdict(), filter);
+    // No scorable expression: every row in this table was scored, so the bucket collapses to the
+    // verdict. The rows the mode ruled out are not here to be filtered — see statusCounts.
+    const where = rowFilterWhere(runRowBucketSql(verdict(threshold), null), filter);
 
     let rows = db
       .selectFrom("comparison_result")
+      // For `compare_by` — which of the row's two spellings this run scored. Only the row query
+      // needs it; the count below is over the same predicate and does not project a name.
+      .innerJoin("comparison", "comparison.id", "comparison_result.comparison_id")
       .where("comparison_result.comparison_id", "=", comparisonId);
     if (where) rows = rows.where(where);
 
@@ -217,24 +316,72 @@ export class ComparisonResultModel extends DBModel {
       )
       .select((eb) => [
         "comparison_result.id as id",
-        "comparison_result.friend_name as name",
-        // A friend has one name — the Thai/English pair belongs to the contact they matched.
+        // The spelling this run scored. Read off `compare_by` since 2026-08-03c dropped the column
+        // that stated it — see `scoredNameSql`.
+        scoredNameSql("comparison_result", "comparison.compare_by").as("name"),
+        // A contact column; this row is about a friend. See `RunRow.nameTh`.
         sql<string | null>`null`.as("nameTh"),
-        // Whose friend this is. Same coalesce as findByComparisonId: the matcher may have named
-        // the uploader itself, and if it didn't, the friend row knows. Scalar subquery, so a name
-        // two people both have never multiplies the row.
+        // The friend's other spelling, as the run recorded it. Frozen text off the result row
+        // rather than a lookup through `friend_id` — following the id would let a later rename
+        // rewrite what this run reported.
+        otherNameSql("comparison_result", "comparison.compare_by").as("nameAlt"),
+        // Whose friend this is. Same coalesce as findByComparisonId, and in the same order since
+        // 2026-07-30: the friend row knows, and the matcher's own `upload_name` stands behind it
+        // for the rows whose friend is no longer on file. Scalar subquery, so a name two people
+        // both have never multiplies the row.
         eb
           .fn<string | null>("coalesce", [
-            "comparison_result.upload_name",
             sql<string | null>`(
-              select u.uploaded_by from friend f
-              join upload u on u.id = f.upload_id
-              where f.friend_name = comparison_result.friend_name and u.uploaded_by is not null
-              order by u.created_at asc limit 1
+              select f.relationship_owner from friend f
+              where ${sameFriendSql("comparison_result", "f")} and f.relationship_owner is not null
+              order by f.created_at asc limit 1
             )`,
+            "comparison_result.upload_name",
           ])
           .as("context"),
-        "comparison_result.status",
+        // The same value under the name the layout reads — see RunRow.relationshipOwner.
+        eb
+          .fn<string | null>("coalesce", [
+            sql<string | null>`(
+              select f.relationship_owner from friend f
+              where ${sameFriendSql("comparison_result", "f")} and f.relationship_owner is not null
+              order by f.created_at asc limit 1
+            )`,
+            "comparison_result.upload_name",
+          ])
+          .as("relationshipOwner"),
+        // Nobody "uploaded" a compare run's rows — the user picked companies and the matcher
+        // scored a friend list that was already on file. Null rather than the friend's importer,
+        // which would answer a question this run never asked.
+        sql<string | null>`null`.as("uploaderName"),
+        /**
+         * When the underlying FRIEND was last touched, not when this result row was written.
+         *
+         * The result's own `created_at` is when the matcher reached a verdict, which on a re-run
+         * reads as today however stale the relationship beneath it is — and "how old is this
+         * record" is the question someone deciding whether to act on the row is asking. Looked up
+         * by name for the same reason everything else here is: `comparison_result` keeps no FK
+         * back to the row it came from.
+         */
+        sql<string | null>`(
+          select f.updated_at from friend f
+          where ${sameFriendSql("comparison_result", "f")}
+          order by f.updated_at desc limit 1
+        )`.as("updatedAt"),
+        // Every row here was scored by construction: the matcher writes no row for a friend it
+        // could not score under the run's mode. The ones it skipped are counted in `statusCounts`
+        // from the friend table instead, since they left no trace in this one.
+        sql<boolean>`true`.as("scored"),
+        // The stamp the matcher left — or, when the reader asked to see the run at a different bar,
+        // the stamp that bar implies. It must be the latter: the badge is drawn from this string,
+        // and a row returned by the `matched` filter that badges itself "No match" is a page
+        // disagreeing with its own tab. See regradedStatusSql.
+        regradedStatusSql(
+          sql<string | null>`comparison_result.status`,
+          sql<number | null>`comparison_result.similarity`,
+          verdict(threshold),
+          threshold
+        ).as("status"),
         "comparison_result.similarity",
         "comparison_result.person_name_en as matchedName",
         "comparison_result.person_name_th as matchedNameTh",
@@ -255,6 +402,15 @@ export class ComparisonResultModel extends DBModel {
     // here: `similarity` ranks every row by closeness (NULLs last), and `status` — matches first —
     // now tie-breaks on similarity too, so within the matches the closest comes first rather than
     // whichever was inserted first. `id` is the final, stable tie-break in every case.
+    //
+    // "Matches first" sorts on the verdict the reader is LOOKING at, not the one on disk — at a
+    // lowered bar the rows that came up to meet it belong at the top with the rest of the matches,
+    // which is the whole reason someone lowered it. `matchedFirstSql` still serves the untouched
+    // case: with no threshold, `verdict()` is the stored verdict and the two are the same sort.
+    const matchedFirst =
+      threshold === null
+        ? matchedFirstSql("comparison_result.status")
+        : sql<number>`case when ${verdict(threshold)} = ${sql.val("matched")} then 0 else 1 end`;
     const ordered =
       sort === "similarity"
         ? selected
@@ -262,7 +418,7 @@ export class ComparisonResultModel extends DBModel {
             .orderBy("comparison_result.id", "asc")
         : sort === "status"
           ? selected
-              .orderBy(matchedFirstSql("comparison_result.status"))
+              .orderBy(matchedFirst)
               .orderBy(sql`comparison_result.similarity desc nulls last`)
               .orderBy("comparison_result.id", "asc")
           : selected.orderBy("comparison_result.id", "asc");
@@ -286,8 +442,22 @@ export class ComparisonResultModel extends DBModel {
    * table come from the same code whichever kind of run you are looking at — one definition of
    * "matched", counted once.
    */
-  static async statusCounts(comparisonId: string): Promise<StatusCounts> {
+  static async statusCounts(
+    comparisonId: string,
+    compareBy: CompareBy,
+    /** The reader's chosen bar, or null for the run's own verdicts. Only the matched/unmatched
+     *  split moves: `total` counts the rows the run has, which no bar can change. */
+    threshold: number | null = null,
+    /**
+     * The run's own source filter — null for a run that covered every source.
+     *
+     * Load-bearing for the `unscored` count below, which reaches into `friend` and would otherwise
+     * count people who were never in this run. See the comment on that query.
+     */
+    sources: string[] | null = null
+  ): Promise<StatusCounts> {
     const db = await this.getKyselyDB();
+    const { language } = compareByAxes(compareBy);
 
     // Derived first, grouped second — NOT `select case…end, group by case…end`, which reads fine
     // and does not run. Postgres matches a GROUP BY against a SELECT expression structurally, and
@@ -299,7 +469,7 @@ export class ComparisonResultModel extends DBModel {
       .selectFrom((eb) =>
         eb
           .selectFrom("comparison_result")
-          .select(verdict().as("verdict"))
+          .select(verdict(threshold).as("verdict"))
           .where("comparison_result.comparison_id", "=", comparisonId)
           .as("verdicts")
       )
@@ -307,7 +477,65 @@ export class ComparisonResultModel extends DBModel {
       .groupBy("verdicts.verdict")
       .execute();
 
-    return tallyVerdicts(rows as { verdict: string; count: unknown }[]);
+    const counts = tallyVerdicts(rows as { verdict: string; count: unknown }[]);
+
+    /**
+     * The friends this run's mode could not score — counted from `friend`, not from here.
+     *
+     * The internal matcher writes NO result row for a friend it could not score, which is the
+     * right call (a stored `unmatch` is a claim that nobody at this company is called that, and
+     * a run that never looked is in no position to make it). The consequence is that this table
+     * cannot see them: a Thai-name run over 320 friends of whom 40 have Thai names would report
+     * a 40-row run and never mention the 280, which reads as "you only have 40 friends".
+     *
+     * So the count comes from the other side. `total` then means what it says on every other
+     * kind of run — every name the run considered — and the difference between the two is
+     * exactly the rows the mode ruled out.
+     *
+     * Unconditional now. It used to be skipped under `either`, which ruled nobody out; that mode
+     * is gone, so every run has a language it did not look at and this query always has an answer
+     * worth having.
+     */
+    // "Has a name, but not in this run's language" — a fact about the data since 2026-07-28,
+    // where it used to be a script-test of the one stored name and therefore an inference.
+    const nameColumn = language === "th" ? "friend.friend_name_th" : "friend.friend_name_en";
+    let unscoredQ = db
+      .selectFrom("friend")
+      .select((eb) => eb.fn.countAll().as("count"))
+      .where((eb) =>
+        eb.or([eb("friend.friend_name_en", "is not", null), eb("friend.friend_name_th", "is not", null)])
+      )
+      .where(sql<SqlBool>`${sql.ref(nameColumn)} is null`);
+
+    /**
+     * NARROWED TO THE RUN'S OWN SOURCES, and it has to be.
+     *
+     * This query is the one place a count reaches past `comparison_result` into the whole `friend`
+     * table, which was harmless while every run covered every friend. It stopped being harmless
+     * the moment a run could be narrowed: a LinkedIn-only run would count every Facebook friend
+     * with no Thai name as one of ITS "Not compared" rows — people it never looked at, never
+     * intended to look at, and cannot show in its own row list.
+     *
+     * The visible damage would have been a run reporting `total: 1,564` over a row list of 318,
+     * with 1,246 rows in a "Not compared" tab that pages to nothing. Which reads as a bug in the
+     * table rather than a wrong denominator, and would have been found from the wrong end.
+     *
+     * Same `lower(...) = any(...)` shape as `FriendModel.findAllForMatching`, and deliberately so:
+     * this count and that filter have to select the same population or the denominator and the
+     * rows disagree.
+     */
+    if (sources !== null) {
+      unscoredQ = unscoredQ.where(
+        sql<SqlBool>`lower(friend.source) = any(${sql.val(sources)}::text[])`
+      );
+    }
+
+    const row = await unscoredQ.executeTakeFirst();
+    const unscored = Number(row?.count) || 0;
+    counts.unscored += unscored;
+    counts.total += unscored;
+
+    return counts;
   }
 
   /**

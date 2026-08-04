@@ -40,6 +40,19 @@ cd code/api
 npm run create-user -- you@example.com 'a long passphrase' --name "Your Name" --admin
 ```
 
+Further accounts take a role — see [Roles](#roles) for what each one gets:
+
+```bash
+npm run create-user -- them@example.com 'a long passphrase'              # `user`  — the whole app
+npm run create-user -- them@example.com 'a long passphrase' --reviewer   # read-only Network page
+```
+
+> **The script reads `code/api/.env`, which may not be the database your stack is running
+> against.** The compose stack takes `DATABASE_URL` from `code/.env`. If the two differ, the
+> account lands in the wrong database and the person simply cannot sign in, with no error to
+> explain why. Check both, and override on the command line when they disagree:
+> `DATABASE_URL="…" DB_SCHEMA=lakeshore npm run create-user -- …`
+
 This needs `app_user` / `auth_session` to exist already — they are created by
 `docs/schema-redesign.sql` along with the rest of the schema (see [DB.md](DB.md)), or by
 `docs/add-auth.sql` if you are adding auth to a database that predates it.
@@ -123,6 +136,37 @@ Everything, via the global hook. The exceptions, all deliberate:
 > session cookie *is* sent on the handshake — so guarding it is now possible, and should be
 > done. It was left alone here because closing it is a behaviour change that deserves its own
 > commit rather than being smuggled into this one.
+
+## Roles
+
+Signing in answers *who you are*. Roles answer *what you may call*. Both are decided on the same
+`onRequest` hook, so a route added later cannot forget the second one.
+
+| Role | What it gets |
+| --- | --- |
+| `admin` | Everything, plus creating accounts (`POST /api/auth/users`). |
+| `user` | Everything except creating accounts. |
+| `reviewer` | The Network workspace, **read only**. No imports, no matcher runs, no edits, and no Uploads or Data page. |
+
+An account holding none of these is refused everything. That is deliberate — a typo'd or emptied
+`roles` array should lock the account out rather than fall through to full access.
+
+**The reviewer allowlist lives in `api/src/lib/roles.ts`,** and it is an explicit list of
+method + path rather than a rule like "reviewers may only send `GET`". Two reasons, both real:
+
+- Not every read is a `GET`. `POST /api/db/sql` and `POST /api/db/tables/:table/query` are reads
+  with a body — a method rule would hand a reviewer the SQL console.
+- Not every `GET` is theirs. `GET /api/db/tables` and `GET /api/upload-sessions` are the Data and
+  Uploads pages, which a reviewer should not reach at all.
+
+So a **new route is denied to reviewers until someone adds it to that list on purpose.** If a
+reviewer reports a page that won't load, that list is the first place to look.
+
+The frontend has a mirror of this in `frontend/lib/auth/access.ts` (which pages may be opened) and
+`usePermissions()` in `frontend/components/auth-provider.tsx` (whether to draw a write control).
+Both are cosmetic — they decide what to paint, exactly as `AuthGuard` does for the session. The
+API is the enforcement. Tests: `api/test/roles.test.ts` (the allowlist) and
+`api/test/reviewer-access.test.ts` (that it is actually wired to the hook).
 
 ## Configuring it (deploy)
 

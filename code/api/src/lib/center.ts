@@ -154,9 +154,10 @@ export async function centerSendEmailOtp(username: string): Promise<void> {
  * Read the signed-in user's Center profile, using the JWT from a successful login. This is
  * the authoritative identity — Network Intel matches its `app_user` against the email here.
  *
- * NOTE: the exact field names in Center's `auth/me` are unconfirmed until ticket 07 (a real
- * specimen). We read the common spellings defensively and fall back to the typed login, so a
- * field-name surprise degrades to "match on what they typed" rather than a crash.
+ * The field names below are confirmed against the live auth/me: it returns `email` plus a
+ * name split across `firstname`/`lastname`. We still read the other common spellings
+ * defensively and fall back to the typed login, so a field-name surprise on another Center
+ * tenant degrades to "match on what they typed" rather than a crash.
  */
 export interface CenterProfile {
   email: string | null;
@@ -177,8 +178,15 @@ export async function centerMe(token: string): Promise<CenterProfile> {
   const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
 
   const str = (v: unknown): string | null => (typeof v === "string" && v.trim() ? v.trim() : null);
+  // Center's auth/me splits the name across `firstname`/`lastname` (confirmed against the live
+  // API) — it has no single `name` field. Join them; keep the one-field spellings first as a
+  // fallback in case another Center tenant returns a combined name instead.
+  const joined =
+    [str(data.firstname) ?? str(data.firstName), str(data.lastname) ?? str(data.lastName)]
+      .filter(Boolean)
+      .join(" ") || null;
   return {
     email: str(data.email) ?? str(data.username) ?? str(data.userName) ?? str(data.mail),
-    name: str(data.name) ?? str(data.displayName) ?? str(data.fullName),
+    name: str(data.name) ?? str(data.displayName) ?? str(data.fullName) ?? joined,
   };
 }

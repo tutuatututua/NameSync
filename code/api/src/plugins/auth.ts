@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
-import { Unauthorized } from "../lib/errors";
+import { Forbidden, Unauthorized } from "../lib/errors";
 import { readCookie } from "../lib/cookies";
+import { FORBIDDEN_MESSAGE, mayAccess } from "../lib/roles";
 import { bearerToken, SESSION_COOKIE, type SessionUser } from "../lib/session";
 import { resolveSession } from "../services/auth.service";
 
@@ -113,5 +114,16 @@ export function registerAuth(app: FastifyInstance): void {
     if (!user) throw new Unauthorized("Your session has expired — sign in again");
 
     req.user = user;
+
+    // Authorisation, on the same hook as authentication so it cannot be forgotten on a new
+    // route: every request that gets past here has been checked against the caller's roles.
+    // Reviewers are default-denied and hold an explicit allowlist — see lib/roles.ts.
+    if (!mayAccess(user.roles, req.method, req.url)) {
+      req.log.warn(
+        { userId: user.sub, roles: user.roles, method: req.method, path: req.url.split("?")[0] },
+        "forbidden: role does not permit this endpoint"
+      );
+      throw new Forbidden(FORBIDDEN_MESSAGE);
+    }
   });
 }

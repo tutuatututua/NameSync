@@ -1,5 +1,9 @@
 import { z } from 'zod';
 import { ModeSchema, PaginationQuerySchema } from './common';
+import { CompareBySchema } from './compare-by';
+import { ThresholdSchema } from './threshold';
+import { ColumnOverridesFieldSchema, CompareSourcesFieldSchema } from './uploads';
+import type { RowVerdict } from './row-status';
 
 /**
  * Row shapes as stored (nullable columns per db.types).
@@ -82,6 +86,54 @@ export const CreateComparisonBodySchema = z.object({
   uploadPersonName: z.string().trim().min(1, 'Relationship owner is required'),
 });
 export type CreateComparisonBody = z.infer<typeof CreateComparisonBodySchema>;
+
+/**
+ * The non-file multipart fields POST /api/comparisons/run reads, as a schema it can validate
+ * them with rather than four hand-rolled `.trim()`s in the route.
+ *
+ * Every one of them is optional here and defaulted or required further in, because multipart
+ * fields arrive as a bag of strings and a missing one is indistinguishable from an empty one at
+ * this layer. What each means:
+ *
+ *   · `uploadPersonName` — the RELATIONSHIP OWNER. Keeps its wire name for the same reason
+ *     `X-Session-ID` keeps its: renaming it breaks callers to say something the docs already
+ *     say. An OVERRIDE: sent, it files every row of the import under that one name, whatever
+ *     the file's own owner column (see `relationship_owner` in file-parser.service.ts) says.
+ *     Omit it and each row keeps the owner its file gave it — which is why it is no longer
+ *     unconditionally required on a friends import. It becomes required again the moment the
+ *     file leaves an importable row without an owner, since the owner is half the dedup key
+ *     and a friend filed under nobody merges with every other ownerless friend.
+ *   · `uploaderName`     — who performed the import. Defaulted from the signed-in user by the
+ *     route when absent, so the normal path never sends it.
+ *   · `sourceType`       — where the FILE came from ('facebook' | 'linkedin' | 'business card'
+ *     | a value the user added). Stored in `upload.source` / `friend.source`, permanently, on
+ *     every row. A fact about the data, not about any run over it.
+ *   · `compareSources`   — which friends the RUN this import starts should cover. Stored in
+ *     `comparison.sources`, per run. COMPANY imports only: a friends import's run scores the rows
+ *     it just brought in, and all of those carry the one `sourceType`, so there is no population
+ *     to narrow. A company import's contacts are scored against the friends already on file, and
+ *     those come from every roster — which is the choice this field exists to offer.
+ *
+ *     NOT the same field as `sourceType`, and the two must not be collapsed: one is provenance
+ *     and permanent, the other is scope and per-run. Null/absent means every source.
+ *   · `compareBy`        — how the run should compare. It lives on the IMPORT screen and not
+ *     only on the ad-hoc dialog because the import is the path that actually reaches the
+ *     external matcher: the dialog runs the internal matcher and sends no webhook, so a mode
+ *     picked only there could never reach the workflow it was meant to configure.
+ *   · `columnOverrides`  — the columns the user mapped by hand on the preview screen, when
+ *     detection found none. Sent here as well as to the preview, and identical in both, because
+ *     the preview is only believable if the import reads the file the same way.
+ */
+export const ImportFieldsSchema = z.object({
+  name: z.string().trim().optional(),
+  uploadPersonName: z.string().trim().optional(),
+  uploaderName: z.string().trim().optional(),
+  sourceType: z.string().trim().max(100).optional(),
+  compareBy: CompareBySchema.optional(),
+  compareSources: CompareSourcesFieldSchema,
+  columnOverrides: ColumnOverridesFieldSchema,
+});
+export type ImportFields = z.infer<typeof ImportFieldsSchema>;
 
 export const CreateComparisonDataSchema = z.object({
   sessionId: z.string(),
@@ -175,8 +227,49 @@ export const ComparisonProgressSchema = z.object({
    * of them is worth doing anything about.
    */
   failed: z.number(),
+
+  /**
+   * Rows this run's mode could never have scored — see `isScorable`.
+   *
+   * Carved out of `unmatched`, and it is the whole point of carving it: a Latin-script friend
+   * on a run that compares against the contact's Thai name has nothing to be held up against,
+   * and counting that as "no match" states a finding ("nobody at this company is called that")
+   * about a question that was never asked of the row. Always 0 under `either`, which scores
+   * everything.
+   *
+   * A matched row is never counted here whatever its script, because a match is proof it WAS
+   * compared — which matters for external runs, where a workflow that ignores `compare_by`
+   * scored rows we would have inferred it skipped.
+   */
+  unscored: z.number(),
+
   /** 0–100, derived. An import with no rows is done, not stuck at zero. */
   percent: z.number(),
+
+  /**
+   * How this run compared — the resolved mode, never null.
+   *
+   * On the run and not on the row because it is constant for every row of a run, and because
+   * it is the fact that makes two runs comparable or not: a full-name English finding and a
+   * surname Thai finding are different questions, and a results table that does not say which
+   * it is invites exactly the comparison it cannot support. A run with no stored mode reports
+   * the default (`en_full`).
+   */
+  compareBy: CompareBySchema,
+
+  /**
+   * WHICH friends this run covered — null when it covered every source.
+   *
+   * Beside `compareBy` and for the same reason: it is constant across the run, and it is half of
+   * what makes two runs comparable. "12 matches" against every friend on file and "12 matches"
+   * against LinkedIn alone are very different findings, and a header that shows only the mode lets
+   * the second be read as the first.
+   *
+   * Null is "every source" here exactly as it is in the column — see `CompareSourcesSchema`. The
+   * renderer turns it into "All sources" rather than hiding the chip, so the axis is always
+   * visible and a reader never has to know whether its absence meant everything or nothing.
+   */
+  sources: z.array(z.string()).nullable(),
 
   /**
    * Which way round this run is — see `RunRow.kind`, which this must agree with.
@@ -232,6 +325,31 @@ export const ComparisonProgressSchema = z.object({
    * furniture over a column of dashes.
    */
   hasSimilarity: z.boolean(),
+
+  /**
+   * The bar these counts were taken at, echoed back — null when the caller named none.
+   *
+   * Echoed rather than assumed, because the client can send a threshold and the server can decline
+   * to apply it (a run with no scores in it). A tally that silently came back ungraded, under a
+   * control sitting at 0.62, would be the one failure mode this feature can produce: numbers that
+   * look like an answer to a question nobody actually asked.
+   */
+  threshold: z.number().nullable(),
+
+  /**
+   * The bar the run's OWN matcher used, when we know it — the home position of the control.
+   *
+   * This is the internal matcher reporting its constant outward, NOT a shared constant both sides
+   * apply. That distinction is the whole reason the number travels on this payload instead of
+   * sitting in this package: the matcher stays the only thing that decides a row, and the client
+   * gets told where the decision was made so it can offer to move it and to put it back.
+   *
+   * Null on a run an external workflow decided. We do not know their bar, cannot know it, and
+   * inventing 0.8 there would draw a "reset to the matcher's threshold" marker at a number that
+   * never graded anything. The control copes by simply not offering the marker — see
+   * ThresholdControl.
+   */
+  matcherThreshold: z.number().nullable(),
 });
 export type ComparisonProgress = z.infer<typeof ComparisonProgressSchema>;
 
@@ -267,10 +385,77 @@ export const RunRowSchema = z.object({
 
   /** The name that was uploaded. For a contact this is the English spelling. */
   name: z.string().nullable(),
-  /** The same person's Thai name. Contacts carry both; a friend has only the one name. */
+  /** The same person's Thai name. A CONTACT column — `name` is their English spelling and this is
+   *  the Thai one. Null on a friend row, which uses `nameAlt` instead (the two answer different
+   *  questions: this one is "the Thai spelling", that one is "the spelling this run did not
+   *  compare", and on a Thai run those are opposites). */
   nameTh: z.string().nullable(),
-  /** What tells this name apart from another like it: the employer (contact), the uploader (friend). */
+  /**
+   * A FRIEND's other spelling — the language this run did not compare. Null on a contact row.
+   *
+   * `friend` carried one name until 2026-07-28 and this was structurally null; the argument was
+   * that a social export has a single `name` field, so a second column would invent information.
+   * A business card prints both, and `upload_source` seeds that as a first-class import type, so
+   * the second spelling was arriving in the files and being dropped at the parser.
+   *
+   * It is what lets an unscored row say something instead of nothing: "Not compared" used to be
+   * the whole content of such a row, and the reason — we hold this person's name, just not in the
+   * language this run needed — is precisely this string.
+   */
+  nameAlt: z.string().nullable(),
+  /** What tells this name apart from another like it: the employer (contact), the owner (friend). */
   context: z.string().nullable(),
+
+  /**
+   * Who actually knows this person — the name to go and ask for the introduction, and the
+   * answer the whole product exists to give.
+   *
+   * Always the FRIEND side's owner, whichever direction the run runs in — on a friends import
+   * that is the row's own `friend.relationship_owner`, and on a company import it is the owner
+   * of the friend this contact matched. Same fact, two sources: a company contact is nobody's
+   * relationship, they are the person being reached, so the only owner in the row is the one on
+   * the other side of it.
+   *
+   * One field rather than two so the layout can put the answer in the same place on every row
+   * without branching. On a company row it carries the same string as `matchedContext`, which is
+   * not duplication so much as the two questions having one answer on that side.
+   */
+  relationshipOwner: z.string().nullable(),
+
+  /**
+   * Who performed the import — `upload.uploaded_by`.
+   *
+   * Beside the owner rather than instead of it, because they are usually the same person and
+   * occasionally are not: an assistant importing on a salesperson's behalf is the case that
+   * split them. Provenance, not the answer — it says who to ask about the DATA, where the
+   * owner says who to ask about the PERSON.
+   */
+  uploaderName: z.string().nullable(),
+
+  /**
+   * When this row was last touched — `friend.updated_at` / `company_contact.updated_at`.
+   *
+   * This one and not the other two candidates. `upload.updated_at` moves for reasons that have
+   * nothing to do with the row (a status flip driven by any of its siblings), so it dates the
+   * import rather than the record. The result's `created_at` dates the VERDICT, which on a
+   * re-run reads as today no matter how stale the relationship underneath is. This column moves
+   * when the row was imported and when a workflow last stamped it, and not otherwise — which is
+   * the question a reader deciding whether to act on a row is actually asking: how old is this?
+   */
+  updatedAt: z.string().nullable(),
+
+  /**
+   * Could this row have been scored under the run's mode at all — see `isScorable`.
+   *
+   * False renders as "Not compared", which must be visually and countably distinct from "No
+   * match". Reusing the no-match badge for both is the single worst outcome available here: it
+   * turns "we never asked this question of this row" into "we asked, and the answer was no".
+   *
+   * Computed on the server rather than in the table, so this flag, the filter tab that selects
+   * it and the count on that tab all come from one expression — the same invariant that keeps
+   * "Matches 4" from labelling a filter that returns five rows.
+   */
+  scored: z.boolean(),
 
   /**
    * The row's verdict in the status vocabulary. Read through `rowVerdict`, never shown verbatim.
@@ -347,10 +532,45 @@ export type RunRow = z.infer<typeof RunRowSchema>;
  * "best available": with a score back to tie-break on, it ranks within the matches too.
  */
 export const RunRowsQuerySchema = PaginationQuerySchema.extend({
-  filter: z.enum(['all', 'pending', 'matched', 'unmatched', 'failed']).default('all'),
+  filter: z.enum(['all', 'pending', 'matched', 'unmatched', 'failed', 'unscored']).default('all'),
   sort: z.enum(['row', 'status', 'similarity']).default('row'),
+  /**
+   * Re-grade the rows at this bar instead of reading their stored verdicts — see `regradeVerdict`.
+   *
+   * It has to reach the filter as well as the badge, which is why it is a query param and not
+   * something the table does to the page it was handed: `filter=matched&threshold=0.6` must return
+   * the rows that match AT 0.6, out of the whole run. Re-labelling 25 rows client-side would show
+   * the matches among the 25 oldest and call them the run's.
+   *
+   * Absent is not 0. It means "the matcher's own verdicts", which is what this endpoint returned
+   * before the parameter existed and what every caller that does not ask for a second opinion gets.
+   */
+  threshold: ThresholdSchema.optional(),
 });
 export type RunRowsQuery = z.infer<typeof RunRowsQuerySchema>;
+
+/**
+ * The five buckets a row falls into on screen — the four verdicts, plus the one the verdict
+ * alone cannot express.
+ *
+ * `unscored` is NOT a status a workflow can write, and deliberately is not: the status
+ * vocabulary is a contract with an external system and growing it would mean asking every
+ * workflow to learn a word before this feature could ship. It is derived here instead, from
+ * the verdict and the run's mode, which is the only place both facts exist at once.
+ *
+ * The precedence below is the same conservative ordering `rowVerdict` uses, extended by one.
+ * Unfinished and failed win, because a row still being worked on has not been "not compared" —
+ * it has not been anything yet. `matched` beats `unscored` because a match is proof the row WAS
+ * compared, whatever our reading of its script says; that case is reachable on an external run
+ * whose workflow ignored `compare_by`, and deferring to the evidence rather than to the
+ * inference is the right way round.
+ */
+export type RunRowBucket = RowVerdict | 'unscored';
+
+export function runRowBucket(verdict: RowVerdict, scored: boolean): RunRowBucket {
+  if (verdict === 'pending' || verdict === 'failed' || verdict === 'matched') return verdict;
+  return scored ? 'unmatched' : 'unscored';
+}
 
 /** GET /api/comparisons/:id/results */
 export const ResultsDataSchema = z.object({
@@ -370,7 +590,13 @@ export const ResultsDataSchema = z.object({
    * `rowCount` when there isn't.
    */
   scoredCount: z.number(),
-  /** Rows the matcher stamped as a match. The run's actual finding. */
+  /**
+   * Rows the matcher stamped as a match. The run's actual finding.
+   *
+   * Re-graded when the caller passed `?threshold=` — the same overlay the row list and the progress
+   * tally apply, from the same rule (`regradeVerdict`), so the badge in the page header cannot
+   * disagree with the tabs underneath it about how many matches the reader is looking at.
+   */
   matchCount: z.number(),
   /**
    * The companies this comparison was run against. Empty for a whole-table run (an import scores
@@ -380,6 +606,66 @@ export const ResultsDataSchema = z.object({
    * `ComparisonResultRow.company_name`. This is the question the run *asked*; that is each answer.
    */
   selectedCompanies: z.array(z.string()),
+  /**
+   * The friend sources this run covered — null for a run that covered every one of them.
+   *
+   * The companion to `selectedCompanies`, and the same kind of fact: this is what the run *asked*,
+   * where each row is an answer. Both are needed to state the question a reader is looking at the
+   * answer to — "every friend, against these three companies" and "LinkedIn only, against these
+   * three companies" produce identically-shaped result sets that mean different things.
+   */
+  sources: z.array(z.string()).nullable(),
   results: z.array(ComparisonResultRowSchema),
 });
 export type ResultsData = z.infer<typeof ResultsDataSchema>;
+
+/**
+ * GET /api/comparisons/duplicate — "has this exact run been done already?"
+ *
+ * ADVISORY, NOT A GATE. The answer drives a callout in the new-run dialog and nothing else: the
+ * user can read it and run anyway, and the POST that follows does not consult it. That is
+ * deliberate on both halves.
+ *
+ * Not a gate, because a re-run is frequently the correct thing to do and the server cannot tell
+ * which time it is. The obvious case is friends imported since: same companies, same mode, same
+ * sources, and a genuinely different answer waiting on the other side. Blocking it would mean
+ * deleting a good run to be allowed to repeat it.
+ *
+ * Not a unique constraint either, for the same reason and one more: `comparison` has no unique
+ * index on anything but its primary key, and adding one would make a duplicate a 500-shaped
+ * failure at INSERT time — after the user has waited through a matcher run — instead of a sentence
+ * they read before starting.
+ *
+ * A match is exact on all three axes. Two runs differing in ANY of companies, mode or sources are
+ * different questions and this reports nothing, which is precisely the "run again if compare type
+ * and source differ" rule the feature was asked for.
+ */
+export const DuplicateRunQuerySchema = z.object({
+  /** Repeatable — `?company=A&company=B`. Compared as a set, order-insensitively. */
+  company: z.union([z.string(), z.array(z.string())]).optional(),
+  compare_by: CompareBySchema.optional(),
+  source: z.union([z.string(), z.array(z.string())]).optional(),
+});
+export type DuplicateRunQuery = z.infer<typeof DuplicateRunQuerySchema>;
+
+export const DuplicateRunDataSchema = z.object({
+  /**
+   * The most recent run asking this exact question, or null.
+   *
+   * Most recent and not "all of them": the dialog offers one link, and the freshest run is the one
+   * whose numbers a reader would want to see before deciding to repeat it. `runCount` says how many
+   * there are, so "you have run this 4 times" is still sayable without paging a list into a dialog.
+   */
+  run: z
+    .object({
+      id: z.string(),
+      name: z.string().nullable(),
+      status: z.string(),
+      matchCount: z.number(),
+      scoredCount: z.number(),
+      createdAt: z.string(),
+    })
+    .nullable(),
+  runCount: z.number(),
+});
+export type DuplicateRunData = z.infer<typeof DuplicateRunDataSchema>;

@@ -1,5 +1,5 @@
 import { sql, type Expression, type RawBuilder, type SqlBool } from "kysely";
-import type { RowVerdict, RunRow } from "@extensions/contract";
+import type { RunRow, RunRowBucket } from "@extensions/contract";
 
 /**
  * The bits `friend` and `company_contact` both need to serve the live row monitor.
@@ -11,8 +11,9 @@ import type { RowVerdict, RunRow } from "@extensions/contract";
  * drift into describing the same state two ways.
  */
 
-/** `all` is not a verdict, it is the absence of a filter. */
-export type RunRowFilter = RowVerdict | "all";
+/** `all` is not a bucket, it is the absence of a filter. The buckets are the four verdicts plus
+ *  `unscored`, which the verdict alone cannot express — see `runRowBucket` in the contract. */
+export type RunRowFilter = RunRowBucket | "all";
 
 /** See RunRowsQuerySchema — `row` is import order, `status` is matches-first, `similarity` is
  *  best-match-first. All three are honoured by all three readers; on a run whose matcher recorded
@@ -35,11 +36,11 @@ export type RunRowSort = "row" | "status" | "similarity";
  * the assumption that stops being true later.
  */
 export function rowFilterWhere(
-  verdict: RawBuilder<RowVerdict>,
+  bucket: RawBuilder<RunRowBucket>,
   filter: RunRowFilter
 ): Expression<SqlBool> | null {
   if (filter === "all") return null;
-  return sql<SqlBool>`${verdict} = ${sql.val(filter)}`;
+  return sql<SqlBool>`${bucket} = ${sql.val(filter)}`;
 }
 
 /** What the three queries select, before it is handed to the client. */
@@ -47,6 +48,7 @@ export interface RawRunRow {
   id: string | number;
   name: string | null;
   nameTh: string | null;
+  nameAlt: string | null;
   context: string | null;
   status: string | null;
   matchedName: string | null;
@@ -57,6 +59,17 @@ export interface RawRunRow {
    *  joined — the tables they read have no score column, because a score is a fact about a pair.
    *  Null on a run whose matcher recorded none. */
   similarity?: number | null;
+  /** Whose relationship this is. Only a friend row has one — a company contact is nobody's
+   *  relationship, they are the person being reached. */
+  relationshipOwner?: string | null;
+  /** Who performed the import. Absent on a compare run, which imported nothing. */
+  uploaderName?: string | null;
+  /** `friend.updated_at` / `company_contact.updated_at`, or the result row's `created_at` on a
+   *  compare run — see each reader for why that is the honest one there. */
+  updatedAt?: string | Date | null;
+  /** Could the run's mode have scored this row. Absent on a reader that has not been asked
+   *  about a narrowed script, which reads as `true` — nothing was excluded. */
+  scored?: boolean | null;
   extras: string | null;
 }
 
@@ -72,6 +85,7 @@ export function toRunRow(kind: "company" | "facebook", r: RawRunRow): RunRow {
     kind,
     name: r.name,
     nameTh: r.nameTh,
+    nameAlt: r.nameAlt,
     context: r.context,
     status: r.status,
     matchedName: r.matchedName,
@@ -80,6 +94,15 @@ export function toRunRow(kind: "company" | "facebook", r: RawRunRow): RunRow {
     // `?? null` because the import readers don't select it — an absent property reads as null,
     // which is exactly "this run kept no score" and what the table renders as "—".
     similarity: r.similarity ?? null,
+    relationshipOwner: r.relationshipOwner ?? null,
+    uploaderName: r.uploaderName ?? null,
+    // timestamptz comes back as a Date on some paths and an ISO string on others, depending on
+    // whether the column was selected by name or through a raw fragment. The contract says
+    // string; normalised here rather than at three call sites.
+    updatedAt: r.updatedAt == null ? null : new Date(r.updatedAt).toISOString(),
+    // Absent means the reader was never given a narrowed script, so nothing could have been
+    // excluded — `true` is the honest default rather than a hedge.
+    scored: r.scored ?? true,
     extras: r.extras ?? null,
   };
 }

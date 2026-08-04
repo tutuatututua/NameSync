@@ -39,6 +39,14 @@ services:
       FACEBOOK_WEBHOOK_URL: ${FACEBOOK_WEBHOOK_URL:-}
       WEBHOOK_CALLBACK_URL_BASE: ${WEBHOOK_CALLBACK_URL_BASE:-}
       CALLBACK_TOKEN: ${CALLBACK_TOKEN:-}
+      # Center sign-in. Without these the container has no Center to talk to and every
+      # attempt fails with "Center sign-in is temporarily unavailable" — which is exactly
+      # what happened before they were added: the values were in code/.env, but nothing
+      # forwarded them into the container. Production REQUIRES this (or SMTP_HOST) to boot.
+      CENTER_PLAYME_URL: ${CENTER_PLAYME_URL:-}
+      # Optional. center.ts omits the field when this is empty, because Center rejects a
+      # login carrying an unexpected group id — so blank is meaningfully different from zero.
+      CENTER_GROUP_IAM2_ID: ${CENTER_GROUP_IAM2_ID:-}
     ports:
       - "4000:4000"
     volumes:
@@ -60,6 +68,10 @@ services:
         # so LAN visitors reaching the site by IP also reach the API by that IP.
         NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-}
         NEXT_PUBLIC_WS_BASE_URL: ${NEXT_PUBLIC_WS_BASE_URL:-}
+        # Empty => the login form drives Center, which is the production path and needs
+        # CENTER_PLAYME_URL on the api service. `local` switches it to Network Intel's own
+        # password + emailed-code sign-in. The LAN profile sets it in the override file.
+        NEXT_PUBLIC_AUTH_MODE: ${NEXT_PUBLIC_AUTH_MODE:-}
     ports:
       - "3000:3000"
     depends_on:

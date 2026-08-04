@@ -1,0 +1,207 @@
+================================================================================
+WORK LOG — Monday 3 August 2026
+NameSync / Network Intel
+================================================================================
+
+HOW THIS WAS COMPILED
+  Nothing was committed today (`git log --since="2026-08-03"` is empty), so the
+  whole day is sitting uncommitted in the working tree. The tree also holds work
+  from earlier days, so the day's work was separated out by file modification
+  time: 58 of the changed paths were last written today, between 09:50 and 17:30.
+  The four new migration scripts are all dated 2026-08-03, which corroborates it.
+
+TOTALS IN THE WORKING TREE
+  65 tracked files modified      +9,042 / -1,430 lines
+   1 tracked file deleted        code/frontend/components/results/RunOutcome.tsx
+  25 new untracked files         (incl. 4 migrations in code/api/docs/migrations/)
+   0 commits
+
+
+--------------------------------------------------------------------------------
+1. SCHEMA MIGRATIONS — four scripts written today
+--------------------------------------------------------------------------------
+   code/api/docs/migrations/
+
+   2026-08-03-drop-upload-source-is-seeded.sql          (14:09)
+     Drops lakeshore.upload_source.is_seeded. The flag made 'business card',
+     'facebook' and 'linkedin' undeletable through the API; it had no teeth
+     because no foreign key points at the table and UploadSourceModel.list
+     unions the seeded rows with the values actually in use. Every entry is
+     deletable now, with the per-entry use count as the guard rail.
+
+   2026-08-03b-backfill-comparison-result-friend-names.sql   (14:28)
+     PHASE 1 of 2, non-destructive. Moves comparison_result.friend_name into
+     friend_name_en / friend_name_th, routing by script (Thai block U+0E00–U+0E7F
+     → th, otherwise en) — the same rule the importer's routeFriendNames applies.
+     Only ever fills a NULL, so a matcher-supplied spelling always wins. Reports
+     the count of still-stranded rows via RAISE NOTICE so it can be eyeballed
+     before anything is dropped.
+
+   2026-08-03c-drop-comparison-result-friend-name.sql        (14:29)
+     PHASE 2, irreversible. Drops comparison_result.friend_name, but ENFORCES the
+     precondition rather than documenting it: raises and rolls back if any row
+     would lose its only name. Documents what is lost (which spelling a run
+     scored is now inferred from comparison.compare_by) and the one external
+     breakage — the external matcher's direct INSERT names friend_name and will
+     fail after this; the HTTP callback path is unaffected.
+
+   2026-08-03d-comparison-sources.sql                        (15:59)
+     comparison.source (varchar, never written by anything) → comparison.sources
+     (text[]). Adds idx_friend_source ON friend (lower(source)) for the matcher's
+     new WHERE clause. NULL means "every source", matching the selected_companies
+     convention; guarded so it refuses the drop if any row does carry a value.
+
+
+--------------------------------------------------------------------------------
+2. NEW FEATURE — compare sources ("which friends is this run about?")
+--------------------------------------------------------------------------------
+   The third run axis, beside compare_by's language and name-part. Before today
+   FriendModel.findAllForMatching had no WHERE clause, so every run scored every
+   friend on file — Facebook, LinkedIn and business cards pooled into one verdict.
+
+   contract   code/extensions/contract/src/compare-sources.ts  (new)
+              normalizeSources / sourcesEqual / sourceInRun / sourcesLabel /
+              ALL_SOURCES_LABEL. Free text, not an enum — the vocabulary is
+              user-extensible. Empty array collapses to null at the boundary.
+   api        matcher.service.ts, friend.model.ts, comparison.model.ts,
+              comparisons.route.ts, db.types.ts
+   frontend   components/source-picker.tsx  (new) — the pick list in the dialog
+              components/sources-badge.tsx  (new) — the chip on a finished run,
+              deliberately never absent, so "unlabelled" can't read as "not
+              narrowed"
+              NewComparisonDialog.tsx, RecentRuns.tsx, RunRows.tsx
+   tests      code/api/test/compare-sources.test.ts  (new, ~25 cases)
+
+
+--------------------------------------------------------------------------------
+3. NEW FEATURE — user-managed upload sources
+--------------------------------------------------------------------------------
+   api        src/models/upload-source.model.ts   (new)
+              src/routes/upload-sources.route.ts  (new) — GET / POST / DELETE
+              registered in src/app.ts
+   frontend   components/upload/TypePicker.tsx    (new) — pick the import's
+              source, or add one that wasn't on the list
+              hooks: useUploadSources, useAddUploadSource, useRemoveUploadSource
+   contract   uploads.ts (+231) — UploadSourceSchema, UploadSourcesDataSchema,
+              CreateUploadSourceBodySchema
+
+
+--------------------------------------------------------------------------------
+4. NEW FEATURE — display threshold on the Network workspace
+--------------------------------------------------------------------------------
+   An explicit, per-request re-read of finished runs at a bar the reader picks.
+   Writes nothing; the stored status stays each matcher's verdict.
+
+   contract   code/extensions/contract/src/threshold.ts  (new)
+              THRESHOLD_MIN/MAX, ThresholdSchema, regradeVerdict, formatThreshold
+   api        regradeVerdictSql / regradedStatusSql in row-status.ts; threshold
+              plumbed through network.model.ts, comparison-result.model.ts and
+              the network + comparisons routes
+              NEW ENDPOINT: GET /api/network/grading — how many stored results
+              carry a score vs. how many exist (NetworkModel.gradingCoverage)
+   frontend   hooks/useThreshold.ts  (new) — the bar lives in the URL, so it
+              survives reload, can be shared, and travels through drill-down
+              links via withThreshold()
+              components/network/NetworkThreshold.tsx  (new) — the slider panel
+              OverviewTab / SearchTab / UploadersTab now take a threshold prop
+   tests      code/api/test/threshold.test.ts  (new, ~23 cases) — pins that the
+              tally, the filter, each row's badge and the headline all describe
+              the same bar, and that an un-thresholded read is byte-identical to
+              the old behaviour
+
+
+--------------------------------------------------------------------------------
+5. BILINGUAL FRIENDS / FRIEND IDENTITY
+--------------------------------------------------------------------------------
+   api        src/models/friend-identity.ts  (new)
+              scoredNameSql / otherNameSql / sameFriendSql — resolving a result
+              row back to a friend now that friend_name is gone
+              friend.model.ts (+782), file-parser.service.ts (+341),
+              name-cleaner.service.ts, company-contact.model.ts, table-registry.ts
+   rules      the run's mode decides what is SCORED, never what is STORED; a row
+              is dropped at import only when BOTH language columns are null;
+              enrichment fills a null spelling and never overwrites one
+   tests      code/api/test/bilingual-friends.test.ts  (new, ~16 cases)
+              code/api/test/owner-and-compare-by.test.ts (new, ~20 cases)
+   contract   compare-by.ts (new file, language × name-part axes)
+
+
+--------------------------------------------------------------------------------
+6. FRONTEND CONSOLIDATION
+--------------------------------------------------------------------------------
+   Extracted to shared components so the same fact is worded the same way on
+   every surface:
+     components/provenance.tsx    (new) — owner + importer strip; the company
+                                          page and the run rows had drifted into
+                                          two vocabularies
+     components/score.tsx         (new)
+     components/marked-name.tsx   (new)
+     components/compare-mode.tsx  (new)
+     components/network/match-grade.tsx    (new)
+     components/network/ConnectionCard.tsx (new)
+   Deleted: components/results/RunOutcome.tsx
+   Heavily rewritten: RunRows.tsx (+1,117/-…), ImportReview.tsx (+711),
+     uploaders/[name]/page.tsx (+425), companies/[name]/page.tsx (+239),
+     UploadFilters.tsx, Verdict.tsx, KnownByBadge.tsx, stat-tile.tsx,
+     hooks/{queries,mutations,queryKeys}.ts, lib/api/client.ts
+
+
+--------------------------------------------------------------------------------
+7. DOCS
+--------------------------------------------------------------------------------
+   code/api/docs/EXTERNAL-MATCHER.md   +328   (17:23)
+   code/api/docs/schema-redesign.sql   +202   (15:59)
+   code/docs/DB.md                      +64   (16:29)
+   code/README.md                       +11   (10:38)
+   code/api/docs/seed-demo.sql           +9   (14:35)
+
+
+--------------------------------------------------------------------------------
+8. LOCAL / LAN ACCESS
+--------------------------------------------------------------------------------
+   code/docker-compose.override.yml  (09:50)
+     Added CORS_ORIGIN "http://localhost:3000,http://192.168.8.103:3000" so a
+     phone or laptop on the same Wi-Fi can reach the app. AUTH_DISABLED alone was
+     not enough: the cross-origin /me call was blocked, AuthProvider read that as
+     "not signed in", and AuthGuard bounced to /login. Also wrote the
+     restore-login instructions into the file header.
+     NOTE: the IP is DHCP-assigned — if the host's address changes, update it
+     here and recreate the api container.
+
+
+--------------------------------------------------------------------------------
+9. COPY CHANGES
+--------------------------------------------------------------------------------
+   app/layout.tsx        page description → "Find who on your team can introduce
+                         you — company data matched against friends."
+   components/nav-items.ts   "Company / Facebook Data" → "Company data / Friends"
+
+
+--------------------------------------------------------------------------------
+10. TESTS ADDED TO EXISTING SUITES
+--------------------------------------------------------------------------------
+   network.test.ts          +402
+   unit.test.ts             +184
+   helpers.ts                +93
+   flow.test.ts              +76
+   mockWebhook.ts            +55
+   external-matcher.test.ts, db-console.test.ts also touched
+   (Not run as part of writing this log — the API suite needs the hand-started
+   Postgres on :55432 and --no-file-parallelism.)
+
+
+--------------------------------------------------------------------------------
+OPEN ITEM NOTED TODAY
+--------------------------------------------------------------------------------
+   The Match threshold panel shows "—" instead of a percentage on the local
+   environment. Not a bug: NetworkThreshold withholds the number when the
+   coverage read returns scored = 0, because printing "80%" beside "nothing here
+   can be re-graded" would contradict itself. The cause is upstream — every
+   comparison_result row in that database was written with a NULL similarity by
+   the external matcher. Needs a run through the internal matcher to produce
+   scored rows.
+
+   Before deploying 2026-08-03c: coordinate with whoever owns the external
+   matcher's direct INSERT — it names friend_name and will start failing.
+
+================================================================================

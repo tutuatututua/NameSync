@@ -21,6 +21,7 @@ import dbRoutes from "./routes/db.route";
 import healthRoutes from "./routes/health.route";
 import comparisonsRoutes from "./routes/comparisons.route";
 import networkRoutes from "./routes/network.route";
+import uploadSourcesRoutes from "./routes/upload-sources.route";
 import callbacksRoutes from "./routes/callbacks.route";
 import sessionsRoutes from "./routes/sessions.route";
 import uploadSessionsRoutes from "./routes/upload-sessions.route";
@@ -110,6 +111,8 @@ export async function buildApp(): Promise<FastifyInstance> {
   // /api/upload-history is gone too: it served the same `upload` rows as /api/upload-sessions,
   // renamed and with status+undo dropped. One import, one record.
   await app.register(uploadSessionsRoutes, { prefix: "/api/upload-sessions" });
+  // The import "type" pick-list — the starting + user-added values of `upload.source`.
+  await app.register(uploadSourcesRoutes, { prefix: "/api/upload-sources" });
   await app.register(dbRoutes, { prefix: "/api/db" });
   await app.register(wsRoutes);
 

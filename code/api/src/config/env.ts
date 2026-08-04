@@ -122,6 +122,12 @@ const EnvSchema = z.object({
   // SMTP_USER when unset. Required (as itself or SMTP_USER) once SMTP_HOST is set.
   SMTP_FROM: z.string().optional(),
 
+  // A file to append unsent sign-in codes to when SMTP is NOT configured — on top of the log
+  // line, which dies with the container and so cannot be relied on across a rebuild. Point it
+  // somewhere persistent (e.g. /data/otp-codes.log, on the api-data volume). Dev only: the
+  // mailer refuses to reach this path in production. Unset = log only, as before.
+  OTP_DEV_SINK: z.string().optional(),
+
   // How long an emailed code is good for, and how many wrong guesses it survives before it
   // is burned. Short + few is the whole security of a 6-digit code.
   OTP_TTL_MINUTES: z.coerce.number().int().positive().max(60).default(10),

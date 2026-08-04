@@ -6,9 +6,12 @@ import { Building2, Search, Users } from "lucide-react";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { PageHeader } from "@/components/page-header";
+import { NetworkThreshold } from "@/components/network/NetworkThreshold";
 import { OverviewTab } from "@/components/network/OverviewTab";
 import { SearchTab } from "@/components/network/SearchTab";
 import { UploadersTab } from "@/components/network/UploadersTab";
+import { useNetworkGrading } from "@/hooks/queries";
+import { thresholdParam, useThreshold } from "@/hooks/useThreshold";
 
 /**
  * Network — the app's home, and its two everyday jobs in one place.
@@ -34,6 +37,15 @@ import { UploadersTab } from "@/components/network/UploadersTab";
  * place a run is watched — so a run has a single home, not three.
  *
  * The tab lives in the URL (`?tab=`), so it's linkable and the back button works.
+ *
+ * ── The match threshold sits above the tabs, not inside one ──
+ *
+ * It grades the same thing on all three — a stored result row — so a copy per tab would be three
+ * controls that had to be kept in step, and a bar set on Company that reverted on Search would make
+ * the two tabs disagree about the same database. Above the rail it is visibly a property of the
+ * WORKSPACE, which is what it is: it rides in this page's URL (`?threshold=`) and is handed to each
+ * tab, which passes it to its query and hangs it on every link it draws out to a company or roster
+ * page. See `useThreshold`.
  */
 
 // Left-to-right: Company · Relationship owners · Search. "company" is the home tab (the URL default), so it
@@ -58,10 +70,23 @@ function NetworkWorkspace() {
   const searchParams = useSearchParams();
   const tabParam = searchParams.get("tab");
   const activeTab: TabValue = TABS.includes(tabParam as TabValue) ? (tabParam as TabValue) : DEFAULT_TAB;
+  const [threshold, setThreshold] = useThreshold();
+  // What the bar can actually move. Read here, beside the control, rather than inside a tab: it
+  // describes the whole result table, so it is the same answer at every roster and every bar.
+  const grading = useNetworkGrading();
 
   function onTabChange(next: string) {
-    // Company is the default, so it needs no param.
-    router.replace(next === DEFAULT_TAB ? "/" : `/?tab=${next}`);
+    // The bar survives a tab change — it is a property of the workspace, and dropping it here would
+    // make switching tabs a silent reset. Rebuilt from the current params rather than appended, so
+    // `?q=` (the deep link into Search) is not carried onto a tab that has no use for it.
+    const sp = new URLSearchParams();
+    if (next !== DEFAULT_TAB) sp.set("tab", next);
+    // Through the same spelling every link uses: null is `off`, the default bar is left off the URL
+    // entirely. Writing `String(threshold)` here would put `off` on the URL as "null".
+    const param = thresholdParam(threshold);
+    if (param !== null) sp.set("threshold", param);
+    const q = sp.toString();
+    router.replace(q ? `/?${q}` : "/");
   }
 
   return (
@@ -69,6 +94,14 @@ function NetworkWorkspace() {
       <PageHeader
         title="Network"
         description="See who your friends connect to, or look someone up by name."
+      />
+
+      {/* Above the tabs because it grades all three of them — see the file header. */}
+      <NetworkThreshold
+        value={threshold}
+        onChange={setThreshold}
+        scored={grading.data?.scored}
+        results={grading.data?.results}
       />
 
       <Tabs value={activeTab} onValueChange={onTabChange}>
@@ -85,20 +118,20 @@ function NetworkWorkspace() {
         </TabsList>
 
         <TabsContent value="company">
-          <OverviewTab />
+          <OverviewTab threshold={threshold} />
         </TabsContent>
         <TabsContent value="uploaders">
-          <UploadersTab />
+          <UploadersTab threshold={threshold} />
         </TabsContent>
         <TabsContent value="search">
-          <SearchTab />
+          <SearchTab threshold={threshold} />
         </TabsContent>
       </Tabs>
     </div>
   );
 }
 
-/** The page's resting shape, for the Suspense boundary — header + the tab rail. */
+/** The page's resting shape, for the Suspense boundary — header, the bar, then the tab rail. */
 function NetworkSkeleton() {
   return (
     <div className="space-y-8">
@@ -106,6 +139,7 @@ function NetworkSkeleton() {
         <Skeleton className="h-8 w-40" />
         <Skeleton className="h-5 w-96 max-w-full" />
       </div>
+      <Skeleton className="h-[132px] rounded-lg" />
       <Skeleton className="h-9 w-52" />
       <div className="grid gap-3 sm:grid-cols-3">
         <Skeleton className="h-[92px] rounded-lg" />

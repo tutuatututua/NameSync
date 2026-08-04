@@ -3,7 +3,7 @@
 import * as React from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { useQueryClient } from "@tanstack/react-query";
-import type { AuthUser, TwoFactorMethod } from "@extensions/contract";
+import { hasFullAccess, isReviewerOnly, type AuthUser, type TwoFactorMethod } from "@extensions/contract";
 import { api, ApiError } from "@/lib/api/client";
 import { setUnauthorizedHandler } from "@/lib/auth/session";
 
@@ -186,3 +186,26 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
 /** True when an error is the API's "not signed in" answer. */
 export const isUnauthorized = (err: unknown): boolean => err instanceof ApiError && err.status === 401;
+
+/** True when an error is the API's "your role doesn't allow that" answer. */
+export const isForbidden = (err: unknown): boolean => err instanceof ApiError && err.status === 403;
+
+/**
+ * What the signed-in account may do — the one place components ask.
+ *
+ * `canWrite` is the question nearly every caller actually has: should this button exist at
+ * all? Reviewers get a read-only app, so an import control, a "New comparison" trigger or a
+ * delete is hidden rather than shown-and-then-403'd. Hiding is a courtesy; the API is the
+ * enforcement (see api/src/lib/roles.ts).
+ *
+ * While `loading` is true nobody has any permission yet. That defaults to hiding write
+ * controls for a beat rather than flashing them and snatching them away.
+ */
+export function usePermissions(): { canWrite: boolean; isReviewer: boolean; roles: string[] } {
+  const { user } = useAuth();
+  const roles = React.useMemo(() => user?.roles ?? [], [user]);
+  return React.useMemo(
+    () => ({ canWrite: hasFullAccess(roles), isReviewer: isReviewerOnly(roles), roles }),
+    [roles]
+  );
+}

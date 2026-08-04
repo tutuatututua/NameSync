@@ -60,12 +60,55 @@ export function startMockWebhook(port: number): Promise<MockServer> {
     });
   });
 
-  return new Promise((resolve) => {
-    server.listen(port, "127.0.0.1", () => {
-      resolve({
-        state,
-        close: () => new Promise<void>((r) => server.close(() => r())),
+  const handle: MockServer = {
+    state,
+    // `closeAllConnections` first, because `close` alone stops only NEW connections and then waits
+    // for the live ones to end — and Node's fetch keeps sockets alive, so the callback can hang
+    // well past the end of the file that opened it.
+    close: () =>
+      new Promise<void>((r) => {
+        server.closeAllConnections();
+        server.close(() => r());
+      }),
+  };
+
+  /**
+   * Bind, and keep trying briefly if the port is still held.
+   *
+   * Every integration file starts one of these on the same port (`MOCK_PORT`), because `setup.ts`
+   * points both webhook URLs at it before any module is imported. Files run one at a time
+   * (`fileParallelism: false`) — but in SEPARATE FORKS, and a fork that has finished its last test
+   * is not necessarily a fork the OS has finished reclaiming sockets from. So the next file can
+   * reach `listen()` while 8199 is still held by a process on its way out.
+   *
+   * It used to resolve only from the `listening` callback with no `error` handler at all, which
+   * turned that race into the worst possible symptom: the promise never settled, `beforeAll` sat
+   * there until the 30s hook timeout, the suite was reported as failing to start, and the actual
+   * EADDRINUSE arrived separately as an unhandled error blamed on whichever file was unlucky. A
+   * short retry absorbs the handover; anything that survives it rejects immediately and says why.
+   */
+  const ATTEMPTS = 20;
+  const RETRY_MS = 100;
+
+  return new Promise((resolve, reject) => {
+    let left = ATTEMPTS;
+
+    const attempt = (): void => {
+      server.once("error", (err: NodeJS.ErrnoException) => {
+        if (err.code === "EADDRINUSE" && --left > 0) {
+          setTimeout(attempt, RETRY_MS);
+          return;
+        }
+        reject(err);
       });
-    });
+      server.listen(port, "127.0.0.1", () => {
+        // Drop the retry handler once bound, so a LATER runtime error on this server is not
+        // mistaken for a failed bind and silently swallowed by a retry that can never help.
+        server.removeAllListeners("error");
+        resolve(handle);
+      });
+    };
+
+    attempt();
   });
 }
