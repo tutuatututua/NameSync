@@ -8,6 +8,14 @@ import type {
   CenterLoginBody,
   CenterLoginData,
   CreateUserBody,
+  TwoFactorReauthBody,
+  TwoFactorReauthData,
+  TwoFactorStatusData,
+  TwoFactorSetupData,
+  TwoFactorEnableBody,
+  TwoFactorEnableData,
+  TwoFactorSmsSendBody,
+  TwoFactorSmsSendData,
   CreateSavedQueryBody,
   DbRow,
   DbTablesData,
@@ -153,7 +161,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     // disabled. Tell the auth layer once, from the one place every request passes through,
     // rather than making every caller remember to handle it. The sign-in endpoints are the
     // exception: a 401 there is "wrong password", which the form shows inline.
-    if (res.status === 401 && path !== "/auth/center/login") {
+    // The 2FA endpoints are the other exception: a 401 there means the short re-auth window
+    // lapsed, NOT that the session is gone. Bouncing to /login would be wrong — the settings
+    // page handles it by asking the user to confirm their password again, inline.
+    if (res.status === 401 && path !== "/auth/center/login" && !path.startsWith("/auth/2fa/")) {
       notifyUnauthorized();
     }
 
@@ -240,6 +251,42 @@ export const api = {
       request<Envelope<AuthUser>>("/auth/users", { method: "POST", body: JSON.stringify(body) }).then(
         (r) => r.data
       ),
+
+    /**
+     * Manage the signed-in user's Center two-factor auth, without leaving Network Intel. The
+     * API proxies Center; everything past `reauth` needs the window `reauth` opens (confirm the
+     * Center password once). `reauth` returns the current 2FA state, or a challenge if the
+     * account already has 2FA on — then call it again with the code.
+     */
+    twoFactor: {
+      reauth: (body: TwoFactorReauthBody) =>
+        request<Envelope<TwoFactorReauthData>>("/auth/2fa/reauth", {
+          method: "POST",
+          body: JSON.stringify(body),
+        }).then((r) => r.data),
+      status: () =>
+        request<Envelope<TwoFactorStatusData>>("/auth/2fa/status").then((r) => r.data),
+      setupTotp: () =>
+        request<Envelope<TwoFactorSetupData>>("/auth/2fa/totp/setup", { method: "POST" }).then((r) => r.data),
+      enableTotp: (body: TwoFactorEnableBody) =>
+        request<Envelope<TwoFactorEnableData>>("/auth/2fa/totp/enable", {
+          method: "POST",
+          body: JSON.stringify(body),
+        }).then((r) => r.data),
+      sendSmsCode: (body: TwoFactorSmsSendBody) =>
+        request<Envelope<TwoFactorSmsSendData>>("/auth/2fa/sms/send-code", {
+          method: "POST",
+          body: JSON.stringify(body),
+        }).then((r) => r.data),
+      enableSms: (body: TwoFactorEnableBody) =>
+        request<Envelope<TwoFactorEnableData>>("/auth/2fa/sms/enable", {
+          method: "POST",
+          body: JSON.stringify(body),
+        }).then((r) => r.data),
+      disable: () =>
+        request<Envelope<TwoFactorStatusData>>("/auth/2fa/disable", { method: "POST" }).then((r) => r.data),
+      end: () => request<{ success: true; message: string }>("/auth/2fa/end", { method: "POST" }),
+    },
   },
   comparisons: {
     /**

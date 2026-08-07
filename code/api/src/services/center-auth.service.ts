@@ -1,6 +1,13 @@
 import type { TwoFactorChallenge } from "@extensions/contract";
 import { Forbidden, Unauthorized } from "../lib/errors";
-import { centerLogin, centerMe, centerSendEmailOtp, centerSendSmsOtp, type CenterCredentials } from "../lib/center";
+import {
+  centerLogin,
+  centerMe,
+  centerSendEmailOtp,
+  centerSendSmsOtp,
+  type CenterCredentials,
+  type CenterProfile,
+} from "../lib/center";
 import { UserModel } from "../models";
 import {
   checkLoginThrottle,
@@ -102,4 +109,60 @@ export async function signInWithCenter(input: CenterSignInInput): Promise<Center
   // Center accepted them AND they are authorised here — the slate is clean.
   clearLoginThrottle(input.email, ip);
   return { kind: "session", session: await issueSession(user, input.meta) };
+}
+
+// ── Re-authentication (for a sensitive action, e.g. managing 2FA) ──────────────
+// Same handshake as signing in, but it stops one step short: instead of minting a Network
+// Intel session it hands the caller the live Center token + profile, so the 2FA proxy can call
+// Center on the user's behalf and then discard the token. See services/two-factor.service.ts.
+
+export type CenterReauthResult =
+  | { kind: "token"; token: string; profile: CenterProfile }
+  | { kind: "twoFactor"; challenge: TwoFactorChallenge };
+
+/**
+ * Prove the user's Center password again (plus their current second factor, if the account
+ * already has one) and return the resulting Center token. `email` comes from the signed-in
+ * session, never from the client, so a caller cannot re-authenticate as someone else — they
+ * supply only the password and, on the second step, the challenge code.
+ *
+ * The same authorisation gate as sign-in applies: an account Center accepts but Network Intel
+ * has no active row for is refused here too, so a lapsed user can't reach the 2FA controls.
+ */
+export async function reauthenticateWithCenter(input: CenterSignInInput): Promise<CenterReauthResult> {
+  const ip = input.meta?.ip;
+  checkLoginThrottle(input.email, ip);
+
+  let result;
+  try {
+    result = await centerLogin(toCredentials(input));
+  } catch (err) {
+    if (err instanceof Unauthorized) recordLoginFailure(input.email, ip);
+    throw err;
+  }
+
+  // Account already has 2FA on (the disable / switch case): Center demands the current factor.
+  // Relay the challenge exactly as sign-in does, sending the out-of-band code where needed.
+  if (result.kind === "twoFactor") {
+    if (result.method === "email") await centerSendEmailOtp(input.email);
+    else if (result.method === "sms") await centerSendSmsOtp(input.email);
+    return {
+      kind: "twoFactor",
+      challenge: { twoFactorRequired: true, method: result.method, ref: result.ref },
+    };
+  }
+
+  if (result.requiredReset) {
+    throw new Forbidden("Your Center password has expired. Please reset it in Center, then sign in again.");
+  }
+
+  const profile = await centerMe(result.token);
+  const email = profile.email ?? input.email;
+  const user = await UserModel.findByEmail(email);
+  if (!user || !user.is_active) {
+    throw new Forbidden("This account isn't authorised for Network Intel.");
+  }
+
+  clearLoginThrottle(input.email, ip);
+  return { kind: "token", token: result.token, profile };
 }

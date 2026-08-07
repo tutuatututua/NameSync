@@ -123,3 +123,81 @@ export type CenterLoginData = z.infer<typeof CenterLoginDataSchema>;
  * it emailed itself. Center generates and sends any second factor now, so nothing here
  * mints a code.
  */
+
+// ── Managing 2FA from settings (proxying Center) ───────────────────────────────
+// A signed-in user can turn their Center authenticator (TOTP) on/off from Network Intel's
+// settings, without visiting Center. The API proxies Center's own TOTP endpoints, gated behind
+// a re-authentication window: the user confirms their Center password once (POST /2fa/reauth),
+// which unlocks the rest for a few minutes. See api/src/services/two-factor.service.ts.
+
+/** Which second factor the account currently has active. `sms` is read-only in v1 (enrol/disable is TOTP). */
+export const TwoFactorMethodStateSchema = z.enum(['none', 'totp', 'sms']);
+export type TwoFactorMethodState = z.infer<typeof TwoFactorMethodStateSchema>;
+
+/**
+ * Confirm the Center password to open the management window. If the account already has 2FA on,
+ * Center demands the current factor first, so this answers with a challenge (like login) and the
+ * client calls again with `code` (+ `ref` for an emailed/texted code).
+ */
+export const TwoFactorReauthBodySchema = z.object({
+  password: z.string().min(1, 'Password is required'),
+  /** The current second-factor code, on the second step when the account already has 2FA. */
+  code: z.string().min(1).max(12).optional(),
+  method: TwoFactorMethodSchema.optional(),
+  ref: z.string().optional(),
+});
+export type TwoFactorReauthBody = z.infer<typeof TwoFactorReauthBodySchema>;
+
+/** `{ method }` — the current 2FA state once the window is open. Also what /2fa/status returns. */
+export const TwoFactorStatusDataSchema = z.object({ method: TwoFactorMethodStateSchema });
+export type TwoFactorStatusData = z.infer<typeof TwoFactorStatusDataSchema>;
+
+/**
+ * Reauth answers with either a 2FA challenge or the opened window's status (`{ method }`).
+ *
+ * ORDER MATTERS — the challenge MUST come first. `TwoFactorStatusDataSchema` is `{ method }`,
+ * and the challenge `{ twoFactorRequired, method, ref }` also carries a `method`, so the
+ * challenge parses cleanly as a status (Zod strips the extra keys). This schema is used to
+ * SERIALIZE the response (fastify-type-provider-zod), and a Zod union serializes with the
+ * first member that matches. With status first, every challenge was silently flattened to
+ * `{ method }` — `twoFactorRequired`/`ref` dropped — so the client never saw the challenge,
+ * skipped the code step, and hit a window that was never opened. Challenge-first fixes it: a
+ * plain `{ method }` status still fails the challenge's required `twoFactorRequired` and falls
+ * through correctly. Do not reorder.
+ */
+export const TwoFactorReauthDataSchema = z.union([TwoFactorChallengeSchema, TwoFactorStatusDataSchema]);
+export type TwoFactorReauthData = z.infer<typeof TwoFactorReauthDataSchema>;
+
+/** Enrolment start: the secret to key in by hand and the `otpauth://` URL to render as a QR. */
+export const TwoFactorSetupDataSchema = z.object({
+  secret: z.string(),
+  otpauthUrl: z.string(),
+});
+export type TwoFactorSetupData = z.infer<typeof TwoFactorSetupDataSchema>;
+
+/** Finish enrolment: the code from the authenticator app. */
+export const TwoFactorEnableBodySchema = z.object({
+  code: z.string().min(1, 'Enter the 6-digit code').max(12),
+});
+export type TwoFactorEnableBody = z.infer<typeof TwoFactorEnableBodySchema>;
+
+/** `{ enabled, method }` — whether the code verified, and the resulting state. Used by both
+ *  authenticator and SMS enrolment (the verify step for each returns this). */
+export const TwoFactorEnableDataSchema = z.object({
+  enabled: z.boolean(),
+  method: TwoFactorMethodStateSchema,
+});
+export type TwoFactorEnableData = z.infer<typeof TwoFactorEnableDataSchema>;
+
+/** SMS enrolment step one: the phone to register. Center texts a code to it. */
+export const TwoFactorSmsSendBodySchema = z.object({
+  /** Dialling code without the +, e.g. "66". */
+  phoneCountry: z.string().min(1, 'Country code is required').max(4),
+  /** Digits only; the national number. Light check here — Center is the real validator. */
+  phoneNumber: z.string().min(4, 'Enter a valid phone number').max(20),
+});
+export type TwoFactorSmsSendBody = z.infer<typeof TwoFactorSmsSendBodySchema>;
+
+/** `{ sent }` — the code is on its way; enter it next (TwoFactorEnableBody). */
+export const TwoFactorSmsSendDataSchema = z.object({ sent: z.boolean() });
+export type TwoFactorSmsSendData = z.infer<typeof TwoFactorSmsSendDataSchema>;

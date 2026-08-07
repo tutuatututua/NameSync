@@ -43,6 +43,11 @@ const REVIEWER_ALLOWED: Allowed[] = [
   { method: "GET", path: /^\/api\/auth\/me$/ },
   { method: "POST", path: /^\/api\/auth\/logout$/ },
 
+  // Managing their own two-factor authentication. Like logout, these act on the reviewer's
+  // own account (proxying Center), not on any data, so the read-only boundary doesn't apply.
+  { method: "GET", path: /^\/api\/auth\/2fa\/status$/ },
+  { method: "POST", path: /^\/api\/auth\/2fa\/(reauth|totp\/setup|totp\/enable|sms\/send-code|sms\/enable|disable|end)$/ },
+
   // The Network workspace — the whole point of the role. All six are reads.
   //
   // `owners` joined the list in 2026-08-04, and it is an addition rather than a widening: it serves

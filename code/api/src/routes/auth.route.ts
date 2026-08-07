@@ -8,14 +8,32 @@ import {
   CenterLoginBodySchema,
   CenterLoginDataSchema,
   CreateUserBodySchema,
+  TwoFactorReauthBodySchema,
+  TwoFactorReauthDataSchema,
+  TwoFactorStatusDataSchema,
+  TwoFactorSetupDataSchema,
+  TwoFactorEnableBodySchema,
+  TwoFactorEnableDataSchema,
+  TwoFactorSmsSendBodySchema,
+  TwoFactorSmsSendDataSchema,
   type AuthUser,
 } from "@extensions/contract";
 import { Forbidden, Unauthorized } from "../lib/errors";
 import { ok } from "../lib/http";
-import { bearerToken, clearSessionCookie, SESSION_COOKIE, setSessionCookie } from "../lib/session";
+import { bearerToken, clearSessionCookie, hashToken, SESSION_COOKIE, setSessionCookie } from "../lib/session";
 import { readCookie } from "../lib/cookies";
 import { createUser, logout } from "../services/auth.service";
 import { signInWithCenter } from "../services/center-auth.service";
+import {
+  beginReauth,
+  disableTotp,
+  enableSms,
+  enableTotp,
+  endReauth,
+  getStatus,
+  sendSmsCode,
+  setupTotp,
+} from "../services/two-factor.service";
 import type { SessionUser } from "../lib/session";
 
 /**
@@ -46,6 +64,17 @@ const tokenOf = (req: FastifyRequest): string | undefined =>
 
 /** The client's address, for the throttle key and the session row. */
 const ipOf = (req: FastifyRequest): string | undefined => req.ip;
+
+/**
+ * The key for THIS session's re-auth window (services/two-factor.service.ts). It is the hash
+ * of the session token, so a window one session opened cannot be used by another — and it is
+ * the same value the session is stored under, never something the client can spoof. Falls back
+ * to the user id only when auth is disabled in dev (no token exists), where 2FA can't work anyway.
+ */
+const windowKeyOf = (req: FastifyRequest): string => {
+  const token = tokenOf(req);
+  return token ? hashToken(token) : `user:${req.user?.sub ?? "anon"}`;
+};
 
 export default async function authRoutes(fastify: FastifyInstance): Promise<void> {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
@@ -97,6 +126,8 @@ export default async function authRoutes(fastify: FastifyInstance): Promise<void
   app.post("/logout", { schema: { response: { 200: ApiMessageSchema } } }, async (req, reply) => {
     const token = tokenOf(req);
     if (token) await logout(token);
+    // Drop any open re-auth window too, so a Center token can't outlive the session that opened it.
+    endReauth(windowKeyOf(req));
     clearSessionCookie(reply);
     return { success: true as const, message: "Signed out" };
   });
@@ -111,6 +142,107 @@ export default async function authRoutes(fastify: FastifyInstance): Promise<void
   // POST /change-password went with them. It rotated app_user.password_hash, which nothing
   // reads any more — so it would have offered to change a credential that cannot sign you in,
   // and left the real one (the Center password) untouched. Passwords are changed in Center.
+
+  // ── Manage two-factor authentication (proxying Center) ────────────────────
+  // A signed-in user turns their Center authenticator on/off here without visiting Center.
+  // Everything is gated behind a re-auth window: /reauth confirms the password (and current
+  // factor, if any) and opens the window; the rest act inside it. See two-factor.service.ts.
+  //
+  // These are never public — they run behind the session guard like the rest of the app — so
+  // the user is already known; the password re-confirmation is a second, fresher proof for a
+  // sensitive change, not the primary authentication.
+
+  // Confirm password → open the window. Answers with the current 2FA state, or a challenge if
+  // the account already has 2FA on (then the client calls again with the code).
+  app.post(
+    "/2fa/reauth",
+    { schema: { body: TwoFactorReauthBodySchema, response: { 200: apiSuccess(TwoFactorReauthDataSchema) } } },
+    async (req) => {
+      if (!req.user) throw new Unauthorized("Not signed in");
+      const result = await beginReauth({
+        email: req.user.email,
+        password: req.body.password,
+        code: req.body.code,
+        method: req.body.method,
+        ref: req.body.ref,
+        windowKey: windowKeyOf(req),
+        meta: { userAgent: req.headers["user-agent"], ip: ipOf(req) },
+      });
+      if (result.kind === "twoFactor") return ok(result.challenge);
+      return ok({ method: result.method });
+    }
+  );
+
+  // Re-read the current 2FA state (window must be open).
+  app.get(
+    "/2fa/status",
+    { schema: { response: { 200: apiSuccess(TwoFactorStatusDataSchema) } } },
+    async (req) => {
+      if (!req.user) throw new Unauthorized("Not signed in");
+      return ok({ method: await getStatus(windowKeyOf(req)) });
+    }
+  );
+
+  // Start authenticator enrolment: a fresh secret + its otpauth URL for the QR.
+  app.post(
+    "/2fa/totp/setup",
+    { schema: { response: { 200: apiSuccess(TwoFactorSetupDataSchema) } } },
+    async (req) => {
+      if (!req.user) throw new Unauthorized("Not signed in");
+      return ok(await setupTotp(windowKeyOf(req)));
+    }
+  );
+
+  // Finish enrolment: verify a code from the authenticator (Center activates TOTP on success).
+  app.post(
+    "/2fa/totp/enable",
+    { schema: { body: TwoFactorEnableBodySchema, response: { 200: apiSuccess(TwoFactorEnableDataSchema) } } },
+    async (req) => {
+      if (!req.user) throw new Unauthorized("Not signed in");
+      return ok(await enableTotp(windowKeyOf(req), req.body.code));
+    }
+  );
+
+  // Start SMS enrolment: Center texts a code to the given number.
+  app.post(
+    "/2fa/sms/send-code",
+    { schema: { body: TwoFactorSmsSendBodySchema, response: { 200: apiSuccess(TwoFactorSmsSendDataSchema) } } },
+    async (req) => {
+      if (!req.user) throw new Unauthorized("Not signed in");
+      await sendSmsCode(windowKeyOf(req), {
+        phoneCountry: req.body.phoneCountry,
+        phoneNumber: req.body.phoneNumber,
+      });
+      return ok({ sent: true });
+    }
+  );
+
+  // Finish SMS enrolment: verify the texted code (activates SMS 2FA on success).
+  app.post(
+    "/2fa/sms/enable",
+    { schema: { body: TwoFactorEnableBodySchema, response: { 200: apiSuccess(TwoFactorEnableDataSchema) } } },
+    async (req) => {
+      if (!req.user) throw new Unauthorized("Not signed in");
+      return ok(await enableSms(windowKeyOf(req), req.body.code));
+    }
+  );
+
+  // Turn 2FA off.
+  app.post(
+    "/2fa/disable",
+    { schema: { response: { 200: apiSuccess(TwoFactorStatusDataSchema) } } },
+    async (req) => {
+      if (!req.user) throw new Unauthorized("Not signed in");
+      return ok(await disableTotp(windowKeyOf(req)));
+    }
+  );
+
+  // Close the window explicitly (leaving the page / cancelling). Always 200 — closing a window
+  // that is already gone is not an error.
+  app.post("/2fa/end", { schema: { response: { 200: ApiMessageSchema } } }, async (req) => {
+    endReauth(windowKeyOf(req));
+    return { success: true as const, message: "Closed" };
+  });
 
   // ── Create a user ─────────────────────────────────────────────────────────
   // Admins only. There is no public sign-up, by design: Network Intel is an internal tool, so
