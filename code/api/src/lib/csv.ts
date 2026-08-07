@@ -1,6 +1,6 @@
 import fs from 'fs';
 import { BadRequest } from './errors';
-import { assertUniqueHeaders, type Sheet } from './sheet';
+import { assertUniqueHeaders, findHeaderRow, type Sheet } from './sheet';
 
 /**
  * Reads a delimited text file (.csv) into the same headers + rows a workbook reads into.
@@ -37,14 +37,21 @@ function decode(buffer: Buffer): string {
   return buffer.toString('utf8').replace(/^﻿/, '');
 }
 
-/** Which delimiter this file uses: the one that yields the most cells on the header line. Ties go
- *  to the earlier candidate, so a plain comma file is never read as anything else. */
+/** How many lines the delimiter sniff reads. It used to read one — the first — which is the wrong
+ *  line in a file that opens with a preamble (see `findHeaderRow`): a prose line has no separator
+ *  in it at all, so a semicolon-delimited LinkedIn export would have been read as one column. */
+const SNIFF_LINES = 25;
+
+/** Which delimiter this file uses: the one that yields the most cells on any of the first lines.
+ *  Ties go to the earlier candidate, so a plain comma file is never read as anything else. */
 function sniffDelimiter(text: string): string {
-  const header = firstLine(text);
+  const lines = firstLines(text, SNIFF_LINES);
+  const widest = (d: string) => Math.max(...lines.map((l) => splitLine(l, d).length));
+
   let best: string = DELIMITERS[0];
-  let bestCount = splitLine(header, DELIMITERS[0]).length;
+  let bestCount = widest(DELIMITERS[0]);
   for (const d of DELIMITERS.slice(1)) {
-    const count = splitLine(header, d).length;
+    const count = widest(d);
     if (count > bestCount) {
       best = d;
       bestCount = count;
@@ -53,16 +60,23 @@ function sniffDelimiter(text: string): string {
   return best;
 }
 
-/** The header line, respecting quotes — a quoted cell may hold a newline, and the sniff must not
- *  cut the header in half at one. */
-function firstLine(text: string): string {
+/** The first `limit` lines, respecting quotes — a quoted cell may hold a newline, and the sniff
+ *  must not cut a line in half at one. */
+function firstLines(text: string, limit: number): string[] {
+  const lines: string[] = [];
   let quoted = false;
-  for (let i = 0; i < text.length; i++) {
+  let start = 0;
+  for (let i = 0; i < text.length && lines.length < limit; i++) {
     const c = text[i];
     if (c === '"') quoted = !quoted;
-    else if (!quoted && (c === '\n' || c === '\r')) return text.slice(0, i);
+    else if (!quoted && (c === '\n' || c === '\r')) {
+      lines.push(text.slice(start, i));
+      if (c === '\r' && text[i + 1] === '\n') i++;
+      start = i + 1;
+    }
   }
-  return text;
+  if (lines.length < limit && start < text.length) lines.push(text.slice(start));
+  return lines.length > 0 ? lines : [text];
 }
 
 /** One line into cells. Only used for the delimiter sniff; the real parse is `parseRows`. */
@@ -135,7 +149,11 @@ function parseRows(text: string, delimiter: string): string[][] {
 }
 
 /**
- * Read a .csv: row 1 is the header, the rest are data.
+ * Read a .csv: the header row, then the data under it.
+ *
+ * Usually that is row 1, but not always — see `findHeaderRow`, which steps over the `Notes:`
+ * preamble a LinkedIn export opens with. Everything above the header is dropped: it is prose
+ * about the file, not rows of it.
  *
  * Rows that are entirely empty are dropped, exactly as the workbook reader drops them — a trailing
  * blank line is what a text editor hands you for free, and counting it would inflate every
@@ -152,7 +170,8 @@ export async function readCsv(filePath: string): Promise<Sheet> {
   if (text.trim() === '') throw new BadRequest('This CSV file is empty.');
 
   const delimiter = sniffDelimiter(text);
-  const [headerCells = [], ...body] = parseRows(text, delimiter);
+  const grid = parseRows(text, delimiter);
+  const [headerCells = [], ...body] = grid.slice(findHeaderRow(grid));
 
   // A blank header still occupies a column — keep the position so later cells line up with the
   // right header, then drop the blanks from the reported header list.

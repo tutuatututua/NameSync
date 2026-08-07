@@ -2,6 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { ALL_COMPANIES_LABEL, CompareByCompanyBodySchema } from "@extensions/contract";
 import { buildApp } from "../src/app";
+import { ComparisonModel } from "../src/models";
 import { startMockWebhook, type MockServer } from "./mockWebhook";
 import { MOCK_PORT } from "./setup";
 import { importCompany, importFacebook, startCompare, truncateAll } from "./helpers";
@@ -145,15 +146,28 @@ describe("a run over every company", () => {
         headers: { "content-type": "application/json" },
       });
       expect(res.statusCode).toBe(200);
-      return resultsOf(res.json().data.sessionId as string);
+      const id = res.json().data.sessionId as string;
+      return { id, ...(await resultsOf(id)) };
     };
 
     // All three are the same request. If any of them ever diverges, the one that breaks is `[]`,
     // which would reach the matcher as "no contacts" and complete with zero matches and no error.
     for (const body of [{}, { company_names: [] }, { company_names: null }]) {
-      const { selectedCompanies, results } = await send(body);
+      const { id, selectedCompanies, results } = await send(body);
       expect(selectedCompanies).toEqual([]);
       expect(results.map((r) => r.company_name).sort()).toEqual(["Acme Co", "Beta Ltd"]);
+      /**
+       * Cleared before the next spelling is sent, and the deletion is part of the assertion rather
+       * than housekeeping: since 2026-08-06 an identical run is REFUSED while nothing has moved, so
+       * a loop that left its runs behind would 409 on the second body — and would be reporting that
+       * the three spellings agree, which is precisely what it is here to prove. Each iteration
+       * therefore asks its question of a table with no prior run in it.
+       *
+       * Through the MODEL rather than `DELETE /api/comparisons/:id`, which refuses every caller
+       * since 2026-08-07. The endpoint's absence is not what this test is about; it needs an empty
+       * `comparison` table between iterations and this is now the only way to get one.
+       */
+      await ComparisonModel.deleteById(id);
     }
   });
 

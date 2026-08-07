@@ -28,15 +28,15 @@ import { cn } from "@/lib/utils";
  *
  * It writes nothing. The stored `status` on every result row is still the verdict its matcher
  * reached; this asks the server to re-grade the rows on the way out, from the similarity each one
- * already carries, and throws the answer away. Press "Stored verdicts" and the workspace says
+ * already carries, and throws the answer away. Open the workspace at `?threshold=off` and it says
  * exactly what it always said.
  *
  * That distinction is not pedantry. The product spent a schema revision getting OUT of the
  * situation where a threshold re-derived every verdict on every read — a bar that moved silently
  * re-graded history, and two authorities disagreed about what "match" meant (see `regradeVerdict`
  * and schema-redesign.sql). What makes this safe is that it is explicit, per-request and visible:
- * the panel is never dressed as the data's own answer, and the moment it is doing anything the
- * reset affordance is on screen saying so.
+ * the panel is never dressed as the data's own answer, and every paint names the bar it is reading
+ * at and says the stored verdicts are untouched.
  *
  * ── Why it is ON at 80% when the page opens ──
  *
@@ -46,9 +46,16 @@ import { cn } from "@/lib/utils";
  * compare numbers that were not decided alike. 80% is one standard, applied to everything at once.
  *
  * It stays safe because it is still SAID: the panel reads "Every count on this page is read at 80%
- * / The stored verdicts are unchanged" from the first paint, with the reset beside it. The failure
- * being avoided was a bar that re-graded silently — this one is loud, reversible in a click, and
- * writes nothing either way. The server's default is untouched (see `useThreshold`).
+ * / The stored verdicts are unchanged" from the first paint. The failure being avoided was a bar
+ * that re-graded silently — this one is loud, reversible in a click, and writes nothing either way.
+ * The server's default is untouched (see `useThreshold`).
+ *
+ * ── Why nothing offers to undo the default ──
+ *
+ * The reset returns the handle to 80% — the position the page opens in — so on arrival it is an
+ * offer to undo nothing, and a permanently visible undo reads as though something has already been
+ * done to the numbers. It appears once the reader has moved off the default and goes away again
+ * when they come back, which is the only span in which it has anything to say.
  *
  * ── Why it is server-driven ──
  *
@@ -75,9 +82,9 @@ import { cn } from "@/lib/utils";
 
 /**
  * Where the handle parks — and, since the workspace now opens at a bar rather than at the stored
- * verdicts, what the page is read at before anyone touches anything. It lives in `useThreshold`
- * because the URL is what actually carries it: this component would otherwise draw a thumb at 80%
- * over counts the page had fetched at some other bar.
+ * verdicts, what the page is read at before anyone touches anything, and what the reset returns to.
+ * It lives in `useThreshold` because the URL is what actually carries it: this component would
+ * otherwise draw a thumb at 80% over counts the page had fetched at some other bar.
  *
  * Still not a verdict rule, and still not in the contract. The SERVER's default is unchanged — an
  * absent `?threshold=` re-grades nothing — so no stored row means anything different than it did.
@@ -99,7 +106,8 @@ export function NetworkThreshold({
   busy,
 }: {
   /** The bar in effect, or null for the matchers' own verdicts. The page loads at
-   *  `DEFAULT_THRESHOLD`; null is what the reset produces, not where anyone starts. */
+   *  `DEFAULT_THRESHOLD`; null is `?threshold=off`, an explicit opt-out nothing on this panel
+   *  produces — the reset here returns to the default bar, not past it. */
   value: number | null;
   onChange: (next: number | null) => void;
   /** Stored result rows carrying a score — the ones this bar can re-grade. Undefined while the
@@ -171,8 +179,16 @@ export function NetworkThreshold({
     if (timer.current) clearTimeout(timer.current);
     timer.current = null;
     setPosition(RESTING_POSITION);
-    onChange(null);
+    onChange(RESTING_POSITION);
   };
+
+  // Whether the reset has anything to return to. It parks the handle back at the DEFAULT bar rather
+  // than at the matchers' verdicts, so at the default it would undo the position it is already in.
+  // Read off `position` rather than `value` so it follows the handle through a drag instead of the
+  // committed bar a quarter-second behind it — the number beside it is drawn from `position` too,
+  // and the two must not disagree. `value === null` is the case where they part in the other
+  // direction: the opt-out leaves `position` parked at a default the page is not being read at.
+  const offDefault = !nothingToGrade && (value === null || position !== RESTING_POSITION);
 
   // How far along the track the handle is, as a percentage — the filled half of the rail is drawn
   // from it, since a native range input gives no way to style the portion behind the thumb.
@@ -198,12 +214,13 @@ export function NetworkThreshold({
             >
               {grading ? formatThreshold(position) : "—"}
             </span>
-            {/* Only once the workspace is actually re-graded. A permanently visible reset offers to
-                undo nothing, and reads as though something already happened to the numbers. */}
-            {grading && (
+            {/* Only once the reader has moved off the bar the page opens at. A permanently visible
+                reset offers to undo nothing, and reads as though something already happened to the
+                numbers — which, at the default, is precisely the impression to avoid. */}
+            {offDefault && (
               <Button variant="ghost" size="sm" onClick={reset} className="gap-1.5">
                 <RotateCcw className="h-3 w-3" aria-hidden />
-                Stored verdicts
+                Default
               </Button>
             )}
           </div>
@@ -291,19 +308,6 @@ export function NetworkThreshold({
           Rendered only when it is less than all of it: on a fully-scored database the sentence
           would be noise about a non-problem.
         */}
-        {partial && (
-          <p className="flex items-start gap-1.5 text-xs text-muted-foreground">
-            <Info className="mt-0.5 h-3 w-3 shrink-0" aria-hidden />
-            <span>
-              The bar moves{" "}
-              <span className="font-medium text-foreground">
-                {scored!.toLocaleString()} of {results!.toLocaleString()}
-              </span>{" "}
-              stored results — the rest were recorded without a score, so they keep their
-              matcher&apos;s verdict wherever you put it.
-            </span>
-          </p>
-        )}
       </CardContent>
     </Card>
   );

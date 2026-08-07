@@ -8,6 +8,8 @@ import {
   NameSearchQuerySchema,
   NameSearchRowSchema,
   NetworkGradingDataSchema,
+  OwnerOptionsQuerySchema,
+  OwnerOptionsDataSchema,
   UploadersQuerySchema,
   UploadersDataSchema,
   UploaderDetailQuerySchema,
@@ -33,37 +35,68 @@ export default async function networkRoutes(fastify: FastifyInstance): Promise<v
   const app = fastify.withTypeProvider<ZodTypeProvider>();
 
   // GET /api/network/overview — one roster's connections across every company (Feature 1).
-  // `uploader` omitted = everyone. Returns the roster picker's options alongside the tallies, so
-  // the whole tab is one request.
+  // `uploader` omitted = everyone. Returns the tallies plus ONE PAGE of the companies on file, each
+  // carrying the roster's reach into it (0 for the ones it reaches nowhere near): `page` / `limit` /
+  // `company` / `sort` govern that list and nothing else, so the tiles above it hold still while it
+  // is searched and paged. See NetworkOverviewQuerySchema.
   app.get(
     "/overview",
     { schema: { querystring: NetworkOverviewQuerySchema, response: { 200: apiSuccess(NetworkOverviewDataSchema) } } },
     async (req) => {
       const uploader = req.query.uploader ?? null;
       const threshold = req.query.threshold ?? null;
-      const [uploaders, companies, ov] = await Promise.all([
-        // Neither of these takes the bar, and neither should. The picker lists everyone with a
-        // roster (a fact about `friend`), and `companiesOnFile` is the denominator for "companies
-        // known" — a company nobody reaches is still on file, and a bar that shrank the denominator
-        // along with the numerator would hold the ratio suspiciously still.
-        NetworkModel.uploaders(),
+      const { page, limit, sort } = req.query;
+      const [owners, companies, ov] = await Promise.all([
+        // Neither of these takes the bar, and neither should. The owner count is a fact about
+        // `friend`, and `companiesOnFile` is the denominator for "companies known" — a company
+        // nobody reaches is still on file, and a bar that shrank the denominator along with the
+        // numerator would hold the ratio suspiciously still.
+        //
+        // Two COUNTS now, where this used to materialize both lists in full and send one of them.
+        // That is the whole of the change: this handler runs on every drag of the threshold bar,
+        // so anything it does per request has to be O(1) in what it returns. The picker's actual
+        // options come from GET /owners, on demand.
+        NetworkModel.ownerCount(),
         CompanyContactModel.distinctCompanies(),
-        NetworkModel.overview(uploader, threshold),
+        NetworkModel.overview(uploader, threshold, {
+          company: req.query.company ?? null,
+          sort,
+          page,
+          limit,
+        }),
       ]);
-      // Total (person, company) matches — a friend at three companies is three connections. Summed
-      // from `connected`, whose per-company counts are already distinct-by-friend.
-      const connections = ov.connected.reduce((sum, c) => sum + c.connections, 0);
       return ok({
-        uploaders,
+        owners,
         uploader,
         friends: ov.friends,
         friendsMatched: ov.friendsMatched,
         friendsConfirmed: ov.friendsConfirmed,
-        companiesOnFile: companies.length,
-        connections,
+        companiesOnFile: companies.total,
+        // Total (person, company) matches — a friend at three companies is three connections.
+        // Summed in SQL over every company the roster reaches, not over `connected`: that is one
+        // page now, and summing it would report the first twenty companies' matches as the roster's.
+        connections: ov.connections,
+        companiesKnown: ov.companiesKnown,
         connected: ov.connected,
+        connectedPagination: {
+          page,
+          limit,
+          total: ov.connectedTotal,
+          totalPages: Math.ceil(ov.connectedTotal / limit),
+        },
       });
     }
+  );
+
+  // GET /api/network/owners — the roster picker's options, searched and capped.
+  //
+  // Split out of the overview payload (2026-08-04) so a slow-moving list stops being re-sent at the
+  // cadence of the threshold bar, and so the picker can search a table the client cannot hold. See
+  // `OwnerOptionsDataSchema` for the split's reasoning and `total` for why the cap is stated.
+  app.get(
+    "/owners",
+    { schema: { querystring: OwnerOptionsQuerySchema, response: { 200: apiSuccess(OwnerOptionsDataSchema) } } },
+    async (req) => ok(await NetworkModel.uploaders(req.query.q ?? null, req.query.limit))
   );
 
   // GET /api/network/grading — how many stored results carry a score, and how many exist. What the

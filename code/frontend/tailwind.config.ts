@@ -102,6 +102,15 @@ const config: Config = {
           medium: "hsl(var(--confidence-medium))",
           low: "hsl(var(--confidence-low))",
         },
+        // The categorical chart palette — identity, in fixed order. `chart-1` is always the first
+        // series and `chart-2` the second; a filter that drops one must never repaint the other.
+        // Separate from `confidence` on purpose: that ramp means severity, and a series borrowing
+        // a status colour would say something about the data it does not mean.
+        chart: {
+          1: "hsl(var(--chart-1))",
+          2: "hsl(var(--chart-2))",
+          3: "hsl(var(--chart-3))",
+        },
       },
 
       backgroundImage: {

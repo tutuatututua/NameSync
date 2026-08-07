@@ -60,6 +60,31 @@
        The obvious ramp (emerald/olive/amber/red) fails the first: olive and amber collapse to
        ΔE 9 under protanopia. Moving `good` to a true green and darkening `medium` fixes it.
        Re-validate before touching these — `scripts/validate_palette.js` in the dataviz skill. */
+    /* Chart marks — a two-slot CATEGORICAL palette, for the Audit trail's daily series.
+       Identity, not magnitude and not status: `chart-1` is runs and `chart-2` is imports, in that
+       fixed order, and neither is ever reassigned by rank.
+
+       They are near-copies of brand / brand-2 and are NOT those tokens, because brand-2 does not
+       survive being a chart mark. `--brand-2` at 48% light is 2.64:1 on a white card — below the
+       3:1 a mark owes its surface — so a stacked segment carrying it would depend on a label it
+       has no room for. `chart-1` here IS `--brand` exactly; `chart-2` is `--brand-2` darkened
+       three points, which is the whole of the difference in this mode.
+
+       Searched with the same validator as the confidence ramp, hues pinned to the brand's own
+       indigo and cyan so only saturation and lightness moved. Light passes all five checks clean
+       (CVD ΔE 19.3 deutan / 20.6 tritan, both marks ≥ 3:1). Re-validate before touching these:
+       `scripts/validate_palette.js` in the dataviz skill. */
+    --chart-1: 243 62% 54%;
+    --chart-2: 196 84% 45%;
+    /* Slot 3, added for the Network page's name-part ratio (full / name / surname).
+       Magenta because the arc it had to land in was narrow: 243 and 196 are taken, and the
+       confidence ramp owns 154 / 120 / 38 / 346 — a categorical series wearing a status hue reads
+       as good-or-bad. Re-validated as a THREE-slot palette with `--pairs all`, not bolted on: the
+       binding pair became magenta↔indigo under protanopia (ΔE 18.1), which is not the pair the
+       two-slot search was protecting. Saturation kept in the house range rather than at the
+       validator's most-separated 95%, which is louder than anything else in this file. */
+    --chart-3: 325 72% 36%;
+
     --confidence-high: 154 65% 27%;
     --confidence-good: 120 45% 27%;
     --confidence-medium: 38 80% 32%;
@@ -107,6 +132,19 @@
     /* Dark is a *separate* search, not a lightened flip of the light set: the validator's
        dark band (OKLCH L 0.48–0.67) is far narrower than light's, and the instinct to reach
        for bright neon tokens overshoots it. Worst pair here is 15.8 ΔE. */
+    /* Chart marks, dark. A separate search against the dark card (#16161d), not a flip: the
+       light cyan sits at OKLCH L 0.76 and the dark band tops out at 0.67, so the mark that needed
+       *darkening* for contrast on white needs darkening again for the band on near-black — the
+       instinct to brighten it overshoots. Both marks pass all five checks; CVD ΔE 12.6 deutan /
+       12.7 tritan, worst contrast comfortably over 3:1. */
+    --chart-1: 243 80% 66%;
+    --chart-2: 196 89% 45%;
+    /* Slot 3, its own search again — and here the third slot really is the constraint: the worst
+       pair is magenta↔cyan under deuteranopia at ΔE 11.6, well below the 1↔2 gap the light set
+       enjoys. Neighbouring candidates that looked fine (hue 310 at the same lightness) fail it
+       outright at ΔE 6.9, which is why this is a validated value and not "a bit more purple". */
+    --chart-3: 320 72% 46%;
+
     --confidence-high: 166 55% 42%;
     --confidence-good: 88 40% 42%;
     --confidence-medium: 38 75% 44%;

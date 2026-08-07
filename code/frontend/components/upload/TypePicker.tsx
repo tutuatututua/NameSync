@@ -73,7 +73,7 @@ export function TypePicker({
         This field is the PROVENANCE of the file being imported: it is written to `friend.source`
         on every row, permanently, and describes where the data came from. It is not the run's
         `comparison.sources`, which is a per-run choice of which friends to compare and which the
-        Find-connections dialog calls "Whose friends".
+        Find-connections dialog calls "Friend sources".
 
         Both were briefly called "Source" here, which made a permanent property of the data read as
         a setting on this one comparison. They are different fields with different lifetimes and

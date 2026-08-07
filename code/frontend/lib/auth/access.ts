@@ -16,11 +16,17 @@ import { hasFullAccess, isReviewerOnly } from "@extensions/contract";
 
 /**
  * The pages a `reviewer` may open: the Network hub, the company and roster pages its tabs
- * link into, and a past run's results. Everything else — /uploads, /database — is theirs to
- * be redirected away from.
+ * link into, a past run's results, and the Audit trail. Everything else — /uploads, /database —
+ * is theirs to be redirected away from.
+ *
+ * The Audit trail is here because it is a read of aggregate activity: counts, the comparison
+ * vocabulary, and a trail that names only who performed an import. Its two endpoints are on the
+ * matching allowlist in `api/src/lib/roles.ts` — change the two together, or a reviewer gets a page
+ * whose every request 403s.
  */
 const REVIEWER_PAGES: RegExp[] = [
   /^\/$/,
+  /^\/audit\/?$/,
   /^\/companies\/[^/]+\/?$/,
   /^\/uploaders\/[^/]+\/?$/,
   /^\/comparisons\/[^/]+\/?$/,

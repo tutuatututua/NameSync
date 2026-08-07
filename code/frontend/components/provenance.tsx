@@ -1,7 +1,9 @@
+"use client";
+
 import Link from "next/link";
 import { Import, UserRound } from "lucide-react";
 import { sameName } from "@/components/network/KnownByBadge";
-import { withThreshold } from "@/hooks/useThreshold";
+import { useCarriedThreshold, withThreshold } from "@/hooks/useThreshold";
 import { cn } from "@/lib/utils";
 
 /**
@@ -24,32 +26,37 @@ import { cn } from "@/lib/utils";
  * absence reads as "nobody imported this" rather than "the same person did". When neither is on
  * file there is no provenance to render and the strip disappears entirely, which is the one case
  * where saying nothing is the honest answer.
+ *
+ * ── THE WORKSPACE BAR RIDES ON THE OWNER'S LINK, AND IS NOT A PROP (2026-08-07) ──
+ *
+ * It was one. The company page passed the bar it was tuned to and the run row passed nothing —
+ * documented as deliberate, on the grounds that a run is read at its matcher's verdicts and has no
+ * bar to assert. That reasoning was right about the RUN and wrong about the READER: a bar set on
+ * Network, carried into a result, is still the bar that reader is working at, and dropping it here
+ * meant clicking the relationship owner inside a result landed on that roster at the default. The
+ * one promise the control makes — "the bar follows you into a company or a roster" — was broken by
+ * the single link people follow to get to a roster.
+ *
+ * So the strip reads the bar off the URL it is being rendered on (`useCarriedThreshold`) instead of
+ * being told. Nothing to forget at a call site, and no page that draws this can silently disagree
+ * with the page beside it. A URL with no bar on it still carries nothing, which is exactly what a
+ * run page linked to from outside the workspace should do.
  */
 export function Provenance({
   owner,
   uploadedBy,
-  threshold,
   className,
 }: {
   /** `friend.relationship_owner` — the person to ask for the introduction. */
   owner: string | null | undefined;
   /** `upload.uploaded_by` — the person who performed the import. */
   uploadedBy: string | null | undefined;
-  /**
-   * The workspace bar in effect where this strip is being read, hung on the owner's link.
-   *
-   * OMITTED on a surface that has no bar — a run row, which is read at its matcher's verdicts. Not
-   * `null`: null is "show me the stored verdicts", and a run row has no business asserting that
-   * about the roster page it links to. Left off, the link lands on whatever the workspace opens at.
-   *
-   * On the company page it is the bar the reader tuned, and dropping it here was a hole in the one
-   * promise the control makes: the tiles above these cards, the "who can reach this company" links
-   * beside them and the back link all carried it, so the owner's name was the single way out of a
-   * tuned workspace that silently reverted to the matchers' verdicts. See `withThreshold`.
-   */
-  threshold?: number | null;
   className?: string;
 }) {
+  // Hooks before the early return — `useCarriedThreshold` must run on every render, including the
+  // ones where there is no provenance to draw.
+  const threshold = useCarriedThreshold();
+
   if (!owner && !uploadedBy) return null;
 
   // Folded by case, because every owner name in the product is grouped that way — see `sameName`.

@@ -173,6 +173,18 @@
     -- case-insensitively and displayed as written, exactly like company_name, because this
     -- is the string the UI puts in front of someone as "go ask this person".
     relationship_owner varchar(255),
+    -- WHICH PERSON THIS ROW IS ABOUT — one uuid shared by every row that is the same person.
+    --
+    -- Imports STACK: every row of every import is inserted under that import's own upload_id,
+    -- because the external workflow selects what to match with `WHERE upload_id = :session_id`
+    -- and cannot see rows filed under an earlier import. Dedup therefore happens at READ time,
+    -- on this column, rather than at write time by refusing the insert.
+    --
+    -- Assigned at import by the same matching that used to decide whether to skip the row (same
+    -- owner, either spelling equal — the two indexes below are its probe). The DEFAULT covers the
+    -- Database console, which writes this table directly: a hand-added row is its own person,
+    -- where NULL would fold every such row into one.
+    person_key        uuid NOT NULL DEFAULT gen_random_uuid(),
     -- The external workflow's verdict on this row: 'processing' → 'match' | 'unmatch'.
     -- No CHECK on purpose: an unexpected value must not fail the workflow's write, and the
     -- app reads anything other than 'pending'/'processing' as "finished". See
@@ -184,9 +196,14 @@
   CREATE INDEX idx_friend_upload     ON lakeshore.friend (upload_id);       -- rollback / by-upload
   -- "Is this upload still working?" — the poll that decides an import is done.
   CREATE INDEX idx_friend_upload_status ON lakeshore.friend (upload_id, status);
-  -- THE DEDUP KEY: (owner, name), once per spelling. `mergeUpload` probes an incoming row against
-  -- BOTH, because a row matching an existing one on the same owner and EITHER non-null spelling is
-  -- the same friend — that is what makes enrichment work instead of filing one person twice.
+  -- THE IDENTITY PROBE: (owner, name), once per spelling. `mergeUpload` probes an incoming row
+  -- against BOTH, because a row matching an existing one on the same owner and EITHER non-null
+  -- spelling is the same friend — that is what lets it inherit their `person_key` instead of being
+  -- filed as a second person.
+  --
+  -- It used to be the DEDUP key, and decided whether to insert at all. It no longer does: imports
+  -- stack, and the same match now assigns identity rather than refusing the row. Same probe, same
+  -- indexes, different consequence.
   --
   -- Case-folded on the owner because every reader of an owner name folds it, and a key that saw
   -- "Alex" and "alex" as two rosters while the Overview showed them as one is the inconsistency
@@ -203,6 +220,10 @@
   -- the source picker shows beside each option. Folded, because the picker stores 'facebook' and
   -- the Database console can write 'Facebook' into the same column.
   CREATE INDEX idx_friend_source     ON lakeshore.friend (lower(source));
+  -- The read-time fold. On the hot path of every Network query, over a table that now grows with
+  -- each re-import rather than holding one row per person.
+  CREATE INDEX idx_friend_person_key    ON lakeshore.friend (person_key);
+  CREATE INDEX idx_friend_person_recent ON lakeshore.friend (person_key, created_at DESC, id DESC);
 
 
   -- ─────────────────────────────────────────────────────────────
@@ -218,6 +239,12 @@
     company_name         varchar(255),                        -- tidied only; case-preserving
     person_name_th       varchar(255),                        -- cleaned + lower-cased at import
     person_name_en       varchar(255),                        -- cleaned + lower-cased at import
+    -- Which contact this row is about — the company-side twin of friend.person_key, same stacking
+    -- rationale. Scoped WITHIN a company (the same name at two employers is two contacts, not a
+    -- duplicate) and linked on EITHER spelling, which the old tuple key could not do: under it,
+    -- the same person imported once with only the English column mapped and again with only the
+    -- Thai column was two rows, and every count saw two people.
+    person_key           uuid NOT NULL DEFAULT gen_random_uuid(),
     -- Same as friend.status — the workflow's verdict on this row.
     status               text NOT NULL DEFAULT 'processing',
     created_at           timestamptz NOT NULL DEFAULT now(),
@@ -228,6 +255,71 @@
   CREATE INDEX idx_company_contact_upload_status ON lakeshore.company_contact (upload_id, status);
   -- The matcher reads (company_name → both person names) for every compare run.
   CREATE INDEX idx_company_contact_names   ON lakeshore.company_contact (company_name, person_name_th, person_name_en);
+  -- The identity probe, one per spelling — the composite above cannot serve a lookup on ONE name
+  -- column, which is exactly what either-spelling linking needs.
+  CREATE INDEX idx_company_contact_company_en ON lakeshore.company_contact (lower(company_name), person_name_en);
+  CREATE INDEX idx_company_contact_company_th ON lakeshore.company_contact (lower(company_name), person_name_th);
+  -- The read-time fold — see the friend twins.
+  CREATE INDEX idx_company_contact_person_key    ON lakeshore.company_contact (person_key);
+  CREATE INDEX idx_company_contact_person_recent ON lakeshore.company_contact (person_key, created_at DESC, id DESC);
+
+
+  -- ─────────────────────────────────────────────────────────────
+  -- friend_current / company_contact_current: one row per PERSON.
+  -- ─────────────────────────────────────────────────────────────
+  -- Imports stack, so the tables above hold one row per (person, import). These fold them back.
+  --
+  -- WHICH READS USE THESE, AND WHICH MUST NOT — the rule the whole design rests on:
+  --
+  --   · A question about PEOPLE — how many friends are on file, who is in a roster, the company
+  --     picker, the per-source counts — reads the view. Stacked copies are one person.
+  --   · A question about an IMPORT or a RUN — progress, an upload's own rows, the webhook
+  --     payload, rollback — reads the raw table. Those questions are ABOUT the copies, and
+  --     folding them would break progress counting outright: a run's denominator IS its rows.
+  --
+  -- Spellings are COALESCED across the person's rows, not taken from the newest row whole. This is
+  -- what replaces enrichment. A friend imported in English and later in Thai is two rows with one
+  -- spelling each; taking the newest row would show them as Thai-only and lose the English name an
+  -- `en` run still matches on. Non-nulls sort first, so each language resolves to a row that had one.
+  --
+  -- Among non-nulls the OLDEST wins, reproducing the fill-only rule this replaces: an import could
+  -- fill a NULL spelling and never change a stored one, so the first spelling recorded is the one
+  -- that stuck. Newest-first would invert that and let a later file silently overwrite a name.
+  --
+  -- status / upload_id are the NEWEST row's and describe that row, not the person. Anything that
+  -- genuinely cares is run-scoped and reads the raw table.
+  CREATE VIEW lakeshore.friend_current AS
+  SELECT
+    f.person_key,
+    -- The person's FIRST row, not their latest: stable across re-imports, and consistent with the
+    -- name columns below, which also resolve oldest-first.
+    min(f.id)                                                                         AS id,
+    (array_agg(f.source ORDER BY f.created_at DESC, f.id DESC))[1]                    AS source,
+    -- Constant within the group (the owner is half the identity); newest for its CAPITALISATION,
+    -- which is display text a later import may have spelled better.
+    (array_agg(f.relationship_owner ORDER BY f.created_at DESC, f.id DESC))[1]        AS relationship_owner,
+    (array_agg(f.friend_name_en
+               ORDER BY (f.friend_name_en IS NULL), f.created_at ASC, f.id ASC))[1] AS friend_name_en,
+    (array_agg(f.friend_name_th
+               ORDER BY (f.friend_name_th IS NULL), f.created_at ASC, f.id ASC))[1] AS friend_name_th,
+    min(f.created_at)                                                                 AS created_at,
+    max(f.updated_at)                                                                 AS updated_at
+  FROM lakeshore.friend f
+  GROUP BY f.person_key;
+
+  CREATE VIEW lakeshore.company_contact_current AS
+  SELECT
+    c.person_key,
+    min(c.id)                                                                         AS id,
+    (array_agg(c.company_name ORDER BY c.created_at DESC, c.id DESC))[1]              AS company_name,
+    (array_agg(c.person_name_en
+               ORDER BY (c.person_name_en IS NULL), c.created_at ASC, c.id ASC))[1] AS person_name_en,
+    (array_agg(c.person_name_th
+               ORDER BY (c.person_name_th IS NULL), c.created_at ASC, c.id ASC))[1] AS person_name_th,
+    min(c.created_at)                                                                 AS created_at,
+    max(c.updated_at)                                                                 AS updated_at
+  FROM lakeshore.company_contact c
+  GROUP BY c.person_key;
 
 
   -- ─────────────────────────────────────────────────────────────
@@ -282,11 +374,59 @@
     -- against a schema this app is forbidden from issuing DDL against. Enforced at the
     -- contract boundary instead, where a bad value is a 400 rather than a 500.
     compare_by         text,
+    -- WHICH ROWS the run covered — the axis, and the one value it takes.
+    --
+    --   filter_by    'upload' | 'company' | 'owner' | 'file'
+    --   filter_value the upload id, the company name, the relationship owner, or the upload id
+    --                of the import being re-run
+    --
+    -- The three columns above narrow a population that something else decided; this one names the
+    -- population. While an import was the only way to start a run that distinction did not exist —
+    -- the rows were "whatever this file brought" and nothing had to say so. Once the Network page
+    -- can re-compare one company, one relationship owner or one past import over data already on
+    -- file, a run needs to record which of those it was, or two runs over completely different row
+    -- sets store and read back identically.
+    --
+    -- A PAIR, always written together and always read together. Half a scope is a run nobody can
+    -- describe: an axis with no value selects everything while calling itself narrowed. Enforced at
+    -- the contract boundary (extensions/contract/src/run-scope.ts), which is also where the
+    -- vocabulary lives — these two travel to the external matcher as CSV columns and headers, and
+    -- the workflow SELECTS on them (docs/EXTERNAL-MATCHER.md §1c), so the value stored here and the
+    -- value branched on there have to be one string spelled once.
+    --
+    -- No CHECK, for exactly the reason `compare_by` has none: it is only ever written by us, and a
+    -- constraint would make adding a fourth scope a hand-applied DDL change against a schema this
+    -- app may not issue DDL against. A bad value is a 400 at the route, not a 500 at the INSERT.
+    --
+    -- NULL is meaningful and is not backfilled: a run predating these columns (added 2026-08-05,
+    -- see docs/add-comparison-scope.sql) recorded no scope, and stamping 'upload' on the ones an
+    -- import points at would be mostly right and silently wrong for the rest. Readers render no
+    -- chip rather than a chip claiming a scope nobody chose.
+    filter_by          text,
+    filter_value       text,
     expected_batches   integer,                               -- total declared by the matcher (0/NULL = unknown)
+    -- Who STARTED this run. Defaulted from the signed-in account (name, else email) at every
+    -- creation site; free text, like `upload.uploaded_by`, because it is a label for a human to
+    -- read and not a foreign key — an account can be deleted and the run it started is still a run
+    -- worth attributing.
+    --
+    -- Nullable, and the null is meaningful: a run written around the app (the Database console) or
+    -- predating this column has no actor on file. The Audit trail then falls back to the uploader
+    -- of the import that opened the run, and shows nothing if there is no such import — it never
+    -- guesses. NOT the same person as `upload.uploaded_by` in general, for the same reason
+    -- `uploaded_by` and `relationship_owner` are different columns: whoever imported a friends list
+    -- need not be whoever later pressed Compare against it.
+    --
+    -- (Mirrored by docs/add-comparison-created-by.sql for live databases.)
+    created_by         varchar(255),
     created_at         timestamptz NOT NULL DEFAULT now(),
     updated_at         timestamptz NOT NULL DEFAULT now()
   );
   CREATE INDEX idx_comparison_created ON lakeshore.comparison (created_at DESC);
+  -- "Every run scoped to this company / this owner / this file" — what the duplicate check asks.
+  -- Partial, so it costs nothing on the legacy rows that carry no scope at all.
+  CREATE INDEX idx_comparison_scope ON lakeshore.comparison (filter_by, filter_value)
+    WHERE filter_by IS NOT NULL;
 
   -- comparison_result: the matches, appended one batch at a time.
   CREATE TABLE lakeshore.comparison_result (

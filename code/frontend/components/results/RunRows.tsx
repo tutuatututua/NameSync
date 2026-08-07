@@ -6,6 +6,7 @@ import {
   Ban,
   Building2,
   CircleDashed,
+  Search,
   TriangleAlert,
   Users,
 } from "lucide-react";
@@ -26,14 +27,18 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { CompareModeBadge } from "@/components/compare-mode";
 import { SourcesBadge } from "@/components/sources-badge";
 import { MarkedName } from "@/components/marked-name";
+import { Side } from "@/components/pair-side";
 import { Provenance } from "@/components/provenance";
 import { Score } from "@/components/score";
 import { useFullWidth } from "@/components/main-container";
+import { PAGE_SIZE, Pager } from "@/components/pagination";
 import { useRunRows, useUploadSources } from "@/hooks/queries";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import type { RunRowsParams } from "@/lib/api/client";
 import { formatDate } from "@/lib/format";
 import { parseExtra } from "@/lib/match";
@@ -119,7 +124,12 @@ import { cn } from "@/lib/utils";
  * `kind` picks which side supplies which, and nothing else about the row changes.
  */
 
-const PAGE_SIZE = 25;
+/*
+ * A `PAGE_SIZE = 25` stood here. It is 20 now and it comes from `components/pagination`, with every
+ * other paged list in the app: the size only means anything to a reader if it is the same size
+ * everywhere, and this table was the one list that answered "how far down is row 200" differently
+ * from the rest.
+ */
 
 /**
  * Below this many rows, the table shows no filter tabs and no sort control.
@@ -249,32 +259,6 @@ function heading(origin: Origin, live: boolean, company: string | null): { title
   };
 }
 
-/**
- * One half of a pairing: whose name this is, then the name.
- *
- * The label is the smallest thing on the row and does the most work on it. Two Thai names either
- * side of an arrow are symmetrical to look at and are not symmetrical at all — one is somebody your
- * team already knows and the other is a stranger at a company you are trying to get into — and
- * which is which is not recoverable from the strings, from the order, or from anything else on the
- * row once the company name wraps to the next line.
- *
- * It rides in front of the name rather than under it so that a wrapped row degrades into two
- * labelled lines instead of two anonymous ones, which is the case the label exists for.
- */
-function Side({ label, hint, children }: { label: string; hint: string; children: React.ReactNode }) {
-  return (
-    <span className="inline-flex min-w-0 items-baseline gap-1.5">
-      <span
-        className="shrink-0 text-2xs uppercase tracking-wide text-muted-foreground/70"
-        title={hint}
-      >
-        {label}
-      </span>
-      {children}
-    </span>
-  );
-}
-
 function VerdictBadge({
   bucket,
   language,
@@ -363,6 +347,16 @@ interface Props {
 export function RunRows({ comparisonId, progress, live, company = null }: Props) {
   const [filter, setFilter] = React.useState<Filter>("all");
   const [page, setPage] = React.useState(1);
+  /**
+   * The search box — a name, a company, an owner.
+   *
+   * SERVER-side, like the sort and for the same reason: a 320-row run is sixteen pages, and
+   * "somchai" typed at a page of 20 would search the 20 rows in front of you and report nothing
+   * about the other 300. Debounced, because it is a request per pause and the list may also be
+   * polling itself while the run is live.
+   */
+  const [query, setQuery] = React.useState("");
+  const q = useDebouncedValue(query.trim(), 300);
 
   useFullWidth();
 
@@ -372,7 +366,7 @@ export function RunRows({ comparisonId, progress, live, company = null }: Props)
   const compareBy = progress?.compareBy ?? DEFAULT_COMPARE_BY;
   const { type: compareType, language: compareLanguage } = compareByAxes(compareBy);
   // The unit every score on this run is in — null on a whole-name run, where the bare percent
-  // already means what it looks like. Resolved once here; it is the same for all 25 rows.
+  // already means what it looks like. Resolved once here; it is the same for all 20 rows.
   const qualifier = scoreQualifier(compareBy);
   // Which friends were in the run. Null (every source) is a value here, not an absence — the badge
   // renders it as "All sources" rather than hiding, see SourcesBadge.
@@ -415,19 +409,21 @@ export function RunRows({ comparisonId, progress, live, company = null }: Props)
    */
   const sort: Sort = sortOverride ?? (!live && showSimilarity ? "similarity" : "row");
 
-  // Both re-page from the top: page 4 of "all" is not page 4 of "matches", and landing on an empty
-  // page you didn't ask for reads as "there are none".
-  React.useEffect(() => setPage(1), [filter, sort]);
+  // All three re-page from the top: page 4 of "all" is not page 4 of "matches", still less page 4
+  // of a search, and landing on an empty page you didn't ask for reads as "there are none".
+  React.useEffect(() => setPage(1), [filter, sort, q]);
 
   const params = React.useMemo<RunRowsParams>(
-    () => ({ page, limit: PAGE_SIZE, filter, sort }),
-    [page, filter, sort]
+    // `q || undefined` — an empty string would be sent as `?q=`, which the schema's `min(1)`
+    // rejects, and the box starts empty on every run.
+    () => ({ page, limit: PAGE_SIZE, filter, sort, q: q || undefined }),
+    [page, filter, sort, q]
   );
-  const q = useRunRows(comparisonId, params, live);
+  const rowsQuery = useRunRows(comparisonId, params, live);
 
-  const rows = q.data?.data ?? [];
-  const total = q.data?.pagination.total ?? 0;
-  const totalPages = q.data?.pagination.totalPages ?? 0;
+  const rows = rowsQuery.data?.data ?? [];
+  const total = rowsQuery.data?.pagination.total ?? 0;
+  const totalPages = rowsQuery.data?.pagination.totalPages ?? 0;
   const tabs = filterTabs(progress);
 
   const kind: Kind = progress?.kind ?? rows[0]?.kind ?? "facebook";
@@ -474,7 +470,7 @@ export function RunRows({ comparisonId, progress, live, company = null }: Props)
                 {kind === "facebook" ? "Friends" : "Company contacts"}
               </Badge>
               {/*
-                The run's mode, on the run and never on the row — it is constant for all 25 of
+                The run's mode, on the run and never on the row — it is constant for all 20 of
                 them. A full-name English finding and a last-name Thai finding are not comparable
                 results, and a list that does not say which it is holding invites exactly that
                 comparison. One place, always visible, impossible to page past.
@@ -499,6 +495,21 @@ export function RunRows({ comparisonId, progress, live, company = null }: Props)
 
           {showControls && (
             <div className="flex flex-wrap items-center gap-3">
+              {/* Beside the tabs rather than above them, because it is the same kind of control:
+                  both narrow WHICH rows, and they compose — "the matches called somchai". The
+                  tabs' counts stay the run's, which is why the line under the list states how many
+                  rows the search actually left. */}
+              <div className="relative w-full sm:w-56">
+                <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="Search these rows…"
+                  className="h-8 pl-8"
+                  aria-label="Search rows by name"
+                />
+              </div>
+
               <div className="flex flex-wrap gap-1" role="tablist" aria-label="Filter rows by outcome">
                 {tabs.map((t) => (
                   <Button
@@ -525,12 +536,22 @@ export function RunRows({ comparisonId, progress, live, company = null }: Props)
 
         {/* Held until there are rows AND scores to explain: a legend over a skeleton, an empty
             filter or a run of bare verdicts describes a column that is not on the screen. */}
-        {showSimilarity && !q.isLoading && rows.length > 0 && (
+        {showSimilarity && !rowsQuery.isLoading && rows.length > 0 && (
           <ScoreLegend qualifier={qualifier} partial={compareType !== "full"} />
         )}
 
+        {/* What the SEARCH left, stated whenever one is on. The filter tabs above carry the run's
+            own counts (they come from the progress endpoint, which knows nothing about this box),
+            so without this line a search that leaves 2 of 320 rows sits under a tab reading
+            "All 320". */}
+        {q && !rowsQuery.isLoading && rows.length > 0 && (
+          <p className="text-sm tabular-nums text-muted-foreground">
+            {total.toLocaleString()} row{total === 1 ? "" : "s"} match “{q}”
+          </p>
+        )}
+
         <div className="overflow-hidden rounded-lg border">
-          {q.isLoading ? (
+          {rowsQuery.isLoading ? (
             <div className="divide-y">
               {Array.from({ length: 5 }, (_, i) => (
                 <div key={i} className="p-4">
@@ -539,10 +560,14 @@ export function RunRows({ comparisonId, progress, live, company = null }: Props)
               ))}
             </div>
           ) : rows.length === 0 ? (
+            /* The search is named first when there is one: "this run has no rows" is alarming and
+               false the moment a box above the list is holding a typo. */
             <p className="py-10 text-center text-sm text-muted-foreground">
-              {filter === "all"
-                ? `This run has no rows${live ? " yet" : ""}.`
-                : `No rows in this view${live ? " yet" : ""}.`}
+              {q
+                ? `No ${filter === "all" ? "" : "matching "}row contains “${q}”.`
+                : filter === "all"
+                  ? `This run has no rows${live ? " yet" : ""}.`
+                  : `No rows in this view${live ? " yet" : ""}.`}
             </p>
           ) : (
             <ul className="divide-y">
@@ -562,32 +587,23 @@ export function RunRows({ comparisonId, progress, live, company = null }: Props)
           )}
         </div>
 
-        {totalPages > 1 && (
-          <div className="flex items-center justify-between gap-3">
-            <p className="text-sm tabular-nums text-muted-foreground">
-              Page {page.toLocaleString()} of {totalPages.toLocaleString()} · {total.toLocaleString()} row
-              {total === 1 ? "" : "s"}
-            </p>
-            <div className="flex gap-2">
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={page <= 1}
-                onClick={() => setPage((p) => Math.max(1, p - 1))}
-              >
-                Previous
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={page >= totalPages}
-                onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-              >
-                Next
-              </Button>
-            </div>
-          </div>
-        )}
+        {/* The row count stays in the summary: on a filtered or searched list it is the only place
+            the reader learns how many rows they are actually paging through. */}
+        <Pager
+          page={page}
+          totalPages={totalPages}
+          onPageChange={setPage}
+          label="run rows"
+          /* `isPlaceholderData` and NOT `isFetching`, which is the one place in the app where the
+             difference is load-bearing: a live run re-reads this list every couple of seconds, so
+             `isFetching` would leave "Loading page 1…" blinking under a table nobody asked to move.
+             `isPlaceholderData` is true only while a page, filter, sort or search the reader
+             actually asked for is still in flight. */
+          pending={rowsQuery.isPlaceholderData}
+          summary={`Page ${page.toLocaleString()} of ${totalPages.toLocaleString()} · ${total.toLocaleString()} row${
+            total === 1 ? "" : "s"
+          }`}
+        />
       </CardContent>
     </Card>
   );
@@ -706,7 +722,7 @@ function Row({
    * What this run's scores are a measurement OF — `full name`, `given name` or `surname`, never
    * absent.
    *
-   * Resolved once for the run and handed down, because it is constant for all 25 rows. It has to
+   * Resolved once for the run and handed down, because it is constant for all 20 rows. It has to
    * reach the row anyway: the mode badge in the panel header scrolls out of sight, and a bare
    * "100%" fifteen rows down a surname run is read as "the same person" when it means "the same
    * surname" — which on this run is the difference between six matches and twenty-one.

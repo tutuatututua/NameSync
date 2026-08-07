@@ -29,33 +29,12 @@ export interface CenterSignInArgs {
   ref?: string | null;
 }
 
-/**
- * An email-OTP sign-in either completes, or the API has emailed a code and wants it back.
- * Same shape as the Center outcome (the method is always "email" here), so the login form
- * reuses one second-factor step for both.
- */
-export type OtpSignInOutcome =
-  | { status: "signed-in" }
-  | { status: "otp-sent"; ref: string | null };
-
-/** What the login form hands to `signInWithOtp`, with the code + ref on step two. */
-export interface OtpSignInArgs {
-  email: string;
-  password: string;
-  code?: string;
-  ref?: string | null;
-}
-
 interface AuthState {
   user: AuthUser | null;
   /** True until the first /me answers. Render nothing decisive while it is. */
   loading: boolean;
-  /** Local password sign-in — dev only; the API refuses it in production. */
-  signIn: (email: string, password: string) => Promise<void>;
-  /** Center sign-in — the production path. Resolves to a 2FA challenge or a completed session. */
+  /** The only way in. Resolves to a 2FA challenge or a completed session. */
   signInWithCenter: (args: CenterSignInArgs) => Promise<CenterSignInOutcome>;
-  /** Email one-time-code sign-in. Resolves to "code emailed" or a completed session. */
-  signInWithOtp: (args: OtpSignInArgs) => Promise<OtpSignInOutcome>;
   signOut: () => Promise<void>;
 }
 
@@ -114,15 +93,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return () => setUnauthorizedHandler(null);
   }, [router]);
 
-  const signIn = React.useCallback(
-    async (email: string, password: string) => {
-      const u = await api.auth.login({ email, password });
-      setUser(u);
-      setLoading(false);
-    },
-    []
-  );
-
   const signInWithCenter = React.useCallback(
     async (args: CenterSignInArgs): Promise<CenterSignInOutcome> => {
       const result = await api.auth.centerLogin({
@@ -135,25 +105,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       // The response is either a completed session (`{ user }`) or a 2FA challenge.
       if ("twoFactorRequired" in result) {
         return { status: "2fa", method: result.method, ref: result.ref };
-      }
-      setUser(result.user);
-      setLoading(false);
-      return { status: "signed-in" };
-    },
-    []
-  );
-
-  const signInWithOtp = React.useCallback(
-    async (args: OtpSignInArgs): Promise<OtpSignInOutcome> => {
-      const result = await api.auth.otpLogin({
-        email: args.email,
-        password: args.password,
-        code: args.code,
-        ref: args.ref ?? undefined,
-      });
-      // Either a completed session (`{ user }`) or a challenge meaning a code was emailed.
-      if ("twoFactorRequired" in result) {
-        return { status: "otp-sent", ref: result.ref };
       }
       setUser(result.user);
       setLoading(false);
@@ -177,8 +128,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, [queryClient, router]);
 
   const value = React.useMemo<AuthState>(
-    () => ({ user, loading, signIn, signInWithCenter, signInWithOtp, signOut }),
-    [user, loading, signIn, signInWithCenter, signInWithOtp, signOut]
+    () => ({ user, loading, signInWithCenter, signOut }),
+    [user, loading, signInWithCenter, signOut]
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
@@ -194,9 +145,9 @@ export const isForbidden = (err: unknown): boolean => err instanceof ApiError &&
  * What the signed-in account may do — the one place components ask.
  *
  * `canWrite` is the question nearly every caller actually has: should this button exist at
- * all? Reviewers get a read-only app, so an import control, a "New comparison" trigger or a
- * delete is hidden rather than shown-and-then-403'd. Hiding is a courtesy; the API is the
- * enforcement (see api/src/lib/roles.ts).
+ * all? Reviewers get a read-only app, so an import control, a Compare trigger or a delete is
+ * hidden rather than shown-and-then-403'd. Hiding is a courtesy; the API is the enforcement
+ * (see api/src/lib/roles.ts).
  *
  * While `loading` is true nobody has any permission yet. That defaults to hiding write
  * controls for a beat rather than flashing them and snatching them away.

@@ -52,6 +52,27 @@ const overview = async (uploader?: string) => {
   return (await app.inject({ method: "GET", url })).json().data;
 };
 
+/** The overview, asking for a particular slice of the company list. */
+const overviewList = async (
+  params: { uploader?: string; company?: string; sort?: string; page?: number; limit?: number } = {}
+) => {
+  const sp = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) if (v !== undefined) sp.set(k, String(v));
+  const query = sp.toString();
+  return (
+    await app.inject({ method: "GET", url: `/api/network/overview${query ? `?${query}` : ""}` })
+  ).json().data;
+};
+
+/** Everyone at an exact company whose name matches `q` — the company page's search box. */
+const searchInCompany = async (company: string, q: string) =>
+  (
+    await app.inject({
+      method: "GET",
+      url: `/api/network/search?company=${encodeURIComponent(company)}&q=${encodeURIComponent(q)}&page=1&limit=50`,
+    })
+  ).json();
+
 const search = async (q: string) =>
   (await app.inject({ method: "GET", url: `/api/network/search?q=${encodeURIComponent(q)}&page=1&limit=20` })).json();
 
@@ -60,6 +81,17 @@ const searchCompany = async (company: string) =>
 
 const uploaders = async () =>
   (await app.inject({ method: "GET", url: "/api/network/uploaders" })).json().data.uploaders;
+
+/** The roster picker's options — names only, searched and capped. Not the tab's tallies above. */
+const owners = async (params: { q?: string; limit?: number } = {}) => {
+  const sp = new URLSearchParams();
+  if (params.q !== undefined) sp.set("q", params.q);
+  if (params.limit !== undefined) sp.set("limit", String(params.limit));
+  const query = sp.toString();
+  return (
+    await app.inject({ method: "GET", url: `/api/network/owners${query ? `?${query}` : ""}` })
+  ).json().data;
+};
 
 const uploader = async (name: string) =>
   (await app.inject({ method: "GET", url: `/api/network/uploader?name=${encodeURIComponent(name)}` })).json().data;
@@ -77,7 +109,9 @@ describe("network overview (GET /api/network/overview)", () => {
     await seedAndCompare();
 
     const ov = await overview();
-    expect(ov.uploaders).toEqual(["Alex"]); // the only roster that uploaded friends
+    // A COUNT, not the names: the picker's options moved to GET /owners so this payload stops
+    // carrying an unbounded array on every threshold drag.
+    expect(ov.owners).toBe(1); // the only roster that uploaded friends
     expect(ov.uploader).toBeNull();
     expect(ov.friends).toBe(2); // Noppamas + Stranger were uploaded
     expect(ov.friendsMatched).toBe(1); // only Noppamas matched; "no match" = 2 − 1 = 1
@@ -85,8 +119,16 @@ describe("network overview (GET /api/network/overview)", () => {
     expect(ov.friendsConfirmed).toBe(1);
     expect(ov.companiesOnFile).toBe(2); // MCKINSEY + BLUEBIK
     expect(ov.connections).toBe(1); // one (person, company) match
-    // Only companies actually reached, and only by a MATCH — BLUEBIK produced none.
-    expect(ov.connected).toEqual([{ company: "MCKINSEY", connections: 1, confirmed: 1 }]);
+    // EVERY company on file, reached first. BLUEBIK produced no match and is still a row — a zero,
+    // not an absence, so "we hold contacts there and nobody reaches them" is visible rather than
+    // being something the reader has to infer from `companiesKnown` being smaller than
+    // `companiesOnFile`.
+    expect(ov.connected).toEqual([
+      { company: "MCKINSEY", connections: 1, confirmed: 1 },
+      { company: "BLUEBIK", connections: 0, confirmed: 0 },
+    ]);
+    // …and the tile above the list did NOT follow it: reach is 1 of the 2 on file.
+    expect(ov.companiesKnown).toBe(1);
   });
 
   it("scopes to one roster's matched/no-match names, and reports an untouched roster as empty", async () => {
@@ -96,24 +138,246 @@ describe("network overview (GET /api/network/overview)", () => {
     expect(alex.uploader).toBe("Alex");
     expect(alex.friends).toBe(2); // uploaded 2 friends
     expect(alex.friendsMatched).toBe(1); // 1 matched → 1 no match
-    expect(alex.connected).toEqual([{ company: "MCKINSEY", connections: 1, confirmed: 1 }]);
+    expect(alex.connected).toEqual([
+      { company: "MCKINSEY", connections: 1, confirmed: 1 },
+      { company: "BLUEBIK", connections: 0, confirmed: 0 },
+    ]);
 
-    // A roster nobody uploaded is empty across the board.
+    // A roster nobody uploaded reaches nothing — every tally is 0. The LIST is not a tally: the
+    // companies are on file whoever is being asked about, so Bob gets the same two rows as Alex
+    // with every number in them zeroed. That is the answer ("Bob reaches neither"), where an empty
+    // list would have read as "there is nothing here", which is a claim about the database.
     const bob = await overview("Bob");
     expect(bob.friends).toBe(0);
     expect(bob.friendsMatched).toBe(0);
     expect(bob.connections).toBe(0);
-    expect(bob.connected).toEqual([]);
+    expect(bob.companiesKnown).toBe(0);
+    expect(bob.connected).toEqual([
+      { company: "BLUEBIK", connections: 0, confirmed: 0 },
+      { company: "MCKINSEY", connections: 0, confirmed: 0 },
+    ]);
+  });
+
+  it("reports the reached-company count as a field, never as the length of the list", async () => {
+    await seedAndCompare();
+    const ov = await overview();
+    // The tile is the NUMERATOR and the list is the denominator, and they are deliberately
+    // different numbers: one company is reached, two are on file and therefore two are listed.
+    // Reading the tile off `connected.length` would report "Companies known 2" over a list whose
+    // second row says it is reached by nobody.
+    expect(ov.companiesKnown).toBe(1);
+    expect(ov.connected).toHaveLength(2);
+    expect(ov.connectedPagination).toEqual({ page: 1, limit: 20, total: 2, totalPages: 1 });
   });
 
   it("lists no uploaders when only company data has been imported (no friend lists yet)", async () => {
     await importCompany(app, { csv: CO_CSV, owner: "Alex" });
     const ov = await overview();
-    expect(ov.uploaders).toEqual([]); // "Alex" here is a company import, not a friend roster
+    expect(ov.owners).toBe(0); // "Alex" here is a company import, not a friend roster
+    expect((await owners()).owners).toEqual([]); // and the picker offers nothing to filter by
     expect(ov.friends).toBe(0);
-    expect(ov.connected).toEqual([]);
+    // Nothing has been compared, so nothing is reached — and the companies are all listed anyway,
+    // each at zero. This is the state the change is for: the tab used to greet a fresh import with
+    // an empty list and "No connections found", which reads as "your data did not arrive".
+    expect(ov.companiesKnown).toBe(0);
+    expect(ov.connected).toEqual([
+      { company: "BLUEBIK", connections: 0, confirmed: 0 },
+      { company: "MCKINSEY", connections: 0, confirmed: 0 },
+    ]);
     // The company data is on file even though nothing reaches it yet.
     expect(ov.companiesOnFile).toBe(2);
+  });
+
+  it("lists nothing when no company data exists, whatever the rosters hold", async () => {
+    await importFacebook(app, { friends: [["Noppamas", 1]], owner: "Alex" });
+    const ov = await overview();
+    expect(ov.friends).toBe(1);
+    // The list's universe is `company_contact`, so with none imported there is genuinely no row to
+    // draw — the one remaining empty state, and the only one an import rather than a run fixes.
+    expect(ov.companiesOnFile).toBe(0);
+    expect(ov.connected).toEqual([]);
+    expect(ov.connectedPagination.total).toBe(0);
+  });
+});
+
+/**
+ * The company list, once it stopped being the whole answer.
+ *
+ * Every test here is really one claim: `page`, `limit`, `company` and `sort` move the LIST and
+ * nothing else on the payload. That is the contract the Network tab's tiles depend on — they sit
+ * directly above the list, they are read at a glance, and a search that quietly changed "Companies
+ * known" would be indistinguishable from the network having changed.
+ */
+describe("network overview — the company list is paged, searched and sorted", () => {
+  // GAMMA is reached by two friends; ALPHA and BETA by one each. DELTA employs somebody nobody
+  // knows — a row at zero, sorted below the three that are reached.
+  const MANY_CSV =
+    "company_name,thai_name,eng_name\n" +
+    "ALPHA,แอนนา,Anna\nBETA,เบน,Ben\nGAMMA,คารา,Cara\nGAMMA,แดน,Dan\nDELTA,อีริค,Erik\n";
+
+  async function seedManyCompanies(): Promise<string> {
+    await importCompany(app, { csv: MANY_CSV, owner: "Alex" });
+    await importFacebook(app, {
+      friends: [
+        ["Anna", 1],
+        ["Ben", 2],
+        ["Cara", 3],
+        ["Dan", 4],
+      ],
+      owner: "Alex",
+    });
+    return startCompare(app, ["ALPHA", "BETA", "GAMMA", "DELTA"]);
+  }
+
+  it("caps the list at `limit` and pages through the rest, strongest company first", async () => {
+    await seedManyCompanies();
+
+    const first = await overviewList({ limit: 2, page: 1 });
+    expect(first.connected.map((c: { company: string }) => c.company)).toEqual(["GAMMA", "ALPHA"]);
+    // FOUR companies now, not three: DELTA is on file and therefore in the list, at the back.
+    expect(first.connectedPagination).toEqual({ page: 1, limit: 2, total: 4, totalPages: 2 });
+    // The tallies are over the whole roster, not over the two rows returned: four friends each
+    // reach one company, so `connections` is 4 even on a page holding two of them. `companiesKnown`
+    // stays 3 — the list grew, the reach did not.
+    expect(first.companiesKnown).toBe(3);
+    expect(first.connections).toBe(4);
+    expect(first.friendsMatched).toBe(4);
+
+    const second = await overviewList({ limit: 2, page: 2 });
+    // The unreached company sorts below every reached one, so it lands on the last page rather than
+    // interleaving with the finding.
+    expect(second.connected).toEqual([
+      { company: "BETA", connections: 1, confirmed: 1 },
+      { company: "DELTA", connections: 0, confirmed: 0 },
+    ]);
+    // …and they are the same numbers on page 2, which is what makes them the roster's.
+    expect(second.companiesKnown).toBe(3);
+    expect(second.connections).toBe(4);
+  });
+
+  it("orders by name when asked, and by reach otherwise", async () => {
+    await seedManyCompanies();
+
+    // A–Z is over everything on file — the order you switch to in order to LOOK SOMETHING UP, so a
+    // company being unreached is exactly the answer it has to be able to give.
+    expect((await overviewList({ sort: "name" })).connected.map((c: { company: string }) => c.company)).toEqual([
+      "ALPHA",
+      "BETA",
+      "DELTA",
+      "GAMMA",
+    ]);
+    // The default is unchanged from before the parameter existed: reach first, alphabetical within.
+    // Zero is a reach like any other and sorts where it falls, which is last.
+    expect((await overviewList()).connected.map((c: { company: string }) => c.company)).toEqual([
+      "GAMMA",
+      "ALPHA",
+      "BETA",
+      "DELTA",
+    ]);
+  });
+
+  it("searches the list case-insensitively without moving a single tally", async () => {
+    await seedManyCompanies();
+
+    const hit = await overviewList({ company: "amm" });
+    expect(hit.connected).toEqual([{ company: "GAMMA", connections: 2, confirmed: 2 }]);
+    expect(hit.connectedPagination.total).toBe(1);
+    // THE POINT OF THE WHOLE SPLIT: the tiles above the list are untouched by what is typed into
+    // the box below them.
+    expect(hit.companiesKnown).toBe(3);
+    expect(hit.connections).toBe(4);
+    expect(hit.friends).toBe(4);
+    expect(hit.friendsMatched).toBe(4);
+    expect(hit.companiesOnFile).toBe(4);
+
+    // The search reaches the unreached companies too — "is DELTA in here" is a question about the
+    // database, and it was unanswerable while the list held only what the roster had matched.
+    const unreached = await overviewList({ company: "delt" });
+    expect(unreached.connected).toEqual([{ company: "DELTA", connections: 0, confirmed: 0 }]);
+    expect(unreached.connectedPagination.total).toBe(1);
+
+    // A search that finds nothing empties the list and says so — it does not report a roster that
+    // reaches nowhere.
+    const miss = await overviewList({ company: "zzz" });
+    expect(miss.connected).toEqual([]);
+    expect(miss.connectedPagination.total).toBe(0);
+    expect(miss.companiesKnown).toBe(3);
+  });
+
+  it("treats a LIKE wildcard as a character, not as a pattern", async () => {
+    await seedManyCompanies();
+    // "%" would match every company if it reached the query unescaped.
+    expect((await overviewList({ company: "%" })).connected).toEqual([]);
+  });
+});
+
+/**
+ * The roster picker's options — split out of the overview payload so the list stops riding along on
+ * every threshold drag, and searched server-side because the client cannot hold it at 100k rows.
+ */
+describe("network owner options (GET /api/network/owners)", () => {
+  it("lists distinct owners alphabetically, with the total beside the slice", async () => {
+    await importFacebook(app, {
+      ownedFriends: [
+        ["Somchai Jaidee", "Mint"],
+        ["Anong Sri", "Nadhee"],
+        ["Preecha Wong", "Mint"],
+      ],
+      uploader: "Assistant",
+    });
+
+    const res = await owners();
+    // One entry per owner, not per friend — Mint contributed two and appears once.
+    expect(res.owners).toEqual(["Mint", "Nadhee"]);
+    expect(res.total).toBe(2);
+  });
+
+  it("searches by case-insensitive substring", async () => {
+    await importFacebook(app, {
+      ownedFriends: [
+        ["A", "Mint"],
+        ["B", "Nadhee"],
+        ["C", "Warinthon"],
+      ],
+      uploader: "Assistant",
+    });
+
+    // Substring, not prefix: "in" is inside Mint and Warinthon but not Nadhee.
+    expect((await owners({ q: "in" })).owners).toEqual(["Mint", "Warinthon"]);
+    expect((await owners({ q: "MINT" })).owners).toEqual(["Mint"]);
+    expect(await owners({ q: "nobody" })).toEqual({ owners: [], total: 0 });
+  });
+
+  /**
+   * `total` is the whole match count and `owners` is the page — the picker states the gap, and a
+   * capped list that reported its own length as the total would read as a complete one.
+   */
+  it("caps the slice at `limit` while reporting how many matched", async () => {
+    await importFacebook(app, {
+      ownedFriends: [
+        ["A", "Ann"],
+        ["B", "Bob"],
+        ["C", "Cat"],
+      ],
+      uploader: "Assistant",
+    });
+
+    const res = await owners({ limit: 2 });
+    expect(res.owners).toEqual(["Ann", "Bob"]);
+    expect(res.total).toBe(3);
+  });
+
+  it("treats LIKE metacharacters in the search as literal text", async () => {
+    await importFacebook(app, {
+      ownedFriends: [
+        ["A", "100%"],
+        ["B", "Bob"],
+      ],
+      uploader: "Assistant",
+    });
+
+    // Unescaped, "%" is "match everything" and this would return both owners.
+    expect((await owners({ q: "%" })).owners).toEqual(["100%"]);
   });
 });
 
@@ -141,11 +405,58 @@ describe("network search (GET /api/network/search)", () => {
     // company page can state "noppamas ↔ noppamas" rather than asserting a match between a score
     // and a name the reader cannot see. Cleaned and lower-cased like every stored name, because it
     // is the string that was actually scored and not a display copy of it.
+    //
+    // `friendAlt` is the same person's OTHER spelling as `friend` holds it today — the Thai one on
+    // an `en_*` run, the English one on a `th_*` run. Null here, and null on every fixture in this
+    // file that imports a plain friends list: those friends have one spelling, so there is no other
+    // one to carry. The populated case — where the branch that picks the column is what is
+    // actually under test — is "carries the friend's other spelling", further down this file.
     expect(row.connectedUploaders).toEqual([
-      { name: "Alex", friend: "noppamas", uploadedBy: "Alex", similarity: 1, mode: "en_full", corroborated: false },
+      {
+        name: "Alex",
+        friend: "noppamas",
+        friendAlt: null,
+        uploadedBy: "Alex",
+        similarity: 1,
+        mode: "en_full",
+        corroborated: false,
+      },
     ]);
     // Alex reaches MCKINSEY (via Noppamas), on a whole-name match.
     expect(row.companyUploaders).toEqual([{ name: "Alex", uploadedBy: "Alex", confirmed: true }]);
+  });
+
+  /**
+   * The company page's search box: an exact company AND a name, which used to be impossible —
+   * `company` won outright and a `q` sent beside it was dropped.
+   */
+  it("narrows an exact company to the people whose NAME matches, and only their name", async () => {
+    await seedAndCompare();
+    // Two more contacts at MCKINSEY, so the search has something to leave behind.
+    await importCompany(app, {
+      csv: "company_name,thai_name,eng_name\nMCKINSEY,สมชาย,Somchai\nMCKINSEY,สมหญิง,Somying\n",
+      owner: "Alex",
+    });
+
+    const all = await searchCompany("MCKINSEY");
+    expect(all.pagination.total).toBe(3);
+
+    const one = await searchInCompany("MCKINSEY", "noppa");
+    expect(one.pagination.total).toBe(1);
+    expect(one.data[0].person_name_en).toBe("noppamas");
+    // The company-wide facts are unchanged by the filter — they are about the company, not about
+    // the rows the search happened to leave.
+    expect(one.data[0].companyConnections).toBe(1);
+
+    // Thai spellings too — the box is the only way to find someone a reader knows by that name.
+    expect((await searchInCompany("MCKINSEY", "สมหญิง")).data[0].person_name_en).toBe("somying");
+
+    // The company leg is NOT re-applied: everyone here works at MCKINSEY, so a filter that matched
+    // the company would return all three and filter nothing.
+    expect((await searchInCompany("MCKINSEY", "mckinsey")).pagination.total).toBe(0);
+
+    // And it cannot reach outside the company it was scoped to.
+    expect((await searchInCompany("MCKINSEY", "thana")).pagination.total).toBe(0);
   });
 
   it("reports a company nobody reaches as zero connections, contact known by no one", async () => {
@@ -170,9 +481,26 @@ describe("network search (GET /api/network/search)", () => {
     // Both know Noppamas, each with their own score — one chip per person, not a shared verdict.
     expect(row.connectedUploaders).toEqual([
       // One English run only — a second language agreeing is what `corroborated` reports, and
-      // there is no second language here.
-      { name: "Alex", friend: "noppamas", uploadedBy: "Alex", similarity: 1, mode: "en_full", corroborated: false },
-      { name: "Bee", friend: "noppamas", uploadedBy: "Bee", similarity: 1, mode: "en_full", corroborated: false },
+      // there is no second language here. `friendAlt` is null for the same reason: one spelling
+      // on file, so there is no other one.
+      {
+        name: "Alex",
+        friend: "noppamas",
+        friendAlt: null,
+        uploadedBy: "Alex",
+        similarity: 1,
+        mode: "en_full",
+        corroborated: false,
+      },
+      {
+        name: "Bee",
+        friend: "noppamas",
+        friendAlt: null,
+        uploadedBy: "Bee",
+        similarity: 1,
+        mode: "en_full",
+        corroborated: false,
+      },
     ]);
     // Both reach MCKINSEY, both on whole names.
     expect(row.companyUploaders).toEqual([
@@ -245,7 +573,29 @@ describe("network uploader detail (GET /api/network/uploader)", () => {
         company: "MCKINSEY",
         // With how close the match was AND what it compared: this list is every pairing a run
         // called a match, and without either an exact name and a near miss read as the same claim.
-        people: [{ friend: "noppamas", en: "noppamas", th: "นพมาศ", similarity: 1, mode: "en_full" }],
+        //
+        // `friendKey` / `runId` / `runName` since 2026-08-04: the list is one entry per RUN, so a
+        // pairing two comparisons both found appears twice. `friendKey` is what says those two
+        // entries are one person (the counts fold on it, the list does not), and the run fields are
+        // what stop the second entry reading as duplicated data. Matched loosely — the key is a
+        // uuid and the id a sequence, so neither is worth pinning to a literal.
+        //
+        // `contactKey` since 2026-08-06 — the other half of the pairing. Without it "one person's
+        // two findings" and "one person matched to two different contacts" are the same shape on
+        // the wire, and the roster page rendered the second as the first.
+        people: [
+          {
+            friend: "noppamas",
+            en: "noppamas",
+            th: "นพมาศ",
+            similarity: 1,
+            mode: "en_full",
+            friendKey: expect.any(String),
+            contactKey: expect.any(String),
+            runId: expect.any(String),
+            runName: expect.any(String),
+          },
+        ],
         confirmed: 1,
       },
     ]);
@@ -258,6 +608,129 @@ describe("network uploader detail (GET /api/network/uploader)", () => {
     expect(stranger.friend).toBe("stranger");
     expect(stranger.similarity).toBe(0);
     expect(["MCKINSEY", "BLUEBIK"]).toContain(stranger.company);
+  });
+
+  it("does not list the same finding twice when the SAME question is run again", async () => {
+    await importCompany(app, { csv: CO_CSV, owner: "Alex" });
+    await importFacebook(app, { friends: [["Noppamas", 1]], owner: "Alex" });
+
+    // The identical question, twice — with the thing that makes asking it twice legitimate in
+    // between. Since 2026-08-06 a repeat whose rows have not moved is refused (409, see
+    // compare-sources.test.ts); this is the case that is NOT refused, and it is the same case the
+    // rule was written around: friends have arrived since, so the same question has a new answer.
+    //
+    // The friend who arrives matches nobody, deliberately. What is under test here is that two runs
+    // of one question produce ONE finding, and a second matching friend would change the row count
+    // for a reason that has nothing to do with de-duplication.
+    await startCompare(app, ["MCKINSEY"], "en_full");
+    await importFacebook(app, { friends: [["Stranger", 0]], owner: "Alex", name: "later.csv" });
+    await startCompare(app, ["MCKINSEY"], "en_full");
+
+    const alex = await uploader("Alex");
+    expect(alex.matchedByCompany).toHaveLength(1);
+    // ONE row, not two. Listing it twice is indistinguishable from duplicated data, which is
+    // exactly how it was reported.
+    expect(alex.matchedByCompany[0].people).toHaveLength(1);
+    expect(alex.matchedByCompany[0].people[0].mode).toBe("en_full");
+    // And the counts are unmoved — they were never per-run.
+    expect(alex.matched).toBe(1);
+    expect(alex.matchedByCompany[0].confirmed).toBe(1);
+  });
+
+  it("keeps a person's two findings adjacent, strongest first", async () => {
+    await importCompany(app, { csv: CO_CSV, owner: "Alex" });
+    // Two friends so the sort has something to interleave: Noppamas matches, Thana matches too.
+    await importFacebook(app, { friends: [["Noppamas", 1], ["Thana", 2]], owner: "Alex" });
+
+    // A full-name run (confirmed) and a given-name run (lead) over the same data — two genuinely
+    // different questions, so both findings are kept.
+    await startCompare(app, ["MCKINSEY"], "en_full");
+    await startCompare(app, ["MCKINSEY"], "en_name");
+
+    const alex = await uploader("Alex");
+    const people = alex.matchedByCompany[0].people as { friendKey: string; mode: string }[];
+
+    /**
+     * Every row for one person sits together. Sorting rows by strength alone put their confirmed
+     * finding among the confirmed matches and their lead finding down among the leads — the same
+     * human twice, in two parts of the list, with nothing connecting them. The renderer's "also
+     * found by" line keys on the previous row being the same person, so it never fired either.
+     */
+    const keys = people.map((p) => p.friendKey);
+    const firstIndex = new Map<string, number>();
+    keys.forEach((k, i) => {
+      if (!firstIndex.has(k)) firstIndex.set(k, i);
+    });
+    for (const [key, start] of firstIndex) {
+      const mine = keys.map((k, i) => (k === key ? i : -1)).filter((i) => i >= 0);
+      expect(mine).toEqual(mine.map((_, n) => start + n)); // contiguous
+    }
+
+    // And within a person, the confirmed finding leads — it is the row the others hang beneath.
+    const noppamas = people.filter((p) => p.friendKey === keys[0]);
+    expect(noppamas.length).toBeGreaterThan(1);
+    expect(noppamas[0].mode).toBe("en_full");
+  });
+
+  /**
+   * ONE FRIEND, TWO CONTACTS AT ONE COMPANY — two connections, not one person's two findings.
+   *
+   * The fold key was (company, friend, mode) and had no term for who the friend matched, so these
+   * two rows arrived indistinguishable from the "same pairing, asked twice" case the fold exists to
+   * collapse. The roster page renders a repeat as `also found by <run>` beneath the first row's
+   * name, which meant a match to an entirely different person was shown as more evidence for the
+   * first one — the reader never saw the second contact's name at all.
+   *
+   * The names here are the production case, in miniature: a surname run lands the friend on the
+   * person who shares their surname, a given-name run lands them on the person who shares their
+   * given name, and neither is the other.
+   */
+  it("lists a friend's matches to TWO different contacts as two findings, keyed by contact", async () => {
+    await importCompany(app, {
+      csv: "company_name,thai_name,eng_name\nACME,อรุณี โรจนพฤกษ์,Arunee Rojanapruk\nACME,อาณัติ วงศ์สวัสดิ์,Arnat Wongsawat\n",
+      owner: "Alex",
+    });
+    await importFacebook(app, { friends: [["Arnat Rojanapruk", 1]], owner: "Alex" });
+
+    // Two questions, two different answers: `rojanapruk` is Arunee's surname, `arnat` is
+    // Wongsawat's given name. Both are leads (neither compared whole names), which is also why
+    // neither can be dismissed as the weaker copy of the other.
+    await startCompare(app, ["ACME"], "en_surname");
+    await startCompare(app, ["ACME"], "en_name");
+
+    const alex = await uploader("Alex");
+    const people = alex.matchedByCompany[0].people as {
+      friendKey: string;
+      contactKey: string | null;
+      en: string | null;
+    }[];
+
+    // BOTH matches survive, and they name two different contacts.
+    expect(people).toHaveLength(2);
+    expect(new Set(people.map((p) => p.friendKey)).size).toBe(1); // one friend…
+    expect(new Set(people.map((p) => p.contactKey)).size).toBe(2); // …two people they reach
+    expect(people.map((p) => p.en).sort()).toEqual(["arnat wongsawat", "arunee rojanapruk"]);
+
+    // And the counts do not follow the list: two connections at one company is still one friend
+    // with a connection, which is what the tile above the list states.
+    expect(alex.matched).toBe(1);
+    expect(alex.matchedByCompany[0].confirmed).toBe(0); // partial-name runs only
+  });
+
+  /** The other half of the same rule: asking ONE question twice is still one finding. The contact
+   *  term must narrow the fold, never disable it. */
+  it("still folds a repeat of the same question against the same contact", async () => {
+    await importCompany(app, { csv: CO_CSV, owner: "Alex" });
+    await importFacebook(app, { friends: [["Noppamas", 1]], owner: "Alex" });
+
+    await startCompare(app, ["MCKINSEY"], "en_full");
+    // A friend arrives, so the repeat is a legitimately new run rather than a refused one.
+    await importFacebook(app, { friends: [["Stranger", 0]], owner: "Alex", name: "later.csv" });
+    await startCompare(app, ["MCKINSEY"], "en_full");
+
+    const people = (await uploader("Alex")).matchedByCompany[0].people;
+    expect(people).toHaveLength(1);
+    expect(people[0].contactKey).toEqual(expect.any(String));
   });
 
   it("carries the near miss a run rejected — the contact, their company and how close it got", async () => {
@@ -414,7 +887,15 @@ describe("an off-contract upload_name cannot break a roster", () => {
     expect(row.connectedUploaders).toEqual([
       // The owner is Win, the importer is Local dev, and the friend is neither of them — three
       // facts the row used to compress into one name, which is how the wrong one went unnoticed.
-      { name: "Win", friend: "noppamas", uploadedBy: "Local dev", similarity: 1, mode: "en_full", corroborated: false },
+      {
+        name: "Win",
+        friend: "noppamas",
+        friendAlt: null,
+        uploadedBy: "Local dev",
+        similarity: 1,
+        mode: "en_full",
+        corroborated: false,
+      },
     ]);
     expect(row.companyUploaders).toEqual([
       { name: "Win", uploadedBy: "Local dev", confirmed: true },
@@ -573,11 +1054,59 @@ describe("network match grading (confirmed vs lead)", () => {
       name: "Alex",
       // Alex's friend — NOT the contact, and not the owner. The two names share only a surname.
       friend: "somchai jaidee",
+      // No Thai spelling on file for this friend, so the run's other language has nothing to show.
+      friendAlt: null,
       uploadedBy: "Alex",
       similarity: expect.any(Number),
       mode: "en_surname",
       corroborated: false,
     });
+  });
+
+  /**
+   * `friendAlt` POPULATED — the branch the four null assertions above cannot reach.
+   *
+   * Every other fixture in this file imports a one-spelling friends list, so `friendAlt` is null
+   * throughout and the field's whole reason for existing goes untested: a `null` proves the column
+   * is selected, not that the right one is.
+   *
+   * The rule is "the language the run did NOT compare", asked of the run's mode — so an `en_*` run
+   * carries the Thai spelling and a `th_*` run the English one. Both directions are asserted here,
+   * over the same friend, because the failure this guards against is the branch being inverted:
+   * with one direction tested, a swapped CASE passes.
+   *
+   * Note what `friend` does across the two runs and `friendAlt` does not: `friend` is frozen
+   * evidence off the result row (the string that run actually scored), while `friendAlt` is read
+   * off the friend row as it stands today. That is the distinction the two fields exist to keep,
+   * and it is only visible when a friend has both spellings.
+   */
+  it("carries the friend's other spelling — the language the run did not compare", async () => {
+    // A contact with both spellings, so either run can match.
+    await importCompany(app, { csv: "company_name,thai_name,eng_name\nACME,สมชาย ใจดี,Somchai Jaidee\n", owner: "Alex" });
+    // A friend with both spellings — the case `friend_name_en` / `friend_name_th` were split for.
+    await importFacebook(app, {
+      friendsCsv: "en_name,th_name\nSomchai Jaidee,สมชาย ใจดี\n",
+      owner: "Alex",
+    });
+
+    await startCompare(app, ["ACME"], "en_full");
+    const [en] = (await searchCompany("ACME")).data[0].connectedUploaders;
+    expect(en.mode).toBe("en_full");
+    expect(en.friend).toBe("somchai jaidee"); // what the English run scored
+    expect(en.friendAlt).toBe("สมชาย ใจดี"); // the spelling it did not
+
+    await startCompare(app, ["ACME"], "th_full");
+    // Strongest-mode-then-best-score keeps one row per owner, and both runs are `full` — so the
+    // survivor is whichever scored higher, and this asserts the PAIR travels together rather than
+    // pinning which run won.
+    const [th] = (await searchCompany("ACME")).data[0].connectedUploaders;
+    if (th.mode === "th_full") {
+      expect(th.friend).toBe("สมชาย ใจดี");
+      expect(th.friendAlt).toBe("somchai jaidee");
+    } else {
+      expect(th.friend).toBe("somchai jaidee");
+      expect(th.friendAlt).toBe("สมชาย ใจดี");
+    }
   });
 
   it("shows the FULL run's score even when a partial run scored higher", async () => {
@@ -667,6 +1196,39 @@ describe("rename a contact (PATCH /api/comparisons/company-data/:uuid)", () => {
 
     const after = (await contacts()).find((c) => c.uuid === noppamas.uuid)!;
     expect(after.person_name_en).toBe("somchai jaidee");
+  });
+
+  it("renames EVERY copy of a re-imported contact, not just the row it was handed", async () => {
+    // Imported twice by TWO PEOPLE: two rows, one contact. The pages that open the rename dialog
+    // (the company page and Search) read `company_contact_current`, which folds them and hands
+    // back one id.
+    //
+    // Two uploaders rather than one file twice, because the uploader is part of the drop key —
+    // the same person re-importing this file writes nothing and is refused (see
+    // import-precheck.test.ts). This is how two rows for one contact actually arise, and it is
+    // the common way: two colleagues who both have these contacts on file.
+    await importCompany(app, { csv: CO_CSV, owner: "Alex" });
+    await importCompany(app, { csv: CO_CSV, owner: "Bob" });
+
+    const rows = await contacts();
+    expect(rows.filter((c) => c.person_name_en === "noppamas")).toHaveLength(2);
+
+    // Rename through the id the folded pages actually hand over.
+    const found = (await app.inject({ method: "GET", url: "/api/network/search?q=noppamas&page=1&limit=20" }))
+      .json().data as { id: string }[];
+    expect(found).toHaveLength(1); // one contact on screen, whatever the row count
+    const res = await rename(found[0].id, { person_name_en: "Somchai Jaidee" });
+    expect(res.statusCode, res.body).toBe(200);
+
+    /**
+     * Both rows, or the rename half-worked: the copy left behind would keep showing the old name on
+     * the Data page and — worse — would be what the external workflow matches on, since it reads
+     * the raw rows of whichever upload it was given. Which copy the folded id names is an
+     * implementation detail of the view, so nothing correct can be built on renaming just that one.
+     */
+    const after = await contacts();
+    expect(after.filter((c) => c.person_name_en === "somchai jaidee")).toHaveLength(2);
+    expect(after.some((c) => c.person_name_en === "noppamas")).toBe(false);
   });
 
   it("moves a contact to a new company", async () => {

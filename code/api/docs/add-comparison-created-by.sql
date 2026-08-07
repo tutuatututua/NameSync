@@ -1,0 +1,42 @@
+-- ============================================================================
+-- Network Intel — record WHO STARTED a comparison run
+-- ============================================================================
+-- Run this against a live database. Purely additive and fully idempotent: one
+-- nullable column, no row rewritten, nothing backfilled. Running it twice is a
+-- no-op, and existing runs simply read NULL.
+--
+--   psql "$DATABASE_URL" -f docs/add-comparison-created-by.sql
+--
+-- Named by schema-redesign.sql, which has pointed here since the column landed.
+-- A database built from that file already has it; this is the drift file for one
+-- built from an older schema, since the app is forbidden from issuing DDL itself
+-- (DB_SKIP_MIGRATE=1).
+--
+-- ── WHY IT EXISTS ──
+--
+-- A run started from the Network page has no import behind it, so before this
+-- column there was nothing on file naming who started it and the Audit trail
+-- could only render a dash. `ComparisonModel.create` sets it from the signed-in
+-- account (name, else email) at every creation site.
+--
+-- Free text, like `upload.uploaded_by`, and deliberately NOT a foreign key: it is
+-- a label for a human to read, and an account can be deleted while the run it
+-- started is still a run worth attributing.
+--
+-- NOT the same person as `upload.uploaded_by` in general — whoever imported a
+-- friends list need not be whoever later pressed Compare against it. That is the
+-- same distinction `uploaded_by` and `relationship_owner` draw one table over,
+-- and conflating any two of the three is how a roster ends up filed under the
+-- wrong person (see docs/EXTERNAL-MATCHER.md, 2026-07-30).
+--
+-- NOT BACKFILLED. NULL means "nobody on file", which is the truth for a run
+-- written around the app (the Database console) or one predating the column. The
+-- Audit trail falls back to the uploader of the import that opened the run, and
+-- shows nothing when there is no such import — it never guesses.
+--
+-- Adjust the schema below if yours is not `lakeshore` (it must match DB_SCHEMA).
+-- ============================================================================
+
+SET search_path TO lakeshore, public;
+
+ALTER TABLE comparison ADD COLUMN IF NOT EXISTS created_by varchar(255);

@@ -128,18 +128,24 @@ export async function importCompany(
     owner?: string;
     format?: UploadFormat;
     name?: string;
-    compareBy?: string;
-    /** Which friends the run this import starts should cover — the company side's compare scope.
-     *  Omitted means every source, which is what this path did before the field existed. NOT the
-     *  file's own provenance: a company file has none. */
-    compareSources?: string[];
+    /**
+     * Who is performing the import — `uploaded_by`, and half of what the pre-check's hard block
+     * turns on (the other half, the relationship owner, a company file does not have).
+     *
+     * Defaulted so the common case reads as one person importing repeatedly, which is what the
+     * block is about. A test that wants the repeat ALLOWED passes a second name.
+     */
+    uploader?: string;
   } = {}
 ) {
   const form = new FormData();
   form.append("name", opts.name ?? "Company import");
   form.append("uploadPersonName", opts.owner ?? "Tester");
-  if (opts.compareBy) form.append("compareBy", opts.compareBy);
-  if (opts.compareSources) form.append("compareSources", JSON.stringify(opts.compareSources));
+  // Sent only when a test names one, so the route's own fallback (the typed owner, then the
+  // session) is what every other test exercises — the same chain the UI relies on. Naming it
+  // unconditionally here would make this helper decide the actor for suites that are about
+  // something else entirely, and the pre-check's hard block turns on exactly that value.
+  if (opts.uploader) form.append("uploaderName", opts.uploader);
   await attach(form, { csv: opts.csv ?? DEFAULT_CSV, format: opts.format });
   return app.inject({ method: "POST", url: "/api/comparisons/run", payload: form, headers: form.getHeaders() });
 }
@@ -168,7 +174,6 @@ export async function importFacebook(
     owner?: string;
     uploader?: string;
     type?: string;
-    compareBy?: string;
     format?: UploadFormat;
     name?: string;
   } = {}
@@ -191,9 +196,11 @@ export async function importFacebook(
   const typedOwner = opts.owner ?? (fileHasOwner ? null : "Tester");
   if (typedOwner) form.append("uploadPersonName", typedOwner);
 
+  // Sent only when a test names one — see importCompany. Without it the route falls back to the
+  // typed owner and then to the session, which is the chain the UI relies on and the one the
+  // pre-check's hard block is measured against.
   if (opts.uploader) form.append("uploaderName", opts.uploader);
   if (opts.type) form.append("sourceType", opts.type);
-  if (opts.compareBy) form.append("compareBy", opts.compareBy);
 
   if (body !== null) {
     form.append("facebookFile", Buffer.from(body, "utf8"), {
@@ -222,7 +229,10 @@ export async function startCompare(
   compareBy?: string,
   /** Which friend sources to compare. Omitted means every source — the same thing omitting the
    *  field from the request body means, so a caller that has no opinion sends what it always did. */
-  sources?: string[] | null
+  sources?: string[] | null,
+  /** WHICH ROWS — a company, a relationship owner or a past import. Omitted is the legacy
+   *  whole-table / company-list run, which is what every caller here sent before it existed. */
+  scope?: { filterBy: string; filterValue: string }
 ): Promise<string> {
   const res = await app.inject({
     method: "POST",
@@ -231,6 +241,7 @@ export async function startCompare(
       company_names: companies === null ? null : Array.isArray(companies) ? companies : [companies],
       ...(compareBy ? { compare_by: compareBy } : {}),
       ...(sources === undefined ? {} : { sources }),
+      ...(scope ? { filter_by: scope.filterBy, filter_value: scope.filterValue } : {}),
     }),
     headers: { "content-type": "application/json" },
   });

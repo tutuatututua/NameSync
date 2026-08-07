@@ -1,4 +1,4 @@
-import { GitCompareArrows, UploadCloud, Database, type LucideIcon } from "lucide-react";
+import { GitCompareArrows, ScrollText, UploadCloud, Database, type LucideIcon } from "lucide-react";
 import { mayOpenPage } from "@/lib/auth/access";
 
 export interface NavItem {
@@ -8,7 +8,12 @@ export interface NavItem {
 }
 
 /**
- * Three pages, because the app does three things: compare, hold data, import data.
+ * Four pages: the app does three things — compare, hold data, import data — and keeps a record of
+ * having done them.
+ *
+ * Audit trail sits last because it is the only one that is not a step in any workflow. It is read
+ * *about* the other three rather than used *with* them, so it belongs at the end of the rail rather
+ * than between two pages people move between all day.
  *
  * What used to be here and why it isn't:
  *   Dashboard              — had no content of its own; it linked to Compare and previewed
@@ -22,10 +27,11 @@ export const NAV_ITEMS: NavItem[] = [
   { href: "/", label: "Network", icon: GitCompareArrows },
   { href: "/uploads", label: "Uploads", icon: UploadCloud },
   { href: "/database", label: "Data", icon: Database },
+  { href: "/audit", label: "Audit trail", icon: ScrollText },
 ];
 
 /**
- * The nav for one account. A reviewer is left with "Network" alone — the other two are
+ * The nav for one account. A reviewer keeps "Network" and "Audit trail" — the other two are
  * pages AuthGuard would bounce them off, and a link that throws you back where you came
  * from is worse than no link.
  *

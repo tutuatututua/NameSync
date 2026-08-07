@@ -63,6 +63,14 @@ async function centerPost(path: string, body: unknown): Promise<CenterResponse> 
     // DNS failure, refused connection, TLS error, timeout — Center is unreachable.
     throw new ServiceUnavailable("Center sign-in is temporarily unavailable. Please try again.");
   }
+  // A 5xx is Center broken, not the user being wrong, and it must be told apart from a
+  // rejection. Without this it falls through to centerLogin's catch-all and is reported as
+  // "Incorrect email or password" — the exact thing the docblock above promises never happens.
+  // Since the sign-in throttle counts credential failures, an outage would also spend a real
+  // user's attempts and lock them out over something that was never their fault.
+  if (res.status >= 500) {
+    throw new ServiceUnavailable("Center sign-in is temporarily unavailable. Please try again.");
+  }
   const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
   return { status: res.status, ok: res.ok, data };
 }

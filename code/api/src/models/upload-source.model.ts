@@ -81,9 +81,12 @@ export class UploadSourceModel extends DBModel {
       known.add(key);
     }
 
-    // A source on FRIEND rows whose import is gone (rolled back, or the friend enriched from a
-    // later import) has no entry above and no upload counting it — but its people are still on
-    // file and still comparable, so the picker has to offer it or they are unreachable.
+    // A source on FRIEND rows whose import is gone — rolled back, or its `upload` row deleted —
+    // has no entry above and no upload counting it, but its people are still on file and still
+    // comparable, so the picker has to offer it or they are unreachable. (The other way this used
+    // to happen is gone: an import could once "enrich" a row belonging to an earlier upload, so a
+    // source could outlive every import that named it. Imports stack now and touch nobody else's
+    // rows, so a friend's source always belongs to the import that wrote that row.)
     for (const [key, friendCount] of Object.entries(friendCounts)) {
       if (known.has(key)) continue;
       out.push({ value: key, label: key, useCount: 0, friendCount });

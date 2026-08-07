@@ -17,6 +17,24 @@ export function formatDate(iso: string | null | undefined): string {
 }
 
 /**
+ * The clock time alone — "10:31 AM".
+ *
+ * The one thing `formatDate` cannot say: which of two things that happened on the SAME DAY came
+ * first. Every list in this product prints a date and nothing finer, which is right until two rows
+ * are the same file imported ten minutes apart — then the only field that could tell them apart
+ * prints identical words on both. See `subjectTitles` in `lib/run-groups.ts`, its one caller.
+ *
+ * Null rather than "Unknown time" for an unparseable date: this is only ever appended to something
+ * that already reads correctly on its own, so having nothing to add means adding nothing.
+ */
+export function formatTimeOfDay(iso: string | null | undefined): string | null {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+}
+
+/**
  * A set of companies, as a sentence fragment.
  *
  * A run can be pointed at several companies, and every line that used to interpolate one name now

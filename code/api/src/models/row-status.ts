@@ -12,6 +12,7 @@ import {
   ROW_MATCHED_VALUES,
   ROW_FAILED_VALUES,
   ROW_UNFINISHED_VALUES,
+  type CompareBy,
   type CompareLanguage,
   type MatchStrength,
   type RowVerdict,
@@ -205,6 +206,32 @@ export function strengthRankSql(compareByColumn: string): RawBuilder<number> {
   // Only `lead` is tested: everything else — the confirmed modes, NULL, and any unrecognised
   // string — ranks 0, which is exactly how `matchStrengthSql` resolves them.
   return sql<number>`case when ${s} in (${lead}) then 1 else 0 end`;
+}
+
+/**
+ * A stored `compare_by` as one of the six canonical modes, in SQL — `parseCompareBy`'s mirror.
+ *
+ * The whole value rather than an axis of it, because its caller is a GROUP BY: the audit breakdown
+ * tallies runs per mode, and it must not be possible for a NULL and an `en_full` to arrive as two
+ * rows. Everything unrecognised resolves to `DEFAULT_COMPARE_BY`, exactly as `parseCompareBy` does
+ * on the way out of the database — a run whose mode column holds something odd is still a run, and
+ * it is already counted as a default-mode run by every other page.
+ *
+ * Built by listing the vocabulary rather than by testing the string's shape, for the same reason
+ * `compareLanguageSql` is: a `coalesce(compare_by, 'en_full')` would pass `sideways` straight
+ * through into a seventh bucket that no reader has a label for.
+ *
+ * The language and type breakdowns are folded from THIS in TypeScript (`compareByAxes`), not queried
+ * separately. Three GROUP BYs over the same column would be three chances to disagree about one
+ * run's mode, and the three tallies are supposed to reconcile: by-language and by-type are the same
+ * runs, cut two ways.
+ */
+export function compareByModeSql(compareByColumn: string): RawBuilder<CompareBy> {
+  const s = sql`lower(trim(coalesce(${sql.ref(compareByColumn)}, '')))`;
+  const branches = COMPARE_BY_VALUES.map(
+    (mode) => sql`when ${s} = ${sql.val(mode)} then ${sql.val(mode)}`
+  );
+  return sql<CompareBy>`case ${sql.join(branches, sql` `)} else ${sql.val(DEFAULT_COMPARE_BY)} end`;
 }
 
 /**

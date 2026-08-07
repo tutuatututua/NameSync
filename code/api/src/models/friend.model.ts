@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { DBModel } from "@extensions/sqldb";
 import { sql, type RawBuilder, type SqlBool } from "kysely";
 import {
@@ -9,6 +10,7 @@ import {
   type RunRow,
 } from "@extensions/contract";
 import { isExternalMatcher } from "../config/env";
+import type { KnownOnFile, PriorImport } from "./upload.model";
 import { sameFriendSql } from "./friend-identity";
 import {
   effectiveStatusSql,
@@ -21,7 +23,14 @@ import {
   tallyVerdicts,
   type StatusCounts,
 } from "./row-status";
-import { rowFilterWhere, toRunRow, type RawRunRow, type RunRowFilter, type RunRowSort } from "./run-rows";
+import {
+  rowFilterWhere,
+  rowSearchWhere,
+  toRunRow,
+  type RawRunRow,
+  type RunRowFilter,
+  type RunRowSort,
+} from "./run-rows";
 
 /**
  * "This friend has a match in the run" — an EXISTS over its matched `comparison_result` pairs.
@@ -107,25 +116,54 @@ const friendBestSimilarity = (comparisonId: string): RawBuilder<number | null> =
  * they arrive English-only from a Facebook export and bilingual from a business card, and those
  * are different tuples. That is a visible regression — the roster grows and every count with it.
  *
- * So a row matching an existing one on the same owner and EITHER non-null spelling IS that friend,
- * and fills in the spelling it was missing. `mergeUpload` is an upsert rather than a drop.
+ * So a row matching an existing one on the same owner and EITHER non-null spelling IS that friend.
  *
- * ── The conflict rule: fill NULLs only, never overwrite ──
+ * ── WHAT THAT MATCH NOW DOES: assign identity, not refuse the row (2026-08-04) ──
  *
- * An import may FILL a null spelling. It may never CHANGE one that is already there.
+ * IMPORTS STACK. Every row of every import is inserted, under that import's own `upload_id`, and
+ * the match above decides which `person_key` it carries rather than whether it is written at all.
  *
- * The reason is not tidiness. Result rows written without `friend_id` — every external-workflow
- * row, and everything predating that column — are resolved back to their friend BY NAME, so
- * overwriting a spelling orphans them and the counts break retroactively and silently. `friend_id`
- * narrows that exposure without closing it, because we do not control who writes that table. It is
- * also the stance the whole codebase takes: imports append, verdicts are permanent, history is
- * frozen. A conflicting value is counted and reported, not applied — the Database console stays
- * the deliberate, visible way to change a stored name.
+ * This is not a preference. The external workflow selects what to match with
+ * `WHERE upload_id = :session_id` — it does not read the CSV we send as its work list. A row that
+ * was skipped as a duplicate therefore sat under an EARLIER upload where the workflow could not
+ * see it, and three bugs followed: re-importing the same people to ask a different question opened
+ * no run at all (the "How to compare" was silently dropped); a partly-overlapping file scored only
+ * its genuinely new rows while reporting a clean run; and enriched rows were reset to 'processing'
+ * and then never stamped by anyone, holding later runs' pending counts open forever.
  *
- * The consequence worth stating, because it looks like a regression and is the point: the same
- * person under a DIFFERENT owner is a second row, not a duplicate. That was already true when
- * two people each imported them; it is now true within one file. One person known by three
- * colleagues is three rows, three rosters and three ways to reach them, which is the product.
+ * Stacking makes an import's row set complete by construction, which is the one property that
+ * workflow behaviour requires. See docs/migrations/2026-08-04-stack-imports-and-person-key.sql.
+ *
+ * ── Dedup moved to read time ──
+ *
+ * `person_key` is one uuid shared by every row that is the same person, and `friend_current` folds
+ * on it. A question about PEOPLE reads the view; a question about an IMPORT or a RUN reads this
+ * table. Getting that backwards is the failure mode to watch for, in both directions: folding a
+ * run's rows breaks progress counting, and NOT folding a people question inflates every count in
+ * the Network workspace — silently, and in the flattering direction.
+ *
+ * ── The conflict rule survives, by a different mechanism ──
+ *
+ * An import may not CHANGE a spelling already on file. It never could, and now it structurally
+ * cannot: it writes its own row and leaves every earlier one untouched. What decides the person's
+ * displayed name is the fold, which takes the OLDEST non-null spelling per language — so the first
+ * spelling recorded still wins, exactly as fill-only produced before.
+ *
+ * That matters for the same reason it always did: result rows written without `friend_id` — every
+ * external-workflow row, and everything predating that column — resolve back to their friend BY
+ * NAME. Under stacking a conflicting spelling's row is still on file, still carrying the shared
+ * `person_key`, so name resolution finds it and lands on the right person either way. A conflict is
+ * still counted and reported; the Database console stays the visible way to change a stored name.
+ *
+ * ── Two things this does NOT merge ──
+ *
+ * The same person under a DIFFERENT owner is a different `person_key`, not a duplicate. One person
+ * known by three colleagues is three rosters and three ways to reach them, which is the product.
+ *
+ * Two spellings that share no common name — an English-only row and a Thai-only row for one
+ * person — cannot be linked, because nothing in the data says they are the same. A later row
+ * carrying BOTH names does link them, and when it does the two existing groups are merged into
+ * one: see the union-find in `mergeUpload`.
  */
 
 export interface FriendRecord {
@@ -190,50 +228,126 @@ const spellKey = (owner: string | null, lang: CompareLanguage, name: string) =>
   JSON.stringify([owner === null ? null : owner.toLowerCase(), lang, name.toLowerCase()]);
 
 /**
- * One enriched row as the merge FOUND it, which is what it takes to put it back.
+ * ── THE EXACT-DUPLICATE KEY — every column, plus who imported it ──
  *
- * `en` / `th` are the spellings this merge FILLED, not the row's previous contents — the fill-only
- * rule (see the conflict rule above) means anything it wrote was NULL beforehand, so "what it wrote"
- * and "what to undo" are the same list. Null in a language the merge did not touch.
+ * A DIFFERENT question from `spellKey` above, and both are needed. Identity asks "is this the same
+ * human", and answers it loosely on purpose (either spelling, same owner) so one person known by
+ * two names folds to one roster entry. THIS asks "is this row already in the table, verbatim, from
+ * this person" — answered strictly, because it decides whether to WRITE, and a loose answer there
+ * discards data somebody meant to keep.
  *
- * `status` is the verdict the row carried before the merge reset it to 'processing'. Null when the
- * column was not read (internal matcher), in which case reverting leaves it alone rather than
- * writing a null into a NOT NULL column.
+ * So a friend whose Thai spelling arrived in a later file is NOT a duplicate of the row that held
+ * only their English name: the rows differ, the second carries something the first did not, and
+ * dropping it would lose the spelling. They are still one PERSON — `person_key` says so.
+ *
+ * Folded throughout, because every column here is either stored folded already (the two names, by
+ * the cleaner) or is free text a human typed that the whole product compares case-insensitively
+ * (`relationship_owner`, `source`, `uploaded_by`).
  */
-export interface EnrichedBefore {
-  id: string;
-  en: string | null;
-  th: string | null;
-  status: string | null;
+const dupKey = (
+  by: string | null,
+  src: string | null,
+  owner: string | null,
+  en: string | null,
+  th: string | null
+): string =>
+  JSON.stringify([
+    by?.toLowerCase() ?? null,
+    src?.toLowerCase() ?? null,
+    owner?.toLowerCase() ?? null,
+    en?.toLowerCase() ?? null,
+    th?.toLowerCase() ?? null,
+  ]);
+
+/** A prior row, as both readers of the duplicate rule select it. */
+interface PriorFriendRow {
+  relationship_owner: string | null;
+  friend_name_en: string | null;
+  friend_name_th: string | null;
+  source: string | null;
+  uploaded_by: string | null;
+  upload_status: string | null;
 }
 
-/** What one merge did. `added + enriched` is the number of rows with something new to match. */
+/**
+ * WHICH ROWS OF THIS FILE WOULD BE DROPPED — one answer, two callers.
+ *
+ * `mergeUpload` uses it to decide what to insert; the import pre-check uses it to tell the user
+ * before they commit. They MUST agree: a screen that marks three rows as "will be dropped" over an
+ * import that drops five is worse than one that says nothing at all, and the only way two callers
+ * cannot disagree is for there to be one function.
+ *
+ * Pure, and takes the prior rows rather than fetching them, so `mergeUpload` reuses the scan it
+ * already does for identity instead of paying for a second one on a 40,000-row import.
+ *
+ * The mask is built in FILE ORDER and grows as it goes, so a file naming the same row twice drops
+ * its own repeat as well as a repeat of the table — the second occurrence is, by then, "already on
+ * file, verbatim".
+ *
+ * Rolled-back rows are skipped: rollback hard-deletes them, so they are not on file to duplicate.
+ * A row whose upload is gone carries `uploaded_by: null` and matches nothing, which is right — it
+ * cannot be anybody's second copy if nobody is on record as having imported it.
+ */
+export const friendDropMask = (
+  prior: PriorFriendRow[],
+  records: FriendRecord[],
+  source: string,
+  uploadedBy: string | null
+): boolean[] => {
+  const onFile = new Set<string>();
+  for (const p of prior) {
+    if (p.upload_status === "rolled_back") continue;
+    onFile.add(dupKey(p.uploaded_by, p.source, p.relationship_owner, p.friend_name_en, p.friend_name_th));
+  }
+  return records.map((r) => {
+    const k = dupKey(uploadedBy, source, r.relationship_owner, r.friend_name_en, r.friend_name_th);
+    if (onFile.has(k)) return true;
+    onFile.add(k);
+    return false;
+  });
+};
+
+/** What one merge did. */
 export interface MergeResult {
+  /**
+   * Rows WRITTEN — the file's usable rows minus the ones dropped as exact duplicates.
+   *
+   * The size of the job handed to the matcher, and what `upload.total_records` stores and a run's
+   * `scoredCount` is read from. It is therefore also the size of what the run can ever say
+   * anything about: a dropped row is filed under an EARLIER upload, and the external workflow
+   * selects with `WHERE upload_id = :session_id`, so this run will not cover it. That is the
+   * deliberate trade of dropping (2026-08-05) — see the note on `duplicates`.
+   */
   added: number;
+  /**
+   * Rows DROPPED — already on file, verbatim, from this same uploader. Not written.
+   *
+   * ── THIS MEANING HAS NOW CHANGED TWICE, SO READ IT RATHER THAN ASSUMING ──
+   *
+   * It counted discarded rows originally; on 2026-08-04 it became purely informational ("describes
+   * somebody already on file") when imports began to stack; and on 2026-08-05 it went back to
+   * counting discards — but on a much stricter key than the first time. What is dropped now is a
+   * row identical in EVERY column, from the same `uploaded_by`. A row that shares a person with one
+   * already on file but differs in any column (a spelling the old row lacked, a different source, a
+   * different owner, a different importer) is still written, and `person_key` folds it to the same
+   * human at read time.
+   *
+   * That strictness is what makes dropping safe where the 2026-08-04 version was not: the rows it
+   * discards carry no information the stored ones lack, so a run that cannot see them is not
+   * missing anything the file said. Reported to the person importing and stored on
+   * `upload.duplicate_records`.
+   */
   duplicates: number;
-  /** Existing friends that gained a spelling they did not have. */
-  enriched: number;
   /**
-   * The ids of those rows, so the caller can send them to the workflow.
-   *
-   * They are NOT in this upload — an enriched row belongs to whichever import first created it —
-   * so `findByUploadId` cannot see them and the webhook payload has to be told about them
-   * explicitly. They carry matchable data no previous run has ever seen, which is exactly the
-   * definition of a row worth matching.
+   * People this import LINKED that were previously two — a row carrying both spellings arriving
+   * after an English-only row and a Thai-only row for one person. Rare, and worth reporting
+   * separately from `duplicates` because the roster visibly shrinks when it happens.
    */
-  enrichedIds: string[];
+  linked: number;
   /**
-   * The same rows, described well enough to undo — for an import whose handover to the ingestion
-   * webhook fails and is therefore discarded whole (see `revertEnrichment`).
-   *
-   * Deleting the upload's own rows cannot reach these: an enriched friend belongs to an EARLIER
-   * import, so a cascade from this one leaves it holding a spelling that no successful import ever
-   * put there, and stuck at 'processing'.
-   */
-  enrichedBefore: EnrichedBefore[];
-  /**
-   * Incoming spellings that DISAGREED with a stored one. Counted and reported, never applied —
-   * see the conflict rule in this file's header for why overwriting is the unsafe direction.
+   * Incoming spellings that DISAGREED with one already on file. Counted and reported, never
+   * applied — see the conflict rule in this file's header. The disagreeing row is still stored
+   * (everything is); it just does not become the person's displayed name.
    */
   conflicts: number;
 }
@@ -272,60 +386,76 @@ const friendRowSelect = [
 
 export class FriendModel extends DBModel {
   /**
-   * Insert an upload's parsed friends, skipping any (owner, name) pair that owner already has
-   * — from an earlier upload, or twice within this file.
+   * Write an upload's parsed friends — ALL of them — and give each the `person_key` of whoever it
+   * turns out to be.
    *
-   * `records` arrive with their owners already resolved: the route has applied the typed owner
-   * over every row when one was given, and refused the import outright if that left any row
-   * unowned — so every record here knows whose it is and this method never has to look at the
-   * parent upload. That is the structural change: the owner used to be read once, from
-   * `upload.uploaded_by`, and applied to the whole batch.
+   * Nothing is skipped. That is the change: this used to drop a row whose (owner, either spelling)
+   * an earlier import already held, and the dropped row's absence from THIS upload is what made the
+   * external workflow — which matches `WHERE upload_id = :session_id` — unable to see it. See the
+   * header of this file for the three bugs that produced.
+   *
+   * `records` arrive with their owners already resolved: the route applied the typed owner over
+   * every row when one was given, and refused the import outright if that left any row unowned — so
+   * every record here knows whose it is and this never has to look at the parent upload.
+   *
+   * ── HOW IDENTITY IS DECIDED ──
+   *
+   * One probe per non-null spelling, against `(lower(owner), name)`. A hit means "this is that
+   * person", and the row inherits their key. No hit at all means a new person, and a fresh uuid.
+   *
+   * A row can hit TWO different people, and that is not a conflict — it is evidence. An English-only
+   * row and a Thai-only row for one person are two groups precisely because nothing had ever linked
+   * them; a business card carrying both spellings is that link. The two groups are then merged, in
+   * the database and in this batch's own bookkeeping, by the union-find below. Doing it any other
+   * way (picking one, or filing a third) would leave the roster permanently claiming two people
+   * where the data now says one.
    */
   static async mergeUpload(
     uploadId: string,
     source: string,
-    records: FriendRecord[]
+    records: FriendRecord[],
+    /**
+     * Who is performing this import — `upload.uploaded_by`, and part of the duplicate key.
+     *
+     * A row is only dropped as a duplicate of one THIS person already filed. Two people importing
+     * the same roster is a fact about the network worth storing twice; one person importing it
+     * twice is not. Null (nobody named) can never equal a stored uploader, so nothing is dropped.
+     */
+    uploadedBy: string | null
   ): Promise<MergeResult> {
-    const empty: MergeResult = {
-      added: 0,
-      duplicates: 0,
-      enriched: 0,
-      enrichedIds: [],
-      enrichedBefore: [],
-      conflicts: 0,
-    };
+    const empty: MergeResult = { added: 0, duplicates: 0, linked: 0, conflicts: 0 };
     if (records.length === 0) return empty;
     const db = await this.getKyselyDB();
 
-    // Only the owners this batch actually mentions can collide, so the prior scan is scoped to
-    // them rather than reading the whole table — one query however many owners the file names,
-    // not one per owner. Folded, because the key is folded.
+    // Only the owners this batch mentions can match, so the prior scan is scoped to them rather
+    // than reading the whole table — one query however many owners the file names, not one per
+    // owner. Folded, because the key is folded.
     const owners = [...new Set(records.map((r) => r.relationship_owner))];
     const named = [...new Set(owners.filter((o): o is string => o !== null).map((o) => o.toLowerCase()))];
-    // A record with no owner only ever dedupes against other ownerless rows — the same stance
-    // the old key took for an upload with no uploader. Unreachable from the import (a social
-    // import is refused without an owner), but the DB console can write one.
+    // A record with no owner only ever matches other ownerless rows. Unreachable from the import
+    // (a social import is refused without an owner), but the Database console can write one.
     const hasUnowned = owners.includes(null);
 
+    /**
+     * The prior rows, plus the two facts the DUPLICATE key needs that the identity key does not:
+     * this row's own `source`, and who imported it.
+     *
+     * LEFT JOIN, not inner: a row whose `upload` has gone (an import discarded mid-flight) is
+     * still on file and still folds into its person, it simply cannot be anybody's duplicate —
+     * `uploaded_by` comes back null and matches no incoming row. Filtering it out instead would
+     * quietly drop it from the identity fold too, which is a different and much worse change.
+     */
     const prior = await db
       .selectFrom("friend")
+      .leftJoin("upload", "upload.id", "friend.upload_id")
       .select([
-        "friend.id",
+        "friend.person_key",
         "friend.relationship_owner",
         "friend.friend_name_en",
         "friend.friend_name_th",
-        // The verdict an enriched row is about to lose — the UPDATE below resets it to
-        // 'processing' — kept so a discarded import can put it back. Read here rather than
-        // re-queried later because "before" only exists before.
-        //
-        // Guarded like every other read of this column: it arrives with the hand-applied
-        // row-status migration (see friendRowSelect), and this SELECT runs on every social
-        // import, so naming it unconditionally would break them all on a database that has not
-        // had that migration. Null then, which `revertEnrichment` reads as "leave it alone".
-        (isExternalMatcher()
-          ? sql<string | null>`friend.status`
-          : sql<string | null>`null`
-        ).as("prior_status"),
+        "friend.source",
+        "upload.uploaded_by as uploaded_by",
+        "upload.status as upload_status",
       ])
       .where((eb) =>
         eb.or([
@@ -335,260 +465,458 @@ export class FriendModel extends DBModel {
       )
       .execute();
 
+    /** What we know each person is called — the conflict test, and what a merge has to carry over. */
+    const spellings = new Map<string, { en: Set<string>; th: Set<string> }>();
+
     /**
-     * One person, as this merge currently understands them.
+     * Union-find over `person_key`, so a merge is recorded once and every reference to the losing
+     * key resolves through it afterwards — including references taken BEFORE the merge happened.
      *
-     * `id` is null for a friend this batch is about to INSERT. Such a row needs no UPDATE: filling
-     * its missing spelling is an edit to the pending record, which then gets inserted complete.
-     * That is what makes a single file carrying "somchai jaidee" on one line and "somchai jaidee /
-     * สมชาย ใจดี" on another produce ONE row with both spellings rather than a row plus an update.
+     * Rewriting a map in place would not be enough: rows earlier in this same file may already
+     * carry the losing key, and they are not written until the end. Resolving at read time lands
+     * them on the winner without a second pass.
      */
-    type Slot = {
-      id: string | null;
-      owner: string | null;
-      en: string | null;
-      th: string | null;
-      pending: FriendRecord | null;
+    const parent = new Map<string, string>();
+    const find = (k: string): string => {
+      const p = parent.get(k);
+      if (p === undefined || p === k) return k;
+      const root = find(p);
+      parent.set(k, root); // path compression
+      return root;
+    };
+    const union = (a: string, b: string): boolean => {
+      const ra = find(a);
+      const rb = find(b);
+      if (ra === rb) return false;
+      // Lexicographically smallest wins, purely so the outcome does not depend on row order: two
+      // imports of the same file must pick the same survivor.
+      const [winner, loser] = ra < rb ? [ra, rb] : [rb, ra];
+      parent.set(loser, winner);
+      // The loser's names come too, or the conflict test would stop seeing half of what this
+      // person is called the moment two groups merged.
+      const ls = spellings.get(loser);
+      if (ls) {
+        const ws = spellings.get(winner) ?? { en: new Set<string>(), th: new Set<string>() };
+        for (const n of ls.en) ws.en.add(n);
+        for (const n of ls.th) ws.th.add(n);
+        spellings.set(winner, ws);
+        spellings.delete(loser);
+      }
+      return true;
     };
 
-    // Every stored spelling is a way in to its row, which is what "either spelling identifies the
-    // friend" means operationally: two keys per row, both pointing at the same Slot.
-    const index = new Map<string, Slot>();
-    const put = (slot: Slot, lang: CompareLanguage, name: string | null) => {
-      if (name) index.set(spellKey(slot.owner, lang, name), slot);
-    };
-    // Kept beside the index rather than on the Slot: it is not part of identity, and only the
-    // rows that turn out to be enriched will ever be asked for it.
-    const priorStatus = new Map<string, string | null>();
+    /** Every stored spelling is a way in to its person. Two entries per bilingual row, one value. */
+    const keyBySpelling = new Map<string, string>();
 
-    for (const r of prior) {
-      const slot: Slot = {
-        id: r.id as string,
-        owner: r.relationship_owner,
-        en: r.friend_name_en,
-        th: r.friend_name_th,
-        pending: null,
-      };
-      priorStatus.set(slot.id as string, r.prior_status ?? null);
-      put(slot, "en", slot.en);
-      put(slot, "th", slot.th);
+    const note = (key: string, owner: string | null, lang: CompareLanguage, name: string | null) => {
+      if (!name) return;
+      const root = find(key);
+      let s = spellings.get(root);
+      if (!s) {
+        s = { en: new Set<string>(), th: new Set<string>() };
+        spellings.set(root, s);
+      }
+      s[lang].add(name);
+      keyBySpelling.set(spellKey(owner, lang, name), root);
+    };
+
+    for (const p of prior) {
+      const key = p.person_key as string;
+      note(key, p.relationship_owner, "en", p.friend_name_en);
+      note(key, p.relationship_owner, "th", p.friend_name_th);
     }
 
-    // Both sides of the comparison are keyed the same way, which is the only reason it is
-    // correct: stored names and incoming names have been through the same cleaner, so the
-    // strings are directly comparable and neither side needs a fallback the other lacks.
-    const find = (r: FriendRecord): Slot | null => {
+    /**
+     * Which rows this file will NOT write — computed once, from the same function the import
+     * pre-check answered the preview with. See `friendDropMask`.
+     */
+    const drop = friendDropMask(prior, records, source, uploadedBy);
+
+    // Both sides keyed the same way, which is the only reason this is correct: stored names and
+    // incoming names have been through the same cleaner, so they compare directly.
+    const probe = (r: FriendRecord): string[] => {
+      const hits = new Set<string>();
       for (const lang of LANGS) {
         const name = r[NAME_COL[lang]];
         if (!name) continue;
-        const hit = index.get(spellKey(r.relationship_owner, lang, name));
-        if (hit) return hit;
+        const hit = keyBySpelling.get(spellKey(r.relationship_owner, lang, name));
+        if (hit) hits.add(find(hit));
       }
-      return null;
+      return [...hits];
     };
 
-    const fresh: FriendRecord[] = [];
-    const updates: { id: string; en: string | null; th: string | null }[] = [];
-    const enrichedIds = new Set<string>();
+    /** The rows that will actually be written, with the person each resolved to. */
+    const toInsert: { record: FriendRecord; key: string }[] = [];
     let duplicates = 0;
+    let linked = 0;
     let conflicts = 0;
 
-    for (const r of records) {
-      const hit = find(r);
-
-      if (!hit) {
-        const slot: Slot = {
-          id: null,
-          owner: r.relationship_owner,
-          en: r.friend_name_en,
-          th: r.friend_name_th,
-          pending: r,
-        };
-        put(slot, "en", slot.en);
-        put(slot, "th", slot.th);
-        fresh.push(r);
+    for (const [i, r] of records.entries()) {
+      /**
+       * ALREADY HERE, VERBATIM, FROM THIS PERSON — dropped rather than written.
+       *
+       * Checked before anything else in the loop, and added to the set as we go, so a file naming
+       * the same row twice drops its own repeat as well as a repeat of the table. `continue` skips
+       * the identity work too, which is correct: this row says nothing the stored one did not, so
+       * there is no spelling to note and nothing that could link two people.
+       */
+      if (drop[i]) {
+        duplicates += 1;
         continue;
       }
 
-      // Fill what is missing, refuse what disagrees, and count both. A record can do both at once
-      // (its English name matches but differs in case-folded spelling while its Thai name is new),
-      // so these are not exclusive and neither short-circuits the other.
-      const patch: { en: string | null; th: string | null } = { en: null, th: null };
-      let filled = false;
-      let conflicted = false;
+      const hits = probe(r);
 
-      for (const lang of LANGS) {
-        const incoming = r[NAME_COL[lang]];
-        if (!incoming) continue;
-        const stored = hit[lang];
-        if (stored === null) {
-          patch[lang] = incoming;
-          filled = true;
-        } else if (stored !== incoming) {
-          conflicted = true;
+      let key: string;
+      if (hits.length === 0) {
+        key = randomUUID();
+      } else {
+        key = hits[0] as string;
+        // The linking case. Every extra group this row touched is the same person as the first,
+        // and this row is the evidence that says so.
+        for (const other of hits.slice(1)) {
+          if (union(key, other)) linked += 1;
         }
+        key = find(key);
+        // NOT counted as a duplicate. This row names somebody already on file but is not the same
+        // ROW — a new spelling, a new source, a different importer — so it is written, and
+        // `person_key` is what folds the two into one person at read time. `duplicates` counts only
+        // what was dropped; see `MergeResult`.
       }
 
-      if (conflicted) conflicts += 1;
-
-      if (filled) {
+      // "Do we already hold a DIFFERENT name for this person in this language?" — the same question
+      // the fill-only rule asked before refusing to overwrite. Asked BEFORE this row's own
+      // spellings are recorded, or it would always agree with itself.
+      const known = spellings.get(key);
+      if (known) {
         for (const lang of LANGS) {
-          const value = patch[lang];
-          if (!value) continue;
-          hit[lang] = value;
-          // Register the new spelling so a LATER record in this same batch that carries only that
-          // spelling still resolves to this friend instead of inserting a second row.
-          put(hit, lang, value);
+          const incoming = r[NAME_COL[lang]];
+          if (!incoming) continue;
+          if (known[lang].size > 0 && !known[lang].has(incoming)) conflicts += 1;
         }
-        if (hit.pending) {
-          // Not yet in the database: fill the record that is about to be inserted.
-          hit.pending.friend_name_en = hit.en;
-          hit.pending.friend_name_th = hit.th;
-        } else if (hit.id) {
-          updates.push({ id: hit.id, en: patch.en, th: patch.th });
-          enrichedIds.add(hit.id);
-        }
-      } else if (!conflicted) {
-        duplicates += 1;
       }
+
+      // Register this row's spellings, so a LATER row in this same file carrying only one of them
+      // resolves to the same person instead of starting a second one.
+      note(key, r.relationship_owner, "en", r.friend_name_en);
+      note(key, r.relationship_owner, "th", r.friend_name_th);
+      toInsert.push({ record: r, key });
     }
 
-    if (fresh.length > 0) {
-      await db
-        .insertInto("friend")
-        .values(
-          fresh.map((r) => ({
-            upload_id: uploadId,
-            source,
-            friend_name_en: r.friend_name_en,
-            friend_name_th: r.friend_name_th,
-            relationship_owner: r.relationship_owner,
-          }))
-        )
-        .execute();
-    }
+    // Every row of this file was already here, verbatim, from this person. Nothing to write — and
+    // the caller turns that into a refusal rather than an empty import (see `enforcePrecheck`).
+    if (toInsert.length === 0) return { added: 0, duplicates, linked, conflicts };
 
-    if (updates.length > 0) {
-      /**
-       * One statement, not one per row: a first bilingual import can enrich thousands of existing
-       * friends, and a loop of UPDATEs would make that import's cost linear in round trips.
-       *
-       * `coalesce(f.<col>, v.<col>)` enforces fill-only IN THE DATABASE as well as in the loop
-       * above. That is not redundancy for its own sake — it means a spelling written between the
-       * SELECT and this UPDATE cannot be clobbered by a decision made against a stale read.
-       *
-       * `status` resets to 'processing' because the row now holds data no run has matched against.
-       * That is what makes the completion poll wait for these rows rather than reporting the
-       * import finished before the workflow has seen them. `updated_at` moves on its own —
-       * `trg_friend_updated` fires on every UPDATE — and it should: the row did change.
-       */
-      const values = sql.join(
-        updates.map(
-          (u) =>
-            sql`(${sql.val(u.id)}::bigint, ${sql.val(u.en)}::varchar, ${sql.val(u.th)}::varchar)`
-        )
-      );
+    /**
+     * Apply the merges to rows already in the database.
+     *
+     * Only groups that actually LOST — `find(k) !== k` — need touching. A batch that linked nothing
+     * runs no statement at all, which is the overwhelmingly common case.
+     */
+    const losers = [...new Set(prior.map((p) => p.person_key as string))].filter((k) => find(k) !== k);
+    if (losers.length > 0) {
+      const moves = sql.join(losers.map((k) => sql`(${sql.val(k)}::uuid, ${sql.val(find(k))}::uuid)`));
       await sql`
         update friend as f
-           set friend_name_en = coalesce(f.friend_name_en, v.en),
-               friend_name_th = coalesce(f.friend_name_th, v.th),
-               status = ${sql.val("processing")}
-          from (values ${values}) as v(id, en, th)
-         where f.id = v.id
+           set person_key = v.to_key
+          from (values ${moves}) as v(from_key, to_key)
+         where f.person_key = v.from_key
       `.execute(db);
     }
 
-    /**
-     * The undo list, folded to one entry per row.
-     *
-     * `updates` is per RECORD and `enrichedIds` is per ROW, and the two can differ: nothing stops
-     * two lines of one file filling one friend's two missing spellings separately. Reverting from
-     * the unfolded list would then emit two VALUES rows for the same id, and `update … from
-     * (values …)` applies exactly one of them — an arbitrary one — silently leaving the other
-     * spelling behind. Folded here so there is one row per id by construction.
-     */
-    const before = new Map<string, EnrichedBefore>();
-    for (const u of updates) {
-      const seen = before.get(u.id);
-      if (seen) {
-        seen.en = seen.en ?? u.en;
-        seen.th = seen.th ?? u.th;
-      } else {
-        before.set(u.id, { id: u.id, en: u.en, th: u.th, status: priorStatus.get(u.id) ?? null });
-      }
-    }
+    // Everything, in one statement. `assigned` is resolved through `find` HERE rather than when it
+    // was pushed, so a row given a key that later lost a union still lands on the winner.
+    await db
+      .insertInto("friend")
+      .values(
+        toInsert.map(({ record, key }) => ({
+          upload_id: uploadId,
+          source,
+          friend_name_en: record.friend_name_en,
+          friend_name_th: record.friend_name_th,
+          relationship_owner: record.relationship_owner,
+          person_key: find(key),
+        }))
+      )
+      .execute();
 
-    return {
-      added: fresh.length,
-      duplicates,
-      enriched: enrichedIds.size,
-      enrichedIds: [...enrichedIds],
-      enrichedBefore: [...before.values()],
-      conflicts,
-    };
+    return { added: toInsert.length, duplicates, linked, conflicts };
   }
 
   /**
-   * Put enriched rows back the way `mergeUpload` found them.
+   * WHICH ROWS OF THIS FILE WOULD BE DROPPED — the pre-check's answer, before anything is written.
    *
-   * The other half of discarding an import whose rows never reached the ingestion webhook.
-   * Deleting the upload takes its own rows with it (`upload_id … ON DELETE CASCADE`); these rows
-   * belong to earlier imports and would otherwise keep a spelling that no successful import ever
-   * put there, which is precisely the "saved anyway" this exists to prevent.
+   * Returns a mask in file order, so the preview can mark the actual rows on screen rather than
+   * printing a number and leaving the reader to work out which ones it meant. `mergeUpload` derives
+   * its inserts from the same function (`friendDropMask`), so what the screen marks and what the
+   * import drops cannot come apart.
    *
-   * Two rules, both load-bearing:
-   *
-   *   · A spelling is cleared only where the column STILL HOLDS THE VALUE WE WROTE. The enrich
-   *     UPDATE fills through `coalesce`, so a concurrent writer may have got there first and our
-   *     write was a no-op; nulling their value would make this method cause the data loss it
-   *     exists to prevent.
-   *   · `status` is restored through `coalesce(v.status, f.status)`, so a merge that never read
-   *     the column (internal matcher) leaves it untouched instead of writing a null into a NOT
-   *     NULL column. Restoring it matters: a row left at 'processing' holds the EARLIER import's
-   *     run open forever, since completion is decided by asking whether any row is unfinished.
-   *
-   * One statement, for the same reason the enrich UPDATE is one: a first bilingual import can
-   * enrich thousands of rows, and undoing it must not cost thousands of round trips.
+   * `source` is a parameter because it is part of the key and the import defaults it — a friends
+   * import with no type chosen stores 'facebook', so the preview has to ask about 'facebook' too or
+   * it would compare the file against rows filed under a source it is not going to use.
    */
-  static async revertEnrichment(before: EnrichedBefore[]): Promise<void> {
-    if (before.length === 0) return;
+  static async dropMask(
+    records: FriendRecord[],
+    source: string,
+    uploadedBy: string | null
+  ): Promise<boolean[]> {
+    if (records.length === 0) return [];
     const db = await this.getKyselyDB();
-    const values = sql.join(
-      before.map(
-        (b) =>
-          sql`(${sql.val(b.id)}::bigint, ${sql.val(b.en)}::varchar, ${sql.val(b.th)}::varchar, ${sql.val(b.status)}::text)`
-      )
-    );
-    await sql`
-      update friend as f
-         set friend_name_en = case when v.en is not null and f.friend_name_en = v.en
-                                   then null else f.friend_name_en end,
-             friend_name_th = case when v.th is not null and f.friend_name_th = v.th
-                                   then null else f.friend_name_th end,
-             status = coalesce(v.status, f.status)
-        from (values ${values}) as v(id, en, th, status)
-       where f.id = v.id
-    `.execute(db);
-  }
 
-  /** The stored rows for a set of ids — the enriched friends, for the webhook payload. */
-  static async findByIds(ids: string[]): Promise<FacebookDataRow[]> {
-    if (ids.length === 0) return [];
-    const db = await this.getKyselyDB();
-    const rows = await db
+    const owners = [...new Set(records.map((r) => r.relationship_owner))];
+    const named = [...new Set(owners.filter((o): o is string => o !== null).map((o) => o.toLowerCase()))];
+    const hasUnowned = owners.includes(null);
+
+    const prior = await db
       .selectFrom("friend")
       .leftJoin("upload", "upload.id", "friend.upload_id")
-      .select(friendRowSelect as never)
-      .where("friend.id", "in", ids)
-      .orderBy("friend.id", "asc")
+      .select([
+        "friend.relationship_owner",
+        "friend.friend_name_en",
+        "friend.friend_name_th",
+        "friend.source",
+        "upload.uploaded_by as uploaded_by",
+        "upload.status as upload_status",
+      ])
+      .where((eb) =>
+        eb.or([
+          ...(named.length > 0 ? [eb(sql<string>`lower(friend.relationship_owner)`, "in", named)] : []),
+          ...(hasUnowned ? [eb("friend.relationship_owner", "is", null)] : []),
+        ])
+      )
       .execute();
-    return rows as unknown as FacebookDataRow[];
+
+    return friendDropMask(prior, records, source, uploadedBy);
   }
 
-  /** Total rows. */
+  /**
+   * How many of these parsed records name somebody ALREADY ON FILE — and which import filed them.
+   *
+   * The import pre-check's numerator — see `ImportPrecheckSchema`. Asked before anything is
+   * written, so the preview screen can say "80 of these 100 people are already on file" and the
+   * import can refuse a repeat that adds nothing.
+   *
+   * Uses the SAME probe as `mergeUpload` — same owner, either spelling — because the two have to
+   * agree about who is already known or the screen's count and the import's behaviour describe
+   * different files. Records within the batch are folded too: a file naming one person twice
+   * contributes one to `known` if they are on file, and nothing if they are not, which is what
+   * makes `known === importable` a truthful "all of these are already here".
+   *
+   * ── `uploadedBy` NARROWS "ON FILE" TO "ON FILE FROM YOU" ──
+   *
+   * The blocking half of the pre-check (see `ImportPrecheckSchema`). Omitted, this answers "does
+   * anyone hold these people" — the question the `partial` / `repeat` wording is built on. Given a
+   * name, it answers "did THIS person already file them", which is the one the refusal turns on:
+   * two people importing the same roster is a fact worth recording, one person importing it twice
+   * is not.
+   *
+   * Rolled-back imports are excluded, and the exclusion is belt-and-braces rather than decorative:
+   * a rollback hard-deletes its rows, so they are not on file to be counted — but an import whose
+   * rows were undone must not go on refusing the re-import that undoing it was the preparation for,
+   * and stating that here means the rule does not depend on how rollback happens to be implemented.
+   *
+   * Folded, because `uploaded_by` is free text the import screen prefills from a session and lets
+   * the user edit — "Alex" and "alex" are one person everywhere else in the product.
+   */
+  static async countKnown(
+    records: FriendRecord[],
+    opts: { uploadedBy?: string | null } = {}
+  ): Promise<KnownOnFile> {
+    const none: KnownOnFile = { known: 0, priorImport: null };
+    if (records.length === 0) return none;
+    // Nobody named cannot have imported anything, so nothing is "already yours". Distinct from
+    // omitting the option, which asks about everybody.
+    if ("uploadedBy" in opts && !opts.uploadedBy) return none;
+    const db = await this.getKyselyDB();
+
+    const owners = [...new Set(records.map((r) => r.relationship_owner))];
+    const named = [...new Set(owners.filter((o): o is string => o !== null).map((o) => o.toLowerCase()))];
+    const hasUnowned = owners.includes(null);
+
+    // The import each stored row came in on, joined rather than looked up afterwards: the refusal
+    // has to NAME the import it is refusing over, and a second query keyed on "the newest import by
+    // this uploader" would name a different file whenever they imported something else since.
+    //
+    // INNER JOIN, so a row whose import was deleted is not on file for this purpose. That is the
+    // right direction: `discardImport` and the rollback path both remove the import, and a row
+    // outliving one is a row nothing can hold the user to.
+    let priorQuery = db
+      .selectFrom("friend")
+      .innerJoin("upload", "upload.id", "friend.upload_id")
+      .select([
+        "friend.relationship_owner",
+        "friend.friend_name_en",
+        "friend.friend_name_th",
+        "upload.id as upload_id",
+        "upload.name as upload_name",
+        "upload.uploaded_by as uploaded_by",
+        "upload.created_at as upload_created_at",
+      ])
+      .where("upload.status", "!=", "rolled_back")
+      .where((eb) =>
+        eb.or([
+          ...(named.length > 0 ? [eb(sql<string>`lower(friend.relationship_owner)`, "in", named)] : []),
+          ...(hasUnowned ? [eb("friend.relationship_owner", "is", null)] : []),
+        ])
+      );
+
+    if (opts.uploadedBy) {
+      const who = opts.uploadedBy.toLowerCase();
+      priorQuery = priorQuery.where(sql<boolean>`lower(upload.uploaded_by) = ${sql.val(who)}`);
+    }
+
+    const prior = await priorQuery.execute();
+
+    // Spelling → the import that filed it. Newest wins, so the message names the most recent time
+    // this happened rather than the first — which is the one the reader remembers doing.
+    const onFile = new Map<string, PriorImport>();
+    for (const p of prior) {
+      const from: PriorImport = {
+        id: String(p.upload_id),
+        name: p.upload_name,
+        uploaded_by: p.uploaded_by,
+        created_at: String(p.upload_created_at),
+      };
+      const note = (key: string): void => {
+        const held = onFile.get(key);
+        if (!held || held.created_at < from.created_at) onFile.set(key, from);
+      };
+      if (p.friend_name_en) note(spellKey(p.relationship_owner, "en", p.friend_name_en));
+      if (p.friend_name_th) note(spellKey(p.relationship_owner, "th", p.friend_name_th));
+    }
+
+    // Counted over distinct PEOPLE in the file, not over rows, for the reason in the doc above.
+    const seen = new Set<string>();
+    let known = 0;
+    let priorImport: PriorImport | null = null;
+    for (const r of records) {
+      const keys = LANGS.map((lang) => {
+        const name = r[NAME_COL[lang]];
+        return name ? spellKey(r.relationship_owner, lang, name) : null;
+      }).filter((k): k is string => k !== null);
+      if (keys.length === 0) continue;
+      if (keys.some((k) => seen.has(k))) continue; // already counted this person from an earlier row
+      keys.forEach((k) => seen.add(k));
+      const from = keys.map((k) => onFile.get(k)).find((f): f is PriorImport => f !== undefined);
+      if (!from) continue;
+      known += 1;
+      if (!priorImport || priorImport.created_at < from.created_at) priorImport = from;
+    }
+    return { known, priorImport };
+  }
+
+  /**
+   * Has the friend side of a run moved since `since`?
+   *
+   * This is what makes "you already ran this" a REFUSAL rather than a note (2026-08-06). Repeating
+   * a run whose inputs have not moved can only reproduce the answer already on file, so the compare
+   * dialog disables its button and `POST /compare` 409s — but the moment a friend lands, the same
+   * question has a new answer waiting and the run has to become askable again. That "moment" is
+   * exactly this query, and getting it wrong in the strict direction traps the user with no way out
+   * but deleting a good run.
+   *
+   * ── IT ASKS ABOUT *THIS RUN'S* FRIENDS, NOT ABOUT THE TABLE ──
+   *
+   * `sources` and `scope` are the same narrowing `findAllForMatching` applies, and they are here
+   * for the same reason they are there: a LinkedIn run is not re-asked by a Facebook import, and
+   * Alex's roster is not re-asked by an import filed under Mint. A table-wide test would unblock
+   * every repeat run in the product on any import at all, which is the feature not existing.
+   *
+   * Keep the two in step. If the definition of "who is in this run" changes in
+   * `findAllForMatching`, it has to change here too, or the block will outlive the answer it is
+   * protecting — the failure mode being a user who imports the friends they were told to import and
+   * still cannot run.
+   *
+   * The narrowing is asked of the PERSON (any of their raw rows matches) and the change is asked of
+   * their rows — so a second import that only adds a Thai spelling to somebody already in the run
+   * counts, which is right: the fold the matcher scores now reads differently.
+   *
+   * `updated_at` as well as `created_at`, because a renamed row is as much a change as a new one:
+   * the Database console can rename a friend, and the run that scored the old spelling is stale.
+   *
+   * A DELETION is NOT detected — a rolled-back import leaves no row to have a timestamp, so a run
+   * whose friends went away stays blocked until something is added. That is the trapping direction
+   * and it is accepted knowingly: the alternative is storing a row count per run and comparing it,
+   * which buys one rare case for a column that can silently disagree with the table it counts.
+   */
+  static async changedSince(
+    since: string,
+    sources: string[] | null = null,
+    scope: { owner?: string | null; uploadId?: string | null } = {}
+  ): Promise<boolean> {
+    const db = await this.getKyselyDB();
+    // The fold, like `findAllForMatching` — the question is about the people a run covers, and a
+    // person is covered once, however many times they have been imported.
+    let q = db.selectFrom("friend_current").select("friend_current.person_key as person_key");
+
+    // ── The three narrowings, as `findAllForMatching` states them. See there for why each is asked
+    //    of the raw rows rather than of the fold's collapsed value.
+    if (sources !== null) {
+      q = q.where(({ exists, selectFrom }) =>
+        exists(
+          selectFrom("friend")
+            .select("friend.id")
+            .whereRef("friend.person_key", "=", "friend_current.person_key")
+            .where(sql<boolean>`lower(friend.source) = any(${sql.val(sources)}::text[])`)
+        )
+      );
+    }
+
+    if (scope.owner) {
+      const owner = scope.owner.toLowerCase();
+      q = q.where(({ exists, selectFrom }) =>
+        exists(
+          selectFrom("friend")
+            .select("friend.id")
+            .whereRef("friend.person_key", "=", "friend_current.person_key")
+            .where(sql<boolean>`lower(friend.relationship_owner) = ${sql.val(owner)}`)
+        )
+      );
+    }
+
+    if (scope.uploadId) {
+      q = q.where(({ exists, selectFrom }) =>
+        exists(
+          selectFrom("friend")
+            .select("friend.id")
+            .whereRef("friend.person_key", "=", "friend_current.person_key")
+            .where("friend.upload_id", "=", scope.uploadId as string)
+        )
+      );
+    }
+
+    const row = await q
+      .where(({ exists, selectFrom }) =>
+        exists(
+          selectFrom("friend")
+            .select("friend.id")
+            .whereRef("friend.person_key", "=", "friend_current.person_key")
+            .where((eb) =>
+              eb.or([
+                eb("friend.created_at", ">", since as never),
+                eb("friend.updated_at", ">", since as never),
+              ])
+            )
+        )
+      )
+      .limit(1)
+      .executeTakeFirst();
+    return row !== undefined;
+  }
+
+  /**
+   * How many friends are on file — PEOPLE, not rows.
+   *
+   * Reads the fold. Since imports stack, the raw row count is "how many times somebody has been
+   * imported", which is not a number anyone has ever wanted on the Data page: re-importing one
+   * file twice would double it while the roster below it stayed the same length.
+   */
   static async stats(): Promise<{ total: number }> {
     const db = await this.getKyselyDB();
-    const row = await db.selectFrom("friend").select(db.fn.count("id").as("count")).executeTakeFirst();
+    const row = await db
+      .selectFrom("friend_current")
+      .select(db.fn.count("person_key").as("count"))
+      .executeTakeFirst();
     return { total: Number(row?.count) || 0 };
   }
 
@@ -675,7 +1003,13 @@ export class FriendModel extends DBModel {
     sort: RunRowSort,
     compareBy: CompareBy,
     /** The reader's chosen bar, or null for the workflow's own verdicts. See `regradeVerdict`. */
-    threshold: number | null = null
+    threshold: number | null = null,
+    /**
+     * The search box's text, or null. Matched against the friend's two spellings and whose
+     * relationship they are — the row's own columns, so the count below is built from the same
+     * predicate as the page. See `rowSearchWhere`.
+     */
+    q: string | null = null
   ): Promise<PaginatedResult<RunRow>> {
     const db = await this.getKyselyDB();
     const offset = (page - 1) * limit;
@@ -694,12 +1028,18 @@ export class FriendModel extends DBModel {
     const scorable = scorableSql(language);
     const bucket = runRowBucketSql(verdict, scorable);
     const where = rowFilterWhere(bucket, filter);
+    const search = rowSearchWhere(
+      ["friend.friend_name_en", "friend.friend_name_th", "friend.relationship_owner"],
+      q
+    );
 
     let rows = db.selectFrom("friend").where("friend.upload_id", "=", uploadId);
     if (where) rows = rows.where(where);
+    if (search) rows = rows.where(search);
 
     let count = db.selectFrom("friend").where("friend.upload_id", "=", uploadId);
     if (where) count = count.where(where);
+    if (search) count = count.where(search);
 
     const selected = rows
       .innerJoin("upload", "upload.id", "friend.upload_id")
@@ -896,8 +1236,20 @@ export class FriendModel extends DBModel {
    * An empty array is NOT accepted as "everything": the caller normalises empty to null long before
    * here, and if one arrived it would correctly score nobody. That is why the parameter is
    * `string[] | null` and not `string[]` — the two states have to stay distinguishable in the type.
+   *
+   * ── `scope` NARROWS IT AGAIN, ON A DIFFERENT AXIS ──
+   *
+   * The run's `filter_by` / `filter_value`, for the two kinds that select friends: one relationship
+   * owner, or one past import. It composes with `sources` rather than replacing it — "Alex's
+   * LinkedIn friends" is a legal and useful run — and both narrow the same way, by asking the RAW
+   * rows rather than the fold, for the same reason `sources` does: a person can reach the fold
+   * through several imports and several owners, and filtering the collapsed value would drop them
+   * from a run they belong in because their newest row happened to say something else.
    */
-  static async findAllForMatching(sources: string[] | null = null): Promise<
+  static async findAllForMatching(
+    sources: string[] | null = null,
+    scope: { owner?: string | null; uploadId?: string | null } = {}
+  ): Promise<
     {
       id: string;
       friend_name_en: string | null;
@@ -906,25 +1258,92 @@ export class FriendModel extends DBModel {
     }[]
   > {
     const db = await this.getKyselyDB();
+    // ONE ROW PER PERSON, not per import. Scoring the raw table would score a re-imported friend
+    // once per import and write that many result rows for them — the run would report more matches
+    // than it has people, which is the inflating direction that never gets reported as a bug.
+    //
+    // The names are the fold's, so a person whose English spelling came from one import and Thai
+    // from another is scored on both. That is what replaces enrichment for the matcher.
     let q = db
-      .selectFrom("friend")
+      .selectFrom("friend_current")
       .select([
         // The id comes back so the matcher can stamp `comparison_result.friend_id` — identity,
-        // which makes counting exact instead of a name join that two spellings can double.
-        "friend.id as id",
-        "friend.friend_name_en as friend_name_en",
-        "friend.friend_name_th as friend_name_th",
-        "friend.relationship_owner as relationship_owner",
+        // which makes counting exact instead of a name join that two spellings can double. It is
+        // the person's newest row, which is a real `friend` row and a valid target for the FK.
+        "friend_current.id as id",
+        "friend_current.friend_name_en as friend_name_en",
+        "friend_current.friend_name_th as friend_name_th",
+        "friend_current.relationship_owner as relationship_owner",
       ]);
 
     if (sources !== null) {
-      // `= any(array)` rather than Kysely's `in`: the left side is a raw expression
-      // (`lower(...)`), which `in` cannot type against a list of plain strings. Postgres plans
-      // this the same way and it uses `idx_friend_source`.
-      q = q.where(sql<boolean>`lower(friend.source) = any(${sql.val(sources)}::text[])`);
+      /**
+       * "Did this person arrive from any of these sources?" — asked against the RAW rows, not
+       * against the fold's `source`.
+       *
+       * The fold has to collapse `source` to one value (the newest row's), and a person imported
+       * from Facebook and later from LinkedIn genuinely belongs to both rosters. Filtering on the
+       * collapsed value would drop them from a Facebook-scoped run because their most recent
+       * import happened to be the LinkedIn one — a silent, order-dependent omission.
+       *
+       * `= any(array)` rather than Kysely's `in`: the left side is a raw expression (`lower(...)`),
+       * which `in` cannot type against a list of plain strings. Postgres plans it the same way and
+       * it uses `idx_friend_source`.
+       */
+      q = q.where(({ exists, selectFrom }) =>
+        exists(
+          selectFrom("friend")
+            .select("friend.id")
+            .whereRef("friend.person_key", "=", "friend_current.person_key")
+            .where(sql<boolean>`lower(friend.source) = any(${sql.val(sources)}::text[])`)
+        )
+      );
     }
 
-    return q.orderBy("friend.id", "asc").execute() as never;
+    /**
+     * "Is any of this person's rows owned by them?" — the `filter_by='owner'` run.
+     *
+     * Folded, because `relationship_owner` is free text a human types: the app cleans it
+     * (`cleanOwnerName`) but preserves case, and every roster in the product already groups it
+     * case-insensitively. A run scoped to "Alex" that missed the rows filed under "alex" would
+     * report a smaller roster than the page the reader started from.
+     *
+     * Against the raw rows, not the fold, for the reason in the doc above — an assistant importing
+     * a second file for somebody else must not move that person out of their own scoped run.
+     */
+    if (scope.owner) {
+      const owner = scope.owner.toLowerCase();
+      q = q.where(({ exists, selectFrom }) =>
+        exists(
+          selectFrom("friend")
+            .select("friend.id")
+            .whereRef("friend.person_key", "=", "friend_current.person_key")
+            .where(sql<boolean>`lower(friend.relationship_owner) = ${sql.val(owner)}`)
+        )
+      );
+    }
+
+    /**
+     * "Did this person arrive in that import?" — the `filter_by='file'` run.
+     *
+     * The row scored is still the FOLD's (one row per person, carrying whichever spellings they
+     * have accumulated), and only the membership test looks at the import. That is the honest
+     * reading of "re-compare that file": it is the people that file brought, held against
+     * everything now known about them — not a replay of the file's own cells, which would score a
+     * person on a spelling a later import has already corrected.
+     */
+    if (scope.uploadId) {
+      q = q.where(({ exists, selectFrom }) =>
+        exists(
+          selectFrom("friend")
+            .select("friend.id")
+            .whereRef("friend.person_key", "=", "friend_current.person_key")
+            .where("friend.upload_id", "=", scope.uploadId as string)
+        )
+      );
+    }
+
+    return q.orderBy("friend_current.id", "asc").execute() as never;
   }
 
   /**
@@ -942,12 +1361,20 @@ export class FriendModel extends DBModel {
    *
    * Folded, so a console-written 'Facebook' counts toward the picker's 'facebook' rather than
    * appearing as a separate option nobody can select.
+   *
+   * PEOPLE per source, counted off the raw table rather than the fold — the one place where doing
+   * both is right. `count(distinct person_key)` is what stops a re-import inflating the number the
+   * picker shows; the RAW table is what keeps a person who arrived from two sources counted under
+   * both, which is true and which `friend_current` cannot say (it collapses `source` to one value).
    */
   static async countBySource(): Promise<Record<string, number>> {
     const db = await this.getKyselyDB();
     const rows = await db
       .selectFrom("friend")
-      .select([sql<string>`lower(friend.source)`.as("source"), sql<string>`count(*)`.as("count")])
+      .select([
+        sql<string>`lower(friend.source)`.as("source"),
+        sql<string>`count(distinct friend.person_key)`.as("count"),
+      ])
       .where("friend.source", "is not", null)
       .groupBy(sql`lower(friend.source)`)
       .execute();
@@ -959,9 +1386,41 @@ export class FriendModel extends DBModel {
     return out;
   }
 
-  /** Newest import first. `source_timestamp` ("friended on") used to lead this ordering; it is
-   *  gone, and `id` descending is the honest remaining answer — most recently imported first,
-   *  which is what someone opening the grid after an upload is looking for. */
+  /**
+   * How many PEOPLE one relationship owner holds — the owner-scoped run's size, checked before it
+   * is started.
+   *
+   * The sibling of `countBySource` above, and it exists for the same one reason: `POST /compare`
+   * refuses a run that can only ever come back empty, because "no friends are filed under Alex" is
+   * a far better answer than a run that completes with zero matches and leaves the reader working
+   * out which half of their question was empty.
+   *
+   * Folded on the way in, matching `findAllForMatching`'s own owner filter, so the number checked
+   * and the population run are the same set. `count(distinct person_key)` for the reason
+   * `countBySource` uses it: a re-imported friend is several rows and one person.
+   */
+  static async countByOwner(owner: string): Promise<number> {
+    const db = await this.getKyselyDB();
+    const row = await db
+      .selectFrom("friend")
+      .select(sql<string>`count(distinct friend.person_key)`.as("count"))
+      .where(sql<boolean>`lower(friend.relationship_owner) = ${sql.val(owner.toLowerCase())}`)
+      .executeTakeFirst();
+    return Number(row?.count) || 0;
+  }
+
+  /**
+   * Newest import first. `source_timestamp` ("friended on") used to lead this ordering; it is
+   * gone, and `id` descending is the honest remaining answer — most recently imported first,
+   * which is what someone opening the grid after an upload is looking for.
+   *
+   * RAW ROWS, deliberately, and the one people-shaped page that does not fold. This is the Data
+   * page: a table of what is stored, with the import each row came from beside it. Since imports
+   * stack, a re-imported friend is genuinely several rows and hiding them here would make the
+   * grid disagree with the database it claims to show — and with rollback, which works on exactly
+   * these rows. The count above it (`stats`) folds, because "how many friends do we have" is a
+   * question about people; this is a question about rows.
+   */
   static async findAllPaginated(page: number, limit: number): Promise<PaginatedResult<FacebookDataRow>> {
     const db = await this.getKyselyDB();
     const offset = (page - 1) * limit;
@@ -980,17 +1439,17 @@ export class FriendModel extends DBModel {
     return { data: data as unknown as FacebookDataRow[], pagination: { page, limit, total, totalPages: Math.ceil(total / limit) } };
   }
 
-  /** Every row one import added — the payload forwarded to the ingestion webhook. */
-  static async findByUploadId(uploadId: string): Promise<FacebookDataRow[]> {
+  /** How many rows one import added — the friends-side twin of
+   *  `CompanyContactModel.countByUploadId`, and replacing `findByUploadId` for the same reason:
+   *  the ingestion webhook is told which rows to select rather than handed a copy of them. */
+  static async countByUploadId(uploadId: string): Promise<number> {
     const db = await this.getKyselyDB();
-    const rows = await db
+    const row = await db
       .selectFrom("friend")
-      .leftJoin("upload", "upload.id", "friend.upload_id")
-      .select(friendRowSelect as never)
-      .where("friend.upload_id", "=", uploadId)
-      .orderBy("friend.id", "asc")
-      .execute();
-    return rows as unknown as FacebookDataRow[];
+      .select(db.fn.count("id").as("count"))
+      .where("upload_id", "=", uploadId)
+      .executeTakeFirst();
+    return Number(row?.count) || 0;
   }
 
   /** Rows contributed by one upload. */
@@ -1013,9 +1472,13 @@ export class FriendModel extends DBModel {
     return { data: data as unknown as FacebookDataRow[], pagination: { page, limit, total, totalPages: Math.ceil(total / limit) } };
   }
 
+  /** How many friends are on file — PEOPLE, like `stats`. */
   static async count(): Promise<number> {
     const db = await this.getKyselyDB();
-    const row = await db.selectFrom("friend").select(db.fn.count("id").as("count")).executeTakeFirst();
+    const row = await db
+      .selectFrom("friend_current")
+      .select(db.fn.count("person_key").as("count"))
+      .executeTakeFirst();
     return Number(row?.count) || 0;
   }
 
@@ -1032,10 +1495,25 @@ export class FriendModel extends DBModel {
     return Number(result?.numDeletedRows ?? 0);
   }
 
+  /**
+   * Delete a friend — every row of them, not one copy. The company-side twin of
+   * `CompanyContactModel.deleteById`; see there for why an id that came out of the fold cannot be
+   * deleted one row at a time.
+   *
+   * NOT the same as rolling back an import (`deleteByUploadId`), which removes only that import's
+   * own rows and lets the person survive through the others.
+   */
   static async deleteById(id: string): Promise<number> {
     if (!/^\d+$/.test(id)) return 0; // non-numeric bigint id: nothing to delete
     const db = await this.getKyselyDB();
-    const result = await db.deleteFrom("friend").where("id", "=", id).executeTakeFirst();
+    const result = await db
+      .deleteFrom("friend")
+      .where(
+        "person_key",
+        "=",
+        db.selectFrom("friend as f").select("f.person_key").where("f.id", "=", id)
+      )
+      .executeTakeFirst();
     return Number(result?.numDeletedRows ?? 0);
   }
 }

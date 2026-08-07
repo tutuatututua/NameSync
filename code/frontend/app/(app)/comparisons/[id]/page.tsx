@@ -5,16 +5,24 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { SearchX } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
+import type { ResultsData } from "@extensions/contract";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { PageHeader } from "@/components/page-header";
 import { EmptyState } from "@/components/empty-state";
 import { Callout } from "@/components/callout";
+import { CompareModeBadge } from "@/components/compare-mode";
+import { ScopeBadge } from "@/components/scope-badge";
+import { SourcesBadge } from "@/components/sources-badge";
+import { CompareScopeButton } from "@/components/network/CompareScopeButton";
 import { ResultsView } from "@/components/results/ResultsView";
 import { RunProgress } from "@/components/results/RunProgress";
-import { useComparisonProgress, useResults } from "@/hooks/queries";
+import { RunSiblings, useSubjectRuns } from "@/components/results/RunSiblings";
+import { useComparisonProgress, useResults, useUploadSources } from "@/hooks/queries";
 import { qk } from "@/hooks/queryKeys";
-import { formatCompanies } from "@/lib/format";
+import { useCarriedThreshold, withThreshold } from "@/hooks/useThreshold";
+import { formatDate } from "@/lib/format";
+import { rerunRequest, subjectHeading } from "@/lib/run-groups";
 
 /**
  * One run — whether it finished a month ago or is finishing as you watch.
@@ -43,6 +51,22 @@ import { formatCompanies } from "@/lib/format";
  * run to show, and it is now the only thing it shows: the endpoints still accept `?threshold=`
  * (documented in the contract, exercised by threshold.test.ts), but nothing here sends one, so a
  * run always reads at its own verdicts.
+ *
+ * ── IT STILL CARRIES THE WORKSPACE'S BAR, WITHOUT READING AT IT (2026-08-07) ──
+ *
+ * Having no bar of its own was taken to mean having nothing to do with one, and that made this page
+ * the hole the tuning fell through. A reader sets 60% on Network, opens a result, and every way out
+ * of here was built from nothing: Back went to `/?tab=results` bare, and the relationship owner on a
+ * row linked to that roster bare — so the drill-down people actually use ("who is this owner, what
+ * else of theirs is unplaced") landed at the default bar, and the workspace they returned to had
+ * quietly reset. The control promises "the bar follows you into a company or a roster"; this was the
+ * page where it stopped.
+ *
+ * So `?threshold=` now rides IN on the links that open a run and OUT on the links that leave it. It
+ * is a pass-through and nothing else: it is never sent to `useResults` or `useComparisonProgress`,
+ * no number on this page moves because of it, and there is deliberately nothing on screen about it —
+ * a bar announced over a run's own verdicts would be claiming to have graded them. See
+ * `useCarriedThreshold`, which exists to keep that distinction from being made by accident.
  */
 export default function ComparisonDetailPage() {
   const params = useParams<{ id: string }>();
@@ -50,6 +74,14 @@ export default function ComparisonDetailPage() {
   const qc = useQueryClient();
 
   const { data, isLoading } = useResults(id);
+
+  /** The `upload_source` labels the sources chip renders with — without them it title-cases the
+   *  stored value, which gets 'Facebook' right and 'LinkedIn' slightly wrong. */
+  const sourceList = useUploadSources();
+  const sourceLabels = React.useMemo(
+    () => new Map((sourceList.data ?? []).map((s) => [s.value, s.label])),
+    [sourceList.data]
+  );
 
   /**
    * Asked for unconditionally, not only while the run is going.
@@ -98,7 +130,7 @@ export default function ComparisonDetailPage() {
     // in practice there is one reading to invalidate — but the endpoints still take `?threshold=`,
     // and a prefix cannot be wrong about how many readings exist.
     qc.invalidateQueries({ queryKey: qk.resultsAll(id) });
-    qc.invalidateQueries({ queryKey: qk.comparisons() });
+    qc.invalidateQueries({ queryKey: qk.comparisonsAll() });
     // The rows too, and this one is easy to forget because it looks like it polls itself.
     //
     // It does — but only while the run is live, and "the run is no longer live" is precisely the
@@ -129,38 +161,17 @@ export default function ComparisonDetailPage() {
 
   return (
     <div className="space-y-8">
-      <PageHeader
-        backHref="/"
-        backLabel="Network"
-        /* Named "and", not "or": this identifies the run — the set of companies it was pointed at —
-           rather than making a claim about any one match. The Verdict below says "or", because
-           there it IS a claim about each matched friend, who works at one of them. */
-        title={formatCompanies(data.selectedCompanies, { conjunction: "and" }) ?? `Run ${id}`}
-        /*
-          The finding is NOT repeated here.
+      <RunHeader id={id} run={data} running={running} sourceLabels={sourceLabels} />
 
-          This used to read "1 match · 2 names scored", directly above a card reading "1 friend
-          matches a contact on file, out of 2 scored" — the same two numbers, twice, four lines
-          apart. The comment defending it said a header that repeats the answer beats one that
-          withholds it, which was true when the Verdict might have been below the fold. It is the
-          next thing on the page.
+      {/*
+        THE SUBJECT'S OTHER ANSWERS.
 
-          So the header identifies the run and the Verdict states the finding, once. The exception
-          is a run still going: the Verdict is deliberately not rendered then (it would read its
-          facts from an empty array and announce a confident zero), so this is the only line that
-          can say anything, and "Matching in progress…" is what there is to say.
-        */
-        description={running ? "Matching in progress…" : undefined}
-        /*
-          No badge in this corner. It carried the match count ("4 matches"), which is the same
-          finding the Verdict states two inches below — the repetition this header's own comment
-          above already refuses for the description line, applied inconsistently to the corner.
-
-          Its other job, naming a run that is still going or has failed, is not lost: a failed run
-          gets the callout directly below, and a running one gets both the description above and
-          the RunProgress panel. Both say more than a one-word pill could.
-        */
-      />
+        High on the page rather than under the table, because it is navigation and its whole value
+        is being seen while the reader still has this run's finding in mind — "15 of 26 here, what
+        did the Facebook one say". Renders nothing when this run is the only one of its subject,
+        which is most runs. See `RunSiblings`.
+      */}
+      <RunSiblings run={data} currentId={id} />
 
       {status === "failed" && (
         <Callout tone="danger" title="This run failed — it never produced any results." />
@@ -173,7 +184,10 @@ export default function ComparisonDetailPage() {
         (progress.data ? (
           <RunProgress progress={progress.data} />
         ) : (
-          <Callout tone="info" title="This run is still going. Results appear as rows are matched." />
+          <Callout
+            tone="info"
+            title="This run is still going. Results appear as rows are matched."
+          />
         ))}
 
       {/*
@@ -198,6 +212,129 @@ export default function ComparisonDetailPage() {
         live={running}
       />
     </div>
+  );
+}
+
+/**
+ * Who this run is about, what it was, and the one verb it offers.
+ *
+ * Its own component because the TITLE needs the subject's other runs (`useSubjectRuns`) and the
+ * page above cannot ask for them: it early-returns on a missing run, so a hook after that point
+ * would be a conditional one. The query is shared with `RunSiblings` through React Query's cache,
+ * not fetched twice — see `useSubjectRuns`.
+ */
+function RunHeader({
+  id,
+  run,
+  running,
+  sourceLabels,
+}: {
+  id: string;
+  run: ResultsData;
+  running: boolean;
+  sourceLabels: ReadonlyMap<string, string>;
+}) {
+  const siblings = useSubjectRuns(run);
+  // The bar the reader arrived carrying, put back on the way out. Read here rather than passed
+  // down: this component owns the only link that leaves for the workspace. See the file header.
+  const threshold = useCarriedThreshold();
+
+  return (
+    // The header and the run's identity chips are ONE block — the chips qualify the title, and the
+    // page's `space-y-8` would otherwise float them halfway down to the results.
+    <div className="space-y-3">
+      <PageHeader
+        /*
+            BACK TO THE LIST THIS PAGE IS THE INSIDE OF.
+
+            It went to "/" — the Network page's default tab, which is Company. A reader who opened a
+            run from Results and pressed Back arrived somewhere they had not been, with their filter
+            and their expanded history gone. Results is where every run is listed, whichever page
+            the reader started from, so it is the honest destination even for someone who arrived
+            from a company page (whose own list is a narrowed view of this one).
+
+            WITH THE BAR ON IT. Results hides the threshold control but deliberately keeps its value
+            in the URL, so a reader who tuned the workspace, opened a run and pressed Back has to
+            land on the workspace they left — not on a rail that reverted to the default while they
+            were reading one run. See the file header.
+          */
+        backHref={withThreshold("/?tab=results", threshold)}
+        backLabel="Results"
+        /*
+            THE SUBJECT, named the way Results names it.
+
+            This read `formatCompanies(selectedCompanies)`, which is the right title for exactly one
+            kind of run — the unscoped one, where the company list IS the question. Every scoped run
+            reaches this page with `selected_companies` empty (its scope decides the rows, not a
+            picker) and was therefore titled "Run 41": an owner's run, an import's run and a
+            company's run, all landing on a page headed by a database id. `subjectHeading` gives
+            each of them the name the row that linked here used, so following a link no longer loses
+            the thing you clicked.
+          */
+        title={subjectHeading({ ...run, id }, siblings)}
+        /*
+            The finding is NOT repeated here.
+
+            This used to read "1 match · 2 names scored", directly above a card reading "1 friend
+            matches a contact on file, out of 2 scored" — the same two numbers, twice, four lines
+            apart. The comment defending it said a header that repeats the answer beats one that
+            withholds it, which was true when the Verdict might have been below the fold. It is the
+            next thing on the page.
+
+            So the header identifies the run and the Verdict states the finding, once. The exception
+            is a run still going: the Verdict is deliberately not rendered then (it would read its
+            facts from an empty array and announce a confident zero), so this is the only line that
+            can say anything, and "Matching in progress…" is what there is to say.
+          */
+        description={running ? "Matching in progress…" : undefined}
+        /*
+            ASK IT AGAIN, DIFFERENTLY — the same action every row on Results carries, from the same
+            rule (`rerunRequest`), on the page where somebody is actually reading an answer and
+            deciding it was the wrong question. Until 2026-08-06 this page was where re-running
+            stopped being possible: you had to go back to a list to repeat the run in front of you.
+
+            This corner previously held a BADGE with the match count, removed because the Verdict
+            states the same finding two inches below. That reasoning is untouched — what fills the
+            corner now is a verb, which is what `actions` is for on every other page.
+          */
+        actions={<CompareAgainButton run={run} />}
+      />
+
+      {/*
+          WHAT THIS RUN WAS — the three facts that tell it from the run beside it in the history.
+
+          The same three chips Results puts on every row, in the same order and from the same
+          components, so a reader who followed a row here sees the labels they clicked rather than
+          having to re-derive them. The date leads because within one subject it is the only thing
+          that orders the answers.
+        */}
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-sm tabular-nums text-muted-foreground">{formatDate(run.date)}</span>
+        <ScopeBadge filterBy={run.filterBy} filterValue={run.filterValue} />
+        <CompareModeBadge mode={run.compareBy} />
+        <SourcesBadge sources={run.sources} labels={sourceLabels} />
+      </div>
+    </div>
+  );
+}
+
+/**
+ * "Compare again" — `rerunRequest` wired to the shared button, exactly as each Results row wires it.
+ *
+ * Its own component so the mapping is read where it is used rather than inlined into a header that
+ * is already carrying a title, a back link and four comments. It renders nothing for a reviewer;
+ * the check is inside `CompareScopeButton`, which is the only place it should ever be written.
+ */
+function CompareAgainButton({ run }: { run: ResultsData }) {
+  const { scope, scopeSelects, initial, covers } = rerunRequest(run);
+  return (
+    <CompareScopeButton
+      label="Compare again"
+      scope={scope}
+      scopeSelects={scopeSelects}
+      initial={initial}
+      covers={covers}
+    />
   );
 }
 

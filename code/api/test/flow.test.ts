@@ -4,7 +4,7 @@ import { DBModel } from "@extensions/sqldb";
 import { buildApp } from "../src/app";
 import { startMockWebhook, type MockServer } from "./mockWebhook";
 import { MOCK_PORT } from "./setup";
-import { truncateAll, importCompany, importFacebook, previewUpload, startCompare, createComparison, postCallback } from "./helpers";
+import { truncateAll, importCompany, importFacebook, previewUpload, startCompare, createComparison, postCallback, DEFAULT_CSV } from "./helpers";
 import { csvToXlsx, friendsXlsx, xlsxBuffer } from "./xlsx";
 import { ComparisonModel } from "../src/models/comparison.model";
 
@@ -113,10 +113,21 @@ describe("import (/run)", () => {
     const csv = (await importCompany(app, { format: "csv", owner: "Alex" })).json().data;
     expect(csv.companyAdded).toBe(2);
 
-    // Same rows again from a JSON file: every one a duplicate, which is only true if both
-    // formats produced identical records.
-    const json = (await importCompany(app, { format: "json", owner: "Alex" })).json().data;
-    expect(json.companyAdded).toBe(0);
+    /**
+     * The SAME two rows from a JSON file, plus one that is new.
+     *
+     * Both repeated rows are dropped, which can only happen if the JSON parser produced records
+     * identical to the CSV parser's — that is the assertion. The extra row is what keeps the test
+     * honest: a refusal alone would also be produced by a parser that read NOTHING, and `added: 1`
+     * says the file was genuinely parsed. Two numbers, because either one on its own passes on a
+     * bug as readily as on the behaviour.
+     */
+    const json = (await importCompany(app, {
+      format: "json",
+      csv: DEFAULT_CSV.trimEnd() + "\nGamma Inc,ปิยะ,Piya\n",
+      owner: "Alex",
+    })).json().data;
+    expect(json.companyAdded).toBe(1);
     expect(json.companyDuplicates).toBe(2);
 
     const friends = (await importFacebook(app, { format: "json", owner: "Alex" })).json().data;
@@ -154,6 +165,64 @@ describe("import (/run)", () => {
     expect(await uploadHistory()).toHaveLength(0);
   });
 
+  // ── the columns an import cannot do without ────────────────────────────────
+  // Two kinds, and they fail for different reasons. The COMPANY column is fixed: every comparison
+  // is selected by company, so a contact filed under nothing can never be reached by any run. The
+  // NAME column depends on the run's mode: a run compares one language and only one, so a Thai run
+  // over a file with no Thai names is a run that can only come back empty — and an empty run reads
+  // as "nobody at this company knows these people", which is a finding the data never supported.
+  //
+  // Both are refused BEFORE anything is written, which is what keeps both ways out open: change the
+  // mode, or map the missing column. Storing the rows and opening a doomed run would leave neither.
+
+  it("400s a company file that names no company — no run could ever reach those contacts", async () => {
+    const res = await importCompany(app, { csv: "eng_name,thai_name\nSomchai,สมชาย\nAnong,อนงค์\n" });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().message).toMatch(/names a company/i);
+    expect(await uploadHistory()).toHaveLength(0);
+
+    // Some rows blank is a different situation: those contacts are unreachable, the rest are not,
+    // and refusing the file would throw away the ones that are fine.
+    const partial = await importCompany(app, {
+      csv: "company_name,eng_name\nAcme Co,Somchai\n,Anong\n",
+    });
+    expect(partial.statusCode, partial.body).toBe(200);
+  });
+
+  it("400s an import whose file has no ENGLISH name — an import's run is always en_full", async () => {
+    // Thai-only friends. An import compares English whole names and nothing else since 2026-08-05,
+    // so this file's run could score nobody — and nothing is stored, because the fix is a decision
+    // to make before the rows land rather than after.
+    const th = await importFacebook(app, {
+      friendsCsv: "name,relationship_owner\nสมชาย ใจดี,Alex\nอนงค์ สุข,Alex\n",
+    });
+    expect(th.statusCode).toBe(400);
+    expect(th.json().message).toMatch(/compares English names/i);
+    // One way out, not two: the mode is no longer a control, so the message must not offer it.
+    expect(th.json().message).not.toMatch(/how to compare/i);
+    expect(await uploadHistory()).toHaveLength(0);
+
+    // The same shape of file, in the language the import's run can actually score.
+    const en = await importFacebook(app, {
+      friends: [["Somchai Jaidee", 1], ["Anong Suk", 2]],
+      owner: "Alex",
+    });
+    expect(en.statusCode, en.body).toBe(200);
+  });
+
+  it("imports in full when only SOME rows carry an English name — a check, not a filter", async () => {
+    // The rule the gate above must never become. An import's run decides what is SCORED, not what
+    // is STORED: the Thai-only friend is imported, counted in the roster, and reported as "Not
+    // compared" — and is still there for a Thai run started from the Network page, which since
+    // 2026-08-05 is the ONLY way a Thai comparison happens. Filtering here would leave that run
+    // unable to find the very rows it exists for.
+    const res = await importFacebook(app, {
+      friendsCsv: "name,relationship_owner\nสมชาย ใจดี,Alex\nAnong Suk,Alex\n",
+    });
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json().data.facebookAdded).toBe(2);
+  });
+
   it("400s a friends file whose every row is nameless", async () => {
     // The timestamp column matched, so the rows aren't empty — but a friend without a name
     // can never be matched, deduped or displayed.
@@ -173,75 +242,159 @@ describe("import (/run)", () => {
     expect(all.data[0].fb_name).toBe("somchai");
   });
 
-  it("keeps no history row for an import whose every row was a duplicate", async () => {
+  it("records a re-import that brought somebody, and refuses one that brought nobody", async () => {
     const first = (await importCompany(app, { owner: "Alex" })).json().data;
     expect(first.companyAdded).toBe(2);
 
-    // The re-import is answered — added 0, duplicates 2 — but it changed nothing, so it
-    // leaves no record behind: a history of non-events reads as events.
-    const again = (await importCompany(app, { owner: "Alex" })).json().data;
-    expect(again.companyAdded).toBe(0);
+    /**
+     * THE TWO HALVES OF "a history of non-events reads as events", settled.
+     *
+     * A re-import that brings ONE new person wrote something, so it is an import: its own upload
+     * row, its own run over what it added, and a rollback button that undoes something real. The
+     * two rows it repeated are dropped and reported as duplicates rather than written again.
+     */
+    const again = (await importCompany(app, {
+      csv: DEFAULT_CSV.trimEnd() + "\nGamma Inc,ปิยะ,Piya\n",
+      owner: "Alex",
+    })).json().data;
+    expect(again.companyAdded).toBe(1);
     expect(again.companyDuplicates).toBe(2);
 
     const history = await uploadHistory();
-    expect(history).toHaveLength(1);
-    expect(history[0].id).toBe(first.sessionId);
+    expect(history).toHaveLength(2);
+    expect(history.map((h) => h.id)).toContain(first.sessionId);
+    expect(history.map((h) => h.id)).toContain(again.sessionId);
+
+    // …and the other half: a repeat that brings nobody writes nothing, so it is refused outright
+    // rather than recorded as an import that did not import. No third history row appears.
+    const nothing = await importCompany(app, { owner: "Alex" });
+    expect(nothing.statusCode).toBe(400);
+    expect(await uploadHistory()).toHaveLength(2);
   });
 });
 
-describe("dedup — exactly matching rows are skipped", () => {
-  it("skips company rows that already exist, no matter who uploaded them", async () => {
+/**
+ * Re-importing somebody already on file.
+ *
+ * ── WHAT THIS SUITE USED TO ASSERT, AND WHY IT CHANGED (2026-08-04) ──
+ *
+ * It used to be called "exactly matching rows are skipped", and it asserted `added: 0` — the merge
+ * refused to write a row describing a person already on file.
+ *
+ * That was the reported bug. The external workflow selects what to match with
+ * `WHERE upload_id = :session_id`, so a skipped row sat under an EARLIER upload where the workflow
+ * could not see it — and an import that added nothing opened no run at all, silently discarding the
+ * "How to compare" the user had picked alongside the file. Re-importing to ask a different question
+ * (Thai given names instead of English full names) did nothing whatsoever.
+ *
+ * Imports STACK now. Every row is written under its own upload, `added` is the size of the file,
+ * and `duplicates` carries the fact `added: 0` used to carry by omission: how many of those rows
+ * describe somebody already known.
+ *
+ * WHAT HAS NOT CHANGED IS WHO IS THE SAME PERSON. Every identity rule these tests were written to
+ * protect — cleaned names, folded case, per-owner rosters, repeats within one file — is asserted
+ * exactly as before, just against the fold (`friend_current` / `company_contact_current`) instead
+ * of against the raw row count. That is the whole point of `person_key`: dedup moved, it did not go.
+ */
+describe("re-import — the duplicate rows drop, the person stays one person", () => {
+  /**
+   * TWO RULES MEET HERE, and keeping them apart is what this block is for.
+   *
+   *   · The DROP KEY — every column plus the uploader, compared exactly on the cleaned values. It
+   *     decides whether a row is WRITTEN. A row matching one already on file from the same uploader
+   *     is not stored again, because it carries nothing the stored row does not.
+   *   · PERSON IDENTITY (`person_key`) — the looser fold. It decides how many PEOPLE the counts
+   *     report, over whatever rows did get written.
+   *
+   * They are not the same question and the fixtures below are chosen so that each can be seen
+   * separately: a different uploader writes rows that still fold to one person, and a case variant
+   * from the same uploader writes nothing at all.
+   *
+   * ── THIS USED TO ASSERT THE OPPOSITE, AND IT IS WORTH SAYING WHY ──
+   *
+   * For one day in August imports STACKED: every row written under its own upload, duplicates
+   * counted but never skipped, on the reasoning that the external workflow selects
+   * `WHERE upload_id = :id` and a row filed under an earlier upload was a row it could not reach.
+   * That reasoning was sound and its fix was not — it wrote a complete second copy of a 40,000-row
+   * file to solve a query problem. Duplicates drop again, and the query problem is solved where it
+   * actually lived: the workflow is pointed at rows rather than handed a copy of them.
+   *
+   * The refusal that meets a file with NOTHING left to write is import-precheck.test.ts's subject.
+   * It shows up here as a 400 wherever a fixture repeats itself exactly.
+   */
+  /** People on file, as the app counts them: the folds, not the raw rows. */
+  const people = async (): Promise<{ friends: number; contacts: number }> => {
+    const data = (await app.inject({ method: "GET", url: "/api/comparisons/data-stats" })).json().data;
+    return { friends: data.facebook.total, contacts: data.company.total };
+  };
+
+  it("writes another uploader's copy of the same contacts, and still counts one contact each", async () => {
     const first = (await importCompany(app, { owner: "Alice" })).json().data;
     expect(first.companyAdded).toBe(2);
     expect(first.companyDuplicates).toBe(0);
 
-    // Same rows, different uploader — the uploader is not part of the company key.
+    // The helper leaves `uploaderName` unset, so `uploaded_by` falls back to the typed owner —
+    // making this a DIFFERENT uploader. The uploader is part of the drop key, so nothing is
+    // dropped; it is not part of a contact's identity, so the people still fold to two.
     const second = (await importCompany(app, { owner: "Bob" })).json().data;
-    expect(second.companyAdded).toBe(0);
-    expect(second.companyDuplicates).toBe(2);
+    expect(second.companyAdded).toBe(2);
+    expect(second.companyDuplicates).toBe(0);
 
+    // Four rows on file, two contacts. The Data page shows rows (it is a view of what is stored,
+    // and rollback works on exactly these); every count of PEOPLE folds them.
     const all = await app.inject({ method: "GET", url: "/api/comparisons/company-data/all?page=1&limit=50" });
-    expect(all.json().pagination.total).toBe(2);
+    expect(all.json().pagination.total).toBe(4);
+    expect((await people()).contacts).toBe(2);
   });
 
-  it("keeps a new person at a company that already has rows", async () => {
+  it("writes only the new person when a company already has rows", async () => {
     await importCompany(app, { csv: "company_name,thai_name,eng_name\nAcme Co,สมชาย,Somchai\n" });
 
     const second = (await importCompany(app, {
       csv: "company_name,thai_name,eng_name\nAcme Co,สมชาย,Somchai\nAcme Co,อนงค์,Anong\n",
     })).json().data;
-    expect(second.companyAdded).toBe(1); // only Anong is new
+    // Somchai is already here from this uploader and is dropped; Anong is new and lands. The file
+    // is not refused — it brought somebody.
+    expect(second.companyAdded).toBe(1);
     expect(second.companyDuplicates).toBe(1);
+
+    expect((await people()).contacts).toBe(2); // Somchai and Anong
   });
 
-  it("skips a friend the same uploader already contributed", async () => {
+  it("refuses a friend the same owner already contributed, rather than filing them twice", async () => {
     const first = (await importFacebook(app, { friends: [["Somchai", 1]], owner: "Alice" })).json().data;
     expect(first.facebookAdded).toBe(1);
     expect(first.facebookDuplicates).toBe(0);
 
-    // Same uploader, same name — a different timestamp does not make it a new row.
-    const second = (await importFacebook(app, { friends: [["Somchai", 2]], owner: "Alice" })).json().data;
-    expect(second.facebookAdded).toBe(0);
-    expect(second.facebookDuplicates).toBe(1);
+    // Same owner, same name — and a different timestamp does not make it a different person, since
+    // the column is one of the ones the import ignores. Every row would drop, so there is nothing
+    // to write and the import is refused rather than recorded as an empty event.
+    const second = await importFacebook(app, { friends: [["Somchai", 2]], owner: "Alice" });
+    expect(second.statusCode).toBe(400);
+
+    expect((await people()).friends).toBe(1);
   });
 
-  // Dedup compares the *cleaned* name, which is what makes it mean anything: the same
-  // person exported twice, dressed differently, was two rows before cleaning existed.
-  it("treats two spellings of one company contact as a duplicate, storing only the cleaned name", async () => {
+  // Identity compares the *cleaned* name, which is what makes it mean anything: the same
+  // person exported twice, dressed differently, was two people before cleaning existed.
+  it("sees through two spellings of one company contact — the second file writes nothing", async () => {
     const first = (await importCompany(app, {
       csv: "company_name,thai_name,eng_name\nAcme Co,นายสมชาย ใจดี,Mr. Somchai Jaidee\n",
     })).json().data;
     expect(first.companyAdded).toBe(1);
 
-    const second = (await importCompany(app, {
+    // Titles stripped and case folded, both files clean to the SAME pair of names — so under the
+    // same uploader this is the identical row and there is nothing left to import.
+    const second = await importCompany(app, {
       csv: "company_name,thai_name,eng_name\nAcme Co,สมชาย ใจดี,SOMCHAI JAIDEE\n",
-    })).json().data;
-    expect(second.companyAdded).toBe(0);
-    expect(second.companyDuplicates).toBe(1);
+    });
+    expect(second.statusCode).toBe(400);
 
-    // And the row that landed holds the cleaned name in the name column itself. There is no
-    // `_clean` twin and no copy of the file's "Mr. Somchai Jaidee" anywhere — the import
-    // preview was the one chance to see it.
+    expect((await people()).contacts).toBe(1);
+
+    // And what landed holds the cleaned name in the name column itself. There is no `_clean` twin
+    // and no copy of the file's "Mr. Somchai Jaidee" anywhere — the preview was the one chance to
+    // see it.
     const stored = (
       await app.inject({ method: "GET", url: "/api/comparisons/company-data/all?page=1&limit=50" })
     ).json().data as { person_name_en: string; person_name_th: string }[];
@@ -250,44 +403,46 @@ describe("dedup — exactly matching rows are skipped", () => {
     expect(stored[0].person_name_th).toBe("สมชาย ใจดี");
   });
 
-  it("treats two spellings of one friend from the same uploader as a duplicate", async () => {
+  it("sees through two spellings of one friend from the same owner", async () => {
     const first = (await importFacebook(app, { friends: [["Mr. Somchai Jaidee", 1]], owner: "Alice" })).json()
       .data;
     expect(first.facebookAdded).toBe(1);
 
-    const second = (await importFacebook(app, { friends: [["SOMCHAI JAIDEE", 2]], owner: "Alice" })).json()
-      .data;
-    expect(second.facebookAdded).toBe(0);
-    expect(second.facebookDuplicates).toBe(1);
+    const second = await importFacebook(app, { friends: [["SOMCHAI JAIDEE", 2]], owner: "Alice" });
+    expect(second.statusCode).toBe(400);
+
+    expect((await people()).friends).toBe(1);
   });
 
-  // Case is now folded by the cleaner itself — "McKinsey Jaidee" and "MCKINSEY JAIDEE" are
-  // one stored string, so the dedup key has nothing left to do about case on a person's name.
-  // A company name is different: it is stored as the file spelled it, so "Acme Co" and
-  // "ACME CO" really are two strings and the key is what folds them.
-  it("treats a case-variant company contact as a duplicate", async () => {
+  // Case is folded by the cleaner itself — "McKinsey Jaidee" and "MCKINSEY JAIDEE" are one stored
+  // string, so identity has nothing left to do about case on a person's name. A company name is
+  // different: it is stored as the file spelled it, so "Acme Co" and "ACME CO" really are two
+  // strings and the key is what folds them.
+  it("folds a case-variant company name in the drop key", async () => {
     const first = (await importCompany(app, {
       csv: "company_name,thai_name,eng_name\nAcme Co,สมชาย,McKinsey Jaidee\n",
     })).json().data;
     expect(first.companyAdded).toBe(1);
 
-    const second = (await importCompany(app, {
+    const second = await importCompany(app, {
       csv: "company_name,thai_name,eng_name\nACME CO,สมชาย,MCKINSEY JAIDEE\n",
-    })).json().data;
-    expect(second.companyAdded).toBe(0);
-    expect(second.companyDuplicates).toBe(1);
+    });
+    expect(second.statusCode).toBe(400);
+
+    expect((await people()).contacts).toBe(1);
   });
 
-  it("treats a case-variant friend from the same uploader as a duplicate", async () => {
+  it("folds a case-variant friend from the same owner", async () => {
     const first = (await importFacebook(app, { friends: [["McKinsey Jaidee", 1]], owner: "Alice" })).json().data;
     expect(first.facebookAdded).toBe(1);
 
-    const second = (await importFacebook(app, { friends: [["MCKINSEY JAIDEE", 2]], owner: "Alice" })).json().data;
-    expect(second.facebookAdded).toBe(0);
-    expect(second.facebookDuplicates).toBe(1);
+    const second = await importFacebook(app, { friends: [["MCKINSEY JAIDEE", 2]], owner: "Alice" });
+    expect(second.statusCode).toBe(400);
+
+    expect((await people()).friends).toBe(1);
   });
 
-  it("keeps the same friend name from two different uploaders as separate rows", async () => {
+  it("keeps the same friend name from two different owners as separate people", async () => {
     await importFacebook(app, { friends: [["Somchai", 1]], owner: "Alice" });
     await importFacebook(app, { friends: [["Somchai", 2]], owner: "Bob" });
 
@@ -297,136 +452,129 @@ describe("dedup — exactly matching rows are skipped", () => {
     expect(new Set(somchai.map((r: { upload_person_name: string }) => r.upload_person_name))).toEqual(
       new Set(["Alice", "Bob"])
     );
+    // Two people, not one: the owner is half the identity, and one person known by two colleagues
+    // is two ways to reach them — the product's whole value.
+    expect((await people()).friends).toBe(2);
   });
 
-  it("dedupes repeats within a single file", async () => {
+  it("drops a repeat WITHIN a single file, against nothing on file at all", async () => {
     const res = (await importFacebook(app, {
       friends: [["Somchai", 1], ["Somchai", 2], ["Anong", 3]],
       owner: "Alice",
     })).json().data;
+    // The mask grows as it goes: the second Somchai is dropped against the first even though the
+    // database was empty when the check started. Without that, a file listing somebody twice would
+    // write them twice on a database that had never seen them — and the drop rule would only work
+    // across imports, never within one.
     expect(res.facebookAdded).toBe(2);
     expect(res.facebookDuplicates).toBe(1);
+
+    expect((await people()).friends).toBe(2); // Somchai and Anong
   });
 });
 
 // ── ingestion webhook ────────────────────────────────────────────────────────
-// The rows go out as an uploaded CSV *file*: multipart, one part named `file`, text/csv,
-// with a .csv filename. A raw text/csv body would be simpler but the receiver 415s it.
+// The request is its headers. Nothing is uploaded: the workflow is told WHICH ROWS to select and
+// selects them out of the Postgres both systems share, which is what it always actually did —
+// `WHERE upload_id = :session_id` — even while we were also building it a CSV of the same rows.
+// See docs/EXTERNAL-MATCHER.md and api/src/services/webhook.service.ts.
 
-/** The file part's payload, pulled back out of a single-part multipart body. */
-const filePart = (body: string): string => {
-  const start = body.indexOf("\r\n\r\n"); // end of the part's own headers
-  const end = body.lastIndexOf("\r\n--"); // closing boundary
-  return body.slice(start + 4, end);
-};
-
-describe("ingestion webhook — the import forwards itself", () => {
+describe("ingestion webhook — the import points the workflow at its rows", () => {
   const sendWebhook = (id: string) =>
     app.inject({ method: "POST", url: `/api/comparisons/${id}/send-webhook` });
 
-  it("forwards a company import as a CSV file part, inside the import request", async () => {
+  it("names a company import's rows, and sends no body at all", async () => {
     const id = (await importCompany(app, { csv: CO_CSV, owner: "Alex" })).json().data.sessionId;
 
-    // No second request: /run handed the rows over before it responded.
+    // No second request: /run handed the work over before it responded.
     expect(mock.state.company).toHaveLength(1);
     expect(mock.state.facebook).toHaveLength(0);
     const hit = mock.state.company[0];
 
-    // Uploaded as a file, not as the request body.
-    expect(hit.contentType).toMatch(/^multipart\/form-data; boundary=/);
-    expect(hit.body).toContain('name="file"');
-    expect(hit.body).toContain(`filename="company-${id}.csv"`);
-    expect(hit.body).toContain("Content-Type: text/csv");
-    // The upload id, under its own name and the legacy one; and how big the job is,
-    // without parsing the file.
-    expect(hit.headers["x-upload-id"]).toBe(id);
-    expect(hit.headers["x-session-id"]).toBe(id);
-    expect(hit.headers["x-row-count"]).toBe("2");
-    // Always sent, even with no run behind it — unlike x-comparison-id. A workflow with no mode
-    // would have to guess, and the harmless-looking guess (whole names) is the wrong answer for
-    // any run that asked for something else.
+    // THE WHOLE POINT. A 100,000-row import is the same request as a two-row one, because the
+    // rows are named rather than shipped.
+    expect(hit.body).toBe("");
+    expect(hit.bodyLength).toBe(0);
+
+    // WHICH ROWS: this import's, by upload id. The workflow's `WHERE upload_id = :filter_value`
+    // and this instruction are now the same string rather than two things that agree.
+    expect(hit.headers["x-filter-by"]).toBe("upload");
+    expect(hit.headers["x-filter-value"]).toBe(id);
+
+    // HOW TO SCORE. Always sent, even with no run behind it — unlike x-comparison-id. A workflow
+    // with no mode would have to guess, and the harmless-looking guess (whole names) is the wrong
+    // answer for any run that asked for something else.
     expect(hit.headers["x-compare-type"]).toBe("full");
     expect(hit.headers["x-compare-language"]).toBe("en");
-    expect(hit.headers["x-compare-by"]).toBe("en_full");
 
-    const lines = filePart(hit.body).trim().split("\n");
-    // `comparison_id` is the run the external workflow writes its results into. Empty here:
-    // the internal matcher is on in tests, so this import started no run. There is one column
-    // per name and it carries the cleaned spelling — the `_clean` twins the workflow used to
-    // be told to match on are gone, so it matches on the name it is handed.
-    //
-    // Everything after `comparison_id` is appended rather than slotted in beside its relatives,
-    // so a receiver reading this CSV positionally keeps working. `compare_sources` is the newest
-    // (2026-08-03) and is therefore last.
-    //
-    // It is EMPTY here and that is its documented reading: this import named no compare scope, so
-    // every friend on file is a candidate. Note it is a different column from `type` — that one is
-    // this FILE's provenance and is empty for the other reason (a company file has none), where
-    // this one is the RUN's scope over the friends it will be matched against.
-    expect(lines[0]).toBe(
-      "uuid,company_name,person_name_th,person_name_en,upload_person_name,status,session_id,comparison_id,uploader_name,type,compare_type,compare_language,compare_by,compare_sources"
-    );
-    expect(lines).toHaveLength(3); // header + the 2 imported rows
-    expect(lines[1]).toContain("MCKINSEY"); // the company keeps its case
-    expect(lines[1]).toContain("noppamas"); // the person does not
-    expect(lines[1]).toContain("Alex"); // upload_person_name column
-    expect(lines[1]).toContain(id); // session_id column
+    // Retired: two spellings of one id, and a mode value that was the other two joined. The doc's
+    // own instruction was to read the axes and ignore the combined form.
+    expect(hit.headers["x-upload-id"]).toBeUndefined();
+    expect(hit.headers["x-session-id"]).toBeUndefined();
+    expect(hit.headers["x-compare-by"]).toBeUndefined();
+    // Gone with the file it described — there is no download to tell apart from a small import.
+    expect(hit.headers["x-row-count"]).toBeUndefined();
+
+    // The internal matcher is on in this suite, so this import opened no run and there is nothing
+    // for the workflow to write results into. OMITTED rather than blank: "there is no run" is a
+    // state a receiver can act on, where an empty value looks like a run whose id is "".
+    expect(hit.headers["x-comparison-id"]).toBeUndefined();
+
+    // Neither narrowing: the scope names these rows exactly, and they are held against every
+    // friend on file.
+    expect(hit.headers["x-compare-sources"]).toBeUndefined();
+    expect(hit.headers["x-compare-companies"]).toBeUndefined();
   });
 
-  it("forwards a facebook import as a CSV file part", async () => {
+  it("names a facebook import's rows on the friends webhook", async () => {
     const id = (await importFacebook(app, { friends: [["Somchai", 1]], owner: "Alice" })).json().data.sessionId;
 
     expect(mock.state.facebook).toHaveLength(1);
+    expect(mock.state.company).toHaveLength(0);
     const hit = mock.state.facebook[0];
-    expect(hit.contentType).toMatch(/^multipart\/form-data; boundary=/);
-    expect(hit.body).toContain(`filename="facebook-${id}.csv"`);
-    expect(hit.body).toContain("Content-Type: text/csv");
 
-    const lines = filePart(hit.body).trim().split("\n");
-    // No `fb_name_clean` twin, and no `timestamp`. `upload_person_name` still carries the
-    // RELATIONSHIP OWNER, as it always has — it is sourced from friend.relationship_owner now
-    // rather than upload.uploaded_by, which is the same fact per row instead of per file. The
-    // workflow writes it to comparison_result.upload_name, and every roster in the product groups
-    // by that, so re-pointing this at the uploader would have re-filed everyone silently.
-    expect(lines[0]).toBe(
-      // The two bilingual columns are APPENDED last, and `fb_name` survives beside them — a
-      // positional parser on the far side keeps working, which is what makes this half of the
-      // change shippable without a coordination round. See docs/EXTERNAL-MATCHER.md.
-      "uuid,fb_name,upload_person_name,status,session_id,comparison_id,relationship_owner,uploader_name,type,compare_type,compare_language,compare_by,friend_name_en,friend_name_th"
-    );
-    expect(lines[1]).toContain("somchai");
-    // The owner, under both the legacy alias and its honest name.
-    expect(lines[1].split(",")[2]).toBe("Alice");
-    expect(lines[1].split(",")[6]).toBe("Alice");
+    expect(hit.body).toBe("");
+    expect(hit.headers["x-filter-by"]).toBe("upload");
+    expect(hit.headers["x-filter-value"]).toBe(id);
+
+    /**
+     * WHICH TABLE is the URL, and that is the whole of the routing rule now.
+     *
+     * The friends webhook selects `friend` and holds it against every contact; the company webhook
+     * does the reverse. Nothing in the request has to say so, and the pair of columns that used to
+     * carry a row's own id under two different meanings — `uuid` being `friend.id` here and
+     * `company_contact.id` there — cannot be misread, because neither is sent.
+     */
+    expect(hit.url).toBe("/facebook");
   });
 
-  it("forwards only the NEW rows of a partly-duplicate import", async () => {
+  it("names the rows of a partly-duplicate import without counting them", async () => {
     await importCompany(app, { csv: "company_name,thai_name,eng_name\nAcme Co,สมชาย,Somchai\n" });
     mock.state.company.length = 0;
 
-    await importCompany(app, {
+    const second = await importCompany(app, {
       csv: "company_name,thai_name,eng_name\nAcme Co,สมชาย,Somchai\nAcme Co,อนงค์,Anong\n",
     });
+    expect(second.statusCode, second.body).toBe(200);
+    const id = second.json().data.sessionId;
 
-    // One row, not two: the duplicate was dropped at import, and the workflow is handed
-    // exactly what landed.
-    const lines = filePart(mock.state.company[0].body).trim().split("\n");
-    expect(lines).toHaveLength(2);
-    expect(lines[1]).toContain("anong");
-    expect(mock.state.company[0].headers["x-row-count"]).toBe("1");
+    /**
+     * This is the case the old CSV got wrong twice, and it is now not expressible.
+     *
+     * Duplicate rows are dropped at write time, so this import wrote one row (Anong) and not two.
+     * The CSV was built from a separate read and had to be kept in step with that decision by hand
+     * — the two drifted, and rows went out that no `WHERE upload_id` query could reach, so they
+     * were never scored while the progress counts agreed they had been.
+     *
+     * A pointer cannot drift from what it points at. Whatever this import wrote is what the
+     * workflow selects, without either side holding a second opinion about how many that is.
+     */
+    expect(mock.state.company).toHaveLength(1);
+    expect(mock.state.company[0].headers["x-filter-value"]).toBe(id);
+    expect(mock.state.company[0].body).toBe("");
   });
 
-  it("quotes a field containing a comma rather than splitting the row", async () => {
-    await importCompany(app, {
-      csv: 'company_name,thai_name,eng_name\n"Acme, Inc.",สมชาย,Somchai\n',
-    });
-
-    const lines = filePart(mock.state.company[0].body).trim().split("\n");
-    expect(lines).toHaveLength(2);
-    expect(lines[1]).toContain('"Acme, Inc."');
-  });
-
-  it("re-sends an import's rows on demand — the manual retry", async () => {
+  it("re-points the workflow at an import's rows on demand — the manual retry", async () => {
     const id = (await importCompany(app, { csv: CO_CSV, owner: "Alex" })).json().data.sessionId;
     mock.state.company.length = 0;
 
@@ -510,6 +658,17 @@ describe("company-selection compare", () => {
 
     const companies = await app.inject({ method: "GET", url: "/api/comparisons/companies" });
     expect(companies.json().data.companies).toEqual(["BLUEBIK", "MCKINSEY"]); // distinct, sorted
+    // `total` is the DISTINCT company count, not the contact count, and it is what an
+    // all-companies run reports its own size from — see CompaniesDataSchema.
+    expect(companies.json().data.total).toBe(2);
+
+    // Searched and capped since the picker stopped holding the whole list client-side. `total`
+    // tracks the search, so the picker can say what it is not showing.
+    const one = await app.inject({ method: "GET", url: "/api/comparisons/companies?q=mck" });
+    expect(one.json().data).toEqual({ companies: ["MCKINSEY"], total: 1 });
+
+    const capped = await app.inject({ method: "GET", url: "/api/comparisons/companies?limit=1" });
+    expect(capped.json().data).toEqual({ companies: ["BLUEBIK"], total: 2 });
 
     const id = await startCompare(app, "MCKINSEY");
     const res = await app.inject({ method: "GET", url: `/api/comparisons/${id}/results` });
@@ -609,6 +768,41 @@ describe("company-selection compare", () => {
     })).json().data as { name: string; similarity: number }[];
     expect(rows.map((r) => r.name)).toEqual(["noppamas", "thanaphon"]);
     expect(rows[0].similarity).toBeGreaterThanOrEqual(rows[1].similarity);
+  });
+
+  /**
+   * A compare run's rows ARE result rows, so both halves of the pairing sit on the row itself —
+   * and both are searchable. That is not a wider net than the import readers get for its own sake:
+   * the rule is "the row's own columns", and on this table the row is the pair.
+   */
+  it("searches a compare run's rows on either side of the pairing", async () => {
+    await importCompany(app, { csv: CO_CSV, owner: "Alex" });
+    await importFacebook(app, {
+      friends: [["Noppamas", 1700000000], ["Thana", 1700000100]],
+      owner: "Alex",
+    });
+    const id = await startCompare(app, ["MCKINSEY", "BLUEBIK"]);
+
+    const rows = async (q: string) =>
+      (
+        await app.inject({
+          method: "GET",
+          url: `/api/comparisons/${id}/rows?page=1&limit=25&q=${encodeURIComponent(q)}`,
+        })
+      ).json();
+
+    // The friend's name — the left half of the row.
+    const friend = await rows("noppa");
+    expect(friend.pagination.total).toBe(1);
+    expect(friend.data[0].name).toBe("noppamas");
+
+    // The company the match landed at — the right half, which the row also carries. Case-folded:
+    // a company name is stored with its own case and the box must not require it.
+    const company = await rows("mckinsey");
+    expect(company.pagination.total).toBe(1);
+    expect(company.data[0].name).toBe("noppamas");
+
+    expect((await rows("nobody")).pagination.total).toBe(0);
   });
 
   it("deduplicates a repeated company rather than double-weighting it", async () => {
@@ -844,25 +1038,38 @@ describe("past runs (GET /api/comparisons)", () => {
     expect(runs[0].name).toBe("Q4 board outreach");
   });
 
-  it("deletes a run and its results together (FK cascade)", async () => {
+  /**
+   * The run and its results SURVIVE the request that used to remove them (2026-08-07).
+   *
+   * Asserted as "still there afterwards" rather than as a status code alone, because the status is
+   * the cheap half: a refusal that 403s and deletes anyway would pass a test that only read the
+   * response. The point of the endpoint is now what it does NOT do.
+   */
+  it("refuses to delete a run, and leaves it standing", async () => {
     await importCompany(app);
     await importFacebook(app);
     const id = await startCompare(app, "Acme Co");
 
     const del = await app.inject({ method: "DELETE", url: `/api/comparisons/${id}` });
-    expect(del.statusCode).toBe(200);
+    expect(del.statusCode).toBe(403);
 
-    expect((await app.inject({ method: "GET", url: "/api/comparisons" })).json().data).toHaveLength(0);
-    // The results went with it — no orphan rows left behind pointing at a run that is gone.
-    const gone = await app.inject({ method: "GET", url: `/api/comparisons/${id}/results` });
-    expect(gone.statusCode).toBe(404);
+    expect((await app.inject({ method: "GET", url: "/api/comparisons" })).json().data).toHaveLength(1);
+    // Its results too — the cascade never fired, so the run page still reads.
+    expect((await app.inject({ method: "GET", url: `/api/comparisons/${id}/results` })).statusCode).toBe(200);
   });
 
-  it("404s a rename or delete of a run that does not exist", async () => {
+  /**
+   * A run that does not exist is refused on the same grounds as one that does.
+   *
+   * The 404 this used to answer is gone on purpose: telling an unauthorised caller which ids exist
+   * is a lookup nobody needs, and the refusal does not depend on the answer. Rename still 404s —
+   * it is an allowed action that genuinely could not find its target.
+   */
+  it("refuses a delete of a run that does not exist, and 404s a rename of one", async () => {
     expect(
       (await app.inject({ method: "PATCH", url: "/api/comparisons/999999", payload: { name: "x" } })).statusCode
     ).toBe(404);
-    expect((await app.inject({ method: "DELETE", url: "/api/comparisons/999999" })).statusCode).toBe(404);
+    expect((await app.inject({ method: "DELETE", url: "/api/comparisons/999999" })).statusCode).toBe(403);
   });
 });
 
@@ -1011,13 +1218,16 @@ describe("import preview", () => {
     expect(p.kind).toBe("company");
     expect(p.totalRows).toBe(2);
     // `cleaned` marks the person-name columns — the ones with a `_clean` twin in each row.
-    // `pickable` is true on all three: every company target is a real column somebody can point
-    // at, so the preview offers a picker for any the file doesn't supply. Only the unlabelled
-    // friend name is false, and it doesn't exist on this side of the import.
+    // `pickable` is false on exactly one row: `person_name`, the UNLABELLED name slot, which a
+    // header like "Contact" or "ชื่อ-นามสกุล" fills and which is then routed to a language by
+    // script. Nobody can point at it by hand — "let the app guess the language" is a worse answer
+    // than the two rows either side of it — and this file, which labels both spellings, leaves it
+    // empty precisely because it answered the question outright.
     expect(p.mapping).toEqual([
-      { target: "company_name", label: "Company", sourceColumn: "company_name", cleaned: false, pickable: true },
-      { target: "person_name_th", label: "Thai name", sourceColumn: "thai_name", cleaned: true, pickable: true },
-      { target: "person_name_en", label: "English name", sourceColumn: "eng_name", cleaned: true, pickable: true },
+      { target: "company_name", label: "Company", sourceColumn: "company_name", alsoColumn: null, cleaned: false, pickable: true, guessed: false },
+      { target: "person_name", label: "Contact name", sourceColumn: null, alsoColumn: null, cleaned: true, pickable: false, guessed: false },
+      { target: "person_name_th", label: "Thai name", sourceColumn: "thai_name", alsoColumn: null, cleaned: true, pickable: true, guessed: false },
+      { target: "person_name_en", label: "English name", sourceColumn: "eng_name", alsoColumn: null, cleaned: true, pickable: true, guessed: false },
     ]);
     // `<target>` is the file's own cell and `<target>_clean` is what will be stored. This
     // pairing is now the only place the original is ever visible — it is not kept — so the
@@ -1025,6 +1235,8 @@ describe("import preview", () => {
     // clean is the lower-casing.
     expect(p.sampleRows[0]).toEqual({
       company_name: "Acme Co",
+      person_name: null,
+      person_name_clean: null,
       person_name_th: "สมชาย",
       person_name_th_clean: "สมชาย", // Thai has no case: nothing to do
       person_name_en: "Somchai",
@@ -1078,15 +1290,23 @@ describe("import preview", () => {
     expect(p.warnings.join(" ")).not.toMatch(/No column matched|will not be imported/);
   });
 
-  it("warns about a column it could not find, and names the ones it will ignore", async () => {
+  it("names the columns it will ignore, without calling a one-language file incomplete", async () => {
     // No Thai column at all, plus a column nothing maps to.
     const csv = "company_name,eng_name,department\nAcme Co,Somchai,Sales\n";
     const p = (await previewUpload(app, { csv })).json().data;
 
     expect(p.mapping.find((m: { target: string }) => m.target === "person_name_th").sourceColumn).toBeNull();
     expect(p.ignoredColumns).toEqual(["department"]);
-    expect(p.warnings.join(" ")).toMatch(/Thai name/);
     expect(p.sampleRows[0].person_name_th).toBeNull();
+
+    // The name question is asked ONCE — "did any name column land?" — and this file answered it.
+    // Asked per slot, it warned that "Thai name" was missing on a contact list that has nothing
+    // wrong with it, and pointed at a picker for a column the file has no reason to carry. The
+    // friends side stopped doing that for exactly this reason; the company side now matches.
+    expect(p.warnings.join(" ")).not.toMatch(/No column matched a contact's name/);
+    // A column that nothing maps to is still worth a picker, and "department" is still ignored —
+    // that is a statement about the file, not a complaint about it.
+    expect(p.warnings.join(" ")).not.toMatch(/Thai name/);
   });
 
   // A row with cells but no names is data the file is asking to import, and the preview has
@@ -1282,23 +1502,40 @@ describe("upload sessions + rollback", () => {
    * anything). Now the re-import is answered but not recorded, so nothing is left to lie:
    * no sessions, no rows, no ghost claim.
    */
-  it("rollback after an all-duplicate re-import leaves no ghost claim", async () => {
+  it("rolls back one import without taking the re-import's rows with it", async () => {
     const first = (await importCompany(app, { csv: CO_CSV, owner: "Alex" })).json().data.sessionId;
-    const again = (await importCompany(app, { csv: CO_CSV, owner: "Alex" })).json().data;
-    expect(again.companyAdded).toBe(0);
-    expect(again.companyDuplicates).toBe(2);
+    // A SECOND UPLOADER, which is what makes both imports own rows for the same contacts. The same
+    // uploader importing this file again would be dropped row for row and refused — see the
+    // re-import suite above — so it could never reach the state this test is about.
+    const again = (await importCompany(app, { csv: CO_CSV, owner: "Bob" })).json().data;
+    expect(again.companyAdded).toBe(2);
+    expect(again.companyDuplicates).toBe(0);
 
+    /**
+     * ROLLING BACK ONE IMPORT MUST NOT TAKE THE OTHER'S ROWS WITH IT.
+     *
+     * The drop key includes the uploader precisely so that this case exists: two people can both
+     * have these contacts on file, each owning their own copy. Undoing one undoes exactly what it
+     * did, and the contacts survive through the other — which is what anyone pressing "roll back
+     * this import" expects, and what makes the button on the second one meaningful.
+     *
+     * If the key ignored the uploader, Bob's import would have stored nothing, and rolling back
+     * Alex's would have deleted the only rows those contacts had — data vanishing out from under
+     * an import that had also claimed it, with a rollback button on it that did nothing.
+     */
     const rb = await app.inject({ method: "POST", url: `/api/upload-sessions/${first}/rollback`, payload: {} });
     expect(rb.statusCode).toBe(200);
     expect(rb.json().data.companyDeleted).toBe(2);
 
-    // The data is gone, and no session pretends otherwise.
+    // The first import's rows are gone; the second import's remain, and so do its contacts.
     const rows = await app.inject({ method: "GET", url: "/api/comparisons/company-data/all?page=1&limit=50" });
-    expect(rows.json().pagination.total).toBe(0);
+    expect(rows.json().pagination.total).toBe(2);
+    const stats = (await app.inject({ method: "GET", url: "/api/comparisons/data-stats" })).json().data;
+    expect(stats.company.total).toBe(2);
+
     const sessions = (await app.inject({ method: "GET", url: "/api/upload-sessions" })).json().data;
-    expect(sessions).toHaveLength(1); // only the first import, now rolled_back
-    expect(sessions[0].id).toBe(first);
-    expect(sessions[0].status).toBe("rolled_back");
+    expect(sessions).toHaveLength(2);
+    expect(sessions.find((s: { id: string }) => s.id === first).status).toBe("rolled_back");
   });
 });
 

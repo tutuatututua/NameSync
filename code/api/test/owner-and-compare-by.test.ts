@@ -142,12 +142,20 @@ describe("isScorable / runRowBucket", () => {
 
 // ── The owner, per row ──────────────────────────────────────────────────────
 
+/**
+ * The friends on file, as PEOPLE — one row each, in the order they were first seen.
+ *
+ * Reads `friend_current`, not `friend`. Imports stack since 2026-08-04, so the raw table holds one
+ * row per (person, import) and counting it would answer "how many times has somebody been
+ * imported". Every assertion below is about identity — whose roster a friend lands on, and when two
+ * rows are one person — which is exactly what the fold is.
+ */
 const owners = async (): Promise<{ name: string | null; owner: string | null }[]> => {
   const pool = await DBModel.getPool();
   const db = await pool.connect();
   const res = await sql<{ name: string | null; owner: string | null }>`
     select coalesce(friend_name_en, friend_name_th) as name, relationship_owner as owner
-    from lakeshore.friend order by id asc
+    from lakeshore.friend_current order by id asc
   `.execute(db);
   return res.rows;
 };
@@ -277,7 +285,15 @@ describe("relationship owner, per friend row", () => {
     const ov = (await app.inject({ method: "GET", url: "/api/network/overview" })).json().data;
     // Two rosters out of one import. Read off `upload.uploaded_by` this would have been one
     // roster of three, filed under the assistant.
-    expect(ov.uploaders.sort()).toEqual(["Mint", "Nadhee"]);
+    //
+    // The overview carries the COUNT; the names come from the picker's own endpoint, which is where
+    // they moved when this payload stopped shipping an unbounded array. Both are asserted, because
+    // the two have to agree — a count of 2 beside a picker offering three names would be worse than
+    // either being wrong alone.
+    expect(ov.owners).toBe(2);
+    const picker = (await app.inject({ method: "GET", url: "/api/network/owners" })).json().data;
+    expect(picker.owners.sort()).toEqual(["Mint", "Nadhee"]);
+    expect(picker.total).toBe(2);
 
     const mint = (await app.inject({ method: "GET", url: "/api/network/overview?uploader=Mint" })).json().data;
     expect(mint.friends).toBe(2);

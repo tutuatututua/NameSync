@@ -40,6 +40,13 @@ describe("mayAccess — full-access roles", () => {
       expect(mayAccess(roles, "GET", "/api/network/overview")).toBe(true);
       expect(mayAccess(roles, "POST", "/api/comparisons/compare")).toBe(true);
       expect(mayAccess(roles, "POST", "/api/db/sql")).toBe(true);
+      /**
+       * `true` here is not "a user may delete a run" — that endpoint refuses everybody since
+       * 2026-08-07 (see comparisons.route.ts). This layer answers only "is this account's ROLE a
+       * reason to refuse", and it is not; the route then refuses for its own reason. Kept exactly
+       * because the two must stay distinguishable: if the role check ever starts returning false
+       * here, something has quietly turned a universal rule into a per-role one.
+       */
       expect(mayAccess(roles, "DELETE", "/api/comparisons/42")).toBe(true);
       expect(mayAccess(roles, "POST", "/api/upload-sessions/preview")).toBe(true);
     }
@@ -48,7 +55,10 @@ describe("mayAccess — full-access roles", () => {
 
 describe("mayAccess — reviewer", () => {
   it("allows the Network workspace reads", () => {
-    for (const path of ["overview", "grading", "uploaders", "uploader", "search"]) {
+    // `owners` populates the roster filter on the one page this role can open. It was reachable
+    // before only because the names rode inside the `overview` payload; splitting them out had to
+    // carry the permission with them or the filter would have come back empty for a reviewer.
+    for (const path of ["overview", "grading", "owners", "uploaders", "uploader", "search"]) {
       expect(mayAccess(REVIEWER, "GET", `/api/network/${path}`)).toBe(true);
     }
   });
@@ -66,10 +76,26 @@ describe("mayAccess — reviewer", () => {
     expect(mayAccess(REVIEWER, "GET", "/api/comparisons/abc123/rows?page=2")).toBe(true);
   });
 
+  it("allows both Audit trail reads", () => {
+    expect(mayAccess(REVIEWER, "GET", "/api/audit/summary")).toBe(true);
+    expect(mayAccess(REVIEWER, "GET", "/api/audit/activity")).toBe(true);
+    // As they actually arrive.
+    expect(mayAccess(REVIEWER, "GET", "/api/audit/summary?days=90")).toBe(true);
+    expect(mayAccess(REVIEWER, "GET", "/api/audit/activity?page=2&limit=20&kind=run")).toBe(true);
+  });
+
+  it("does not widen /api/audit beyond those two", () => {
+    // The alternation is the whole rule here — an unanchored or `[^/]+` spelling would hand a
+    // reviewer whatever gets mounted under this prefix next.
+    expect(mayAccess(REVIEWER, "GET", "/api/audit")).toBe(false);
+    expect(mayAccess(REVIEWER, "GET", "/api/audit/export")).toBe(false);
+    expect(mayAccess(REVIEWER, "GET", "/api/audit/summary/raw")).toBe(false);
+    expect(mayAccess(REVIEWER, "POST", "/api/audit/summary")).toBe(false);
+  });
+
   it("allows managing only their own account", () => {
     expect(mayAccess(REVIEWER, "GET", "/api/auth/me")).toBe(true);
     expect(mayAccess(REVIEWER, "POST", "/api/auth/logout")).toBe(true);
-    expect(mayAccess(REVIEWER, "POST", "/api/auth/change-password")).toBe(true);
     // Creating accounts is an admin power and stays one.
     expect(mayAccess(REVIEWER, "POST", "/api/auth/users")).toBe(false);
   });

@@ -51,15 +51,118 @@ interface FieldSpec {
    * detected, the row is a leftover with nothing left to hold.
    */
   isGeneric?: boolean;
+  /**
+   * The two halves of a split name, when a file writes one instead of a whole one.
+   *
+   * LinkedIn's `Connections.csv` and most CRM exports have “First Name” and “Last Name” and no
+   * column holding both. One target resolves to one column, so such a file used to detect no name
+   * at all — and the picker couldn't rescue it either, because picking either half imports half of
+   * everybody's name. Detected as a PAIR and joined, which is the only reading that keeps the
+   * whole name. Tried after the single-column aliases: a file with both a full name and its parts
+   * means the full one.
+   */
+  parts?: { first: string[]; last: string[] };
+  /**
+   * This target may be filled by reading the DATA when no header matched — see `guessNameColumn`.
+   *
+   * The language-labelled name columns only. Not the owner (a column full of people's names is far
+   * more likely to be the friends than the person who knows them, and guessing wrong there merges
+   * rosters), not the company, and not the unlabelled slot, which has no column of its own.
+   */
+  guessable?: boolean;
 }
 
 // The language spellings mirror FACEBOOK_FIELDS below, `en_name`/`th_name` included: the two
 // sides of an import come out of the same exporters, and a header vocabulary one file is allowed
 // to use and the other isn't would be a difference with no reason behind it.
+// Headers match on letters and digits alone (see `norm`), so one spelling here covers every way a
+// file writes it: 'company_name' also answers "Company Name", "company-name" and "Company (Name)".
+// What still has to be listed is a different WORD for the same thing — and those are what the
+// pickers on the preview screen kept being asked about, one file after another.
 const COMPANY_FIELDS: FieldSpec[] = [
-  { target: 'company_name', label: 'Company', aliases: ['company_name', 'Company Name', 'company'] },
-  { target: 'person_name_th', label: 'Thai name', aliases: ['thai_name', 'th_name', 'Thai Name', 'thai', 'name_th'], isName: true },
-  { target: 'person_name_en', label: 'English name', aliases: ['eng_name', 'en_name', 'English Name', 'English', 'eng', 'name_en'], isName: true },
+  {
+    target: 'company_name',
+    label: 'Company',
+    aliases: [
+      'company_name',
+      'Company Name',
+      'company',
+      'organisation',
+      'organization',
+      'organisation name',
+      'organization name',
+      'org',
+      'employer',
+      'account',
+      'account name',
+      'firm',
+      'workplace',
+      'บริษัท',
+      'ชื่อบริษัท',
+      'องค์กร',
+      'หน่วยงาน',
+    ],
+  },
+  /**
+   * The contact's name where the file does NOT say which language it is in — the company side's
+   * copy of `friend_name`, and new here for the same reason that one exists.
+   *
+   * A header like "Contact Person", "Full Name" or "ชื่อ-นามสกุล" names a person and claims nothing
+   * about the script. Filing those under `person_name_en` — where they would have had to go, since
+   * this side had only the two labelled slots — asserts English about a column that may well hold
+   * Thai, and a Thai run would then report the whole import as unmatched. Routed by script instead,
+   * by the same rule the friends side has always used.
+   *
+   * This is also the slot the split-name pair and the read-the-data guess land in, and for the same
+   * reason: neither knows a language either.
+   */
+  {
+    target: 'person_name',
+    label: 'Contact name',
+    aliases: [
+      'contact name',
+      'contact person',
+      'contact',
+      'person name',
+      'person',
+      'full name',
+      'fullname',
+      'display name',
+      'ชื่อ',
+      'ชื่อ-นามสกุล',
+      'ชื่อ-สกุล',
+      'ชื่อนามสกุล',
+      'ชื่อผู้ติดต่อ',
+    ],
+    isName: true,
+    isGeneric: true,
+    guessable: true,
+    parts: {
+      first: ['first name', 'firstname', 'given name', 'givenname', 'forename', 'ชื่อจริง', 'ชื่อต้น'],
+      last: ['last name', 'lastname', 'surname', 'family name', 'familyname', 'นามสกุล', 'สกุล'],
+    },
+  },
+  {
+    target: 'person_name_th',
+    label: 'Thai name',
+    aliases: ['thai_name', 'th_name', 'Thai Name', 'thai', 'name_th', 'ชื่อไทย', 'ชื่อภาษาไทย'],
+    isName: true,
+  },
+  {
+    target: 'person_name_en',
+    label: 'English name',
+    aliases: [
+      'eng_name',
+      'en_name',
+      'English Name',
+      'English',
+      'eng',
+      'name_en',
+      'ชื่ออังกฤษ',
+      'ชื่อภาษาอังกฤษ',
+    ],
+    isName: true,
+  },
 ];
 
 /** Facebook friends, as a table. The JSON export's own key name (`name`) leads the aliases: it is
@@ -93,9 +196,39 @@ const FACEBOOK_FIELDS: FieldSpec[] = [
   {
     target: 'friend_name',
     label: 'Friend name',
-    aliases: ['name', 'friend_name', 'Friend Name', 'Facebook Name', 'fb_name', 'full_name'],
+    aliases: [
+      'name',
+      'friend_name',
+      'Friend Name',
+      'Facebook Name',
+      'fb_name',
+      'full_name',
+      // Language-neutral spellings, all of them naming a person and none of them naming a script —
+      // which is what this slot is for. They were absent, so a file calling its one name column
+      // "Contact" or "ชื่อ-นามสกุล" reached the preview with nothing detected: three pickers, and a
+      // user asked to answer a question the app could perfectly well have answered itself.
+      'contact',
+      'contact name',
+      'contact person',
+      'person name',
+      'display name',
+      'profile name',
+      'user name',
+      'ชื่อ',
+      'ชื่อ-นามสกุล',
+      'ชื่อ-สกุล',
+      'ชื่อนามสกุล',
+      'ชื่อผู้ติดต่อ',
+    ],
     isName: true,
     isGeneric: true,
+    guessable: true,
+    // LinkedIn's Connections.csv, and every CRM export shaped like it. Joined rather than picked
+    // between: half a name is not a name. See `FieldSpec.parts`.
+    parts: {
+      first: ['first name', 'firstname', 'given name', 'givenname', 'forename', 'ชื่อจริง', 'ชื่อต้น'],
+      last: ['last name', 'lastname', 'surname', 'family name', 'familyname', 'นามสกุล', 'สกุล'],
+    },
   },
   // `en_name` / `th_name` sit beside `name_en` / `name_th` because both orders are written in
   // practice and neither is more correct — a bilingual export produced against this app's own
@@ -106,13 +239,32 @@ const FACEBOOK_FIELDS: FieldSpec[] = [
   {
     target: 'friend_name_en',
     label: 'Friend name (English)',
-    aliases: ['friend_name_en', 'eng_name', 'en_name', 'English Name', 'name_en', 'Friend Name (English)'],
+    aliases: [
+      'friend_name_en',
+      'eng_name',
+      'en_name',
+      'English Name',
+      'name_en',
+      'Friend Name (English)',
+      'ชื่ออังกฤษ',
+      'ชื่อภาษาอังกฤษ',
+    ],
     isName: true,
   },
   {
     target: 'friend_name_th',
     label: 'Friend name (Thai)',
-    aliases: ['friend_name_th', 'thai_name', 'th_name', 'Thai Name', 'thai', 'name_th', 'Friend Name (Thai)'],
+    aliases: [
+      'friend_name_th',
+      'thai_name',
+      'th_name',
+      'Thai Name',
+      'thai',
+      'name_th',
+      'Friend Name (Thai)',
+      'ชื่อไทย',
+      'ชื่อภาษาไทย',
+    ],
     isName: true,
   },
   /**
@@ -143,6 +295,16 @@ const FACEBOOK_FIELDS: FieldSpec[] = [
       'belongs to',
       'belongs_to',
       'introducer',
+      'introduced by',
+      'referred by',
+      'referrer',
+      'added by',
+      'connection owner',
+      'account owner',
+      'sales owner',
+      'ผู้แนะนำ',
+      'เจ้าของ',
+      'รู้จักโดย',
     ],
     isOwner: true,
   },
@@ -159,76 +321,297 @@ const FACEBOOK_FIELDS: FieldSpec[] = [
  */
 const SAMPLE_SIZE = 50;
 
-/** Headers match ignoring case, spaces and underscores: "Thai Name" == "thai_name". */
-const norm = (s: string): string => s.replace(/[\s_]+/g, '').toLowerCase();
+/**
+ * Headers match on their letters and digits alone: "Thai Name" == "thai_name" == "Thai-Name".
+ *
+ * It used to fold whitespace and underscores only, which made the alias lists a catalogue of
+ * PUNCTUATION rather than of vocabulary: "Name (EN)", "name-en" and "name.en" are the same header
+ * written three ways, and each one that wasn't listed arrived at the preview as a column nothing
+ * could find. Dropping every separator answers all of them at once, and leaves the lists to hold
+ * what they should — the different WORDS a file uses for the same thing.
+ */
+const norm = (s: string): string => s.replace(/[^\p{L}\p{N}]+/gu, '').toLowerCase();
 
-/** The header an alias list finds in this file, or null. */
-const detect = (aliases: string[], headers: string[]): string | null =>
-  aliases.map((a) => headers.find((h) => norm(h) === norm(a))).find((h) => h !== undefined) ?? null;
+/** The last segment of a flattened JSON key: `profile.name` → `name`. Plain headers have none,
+ *  and answer as themselves. */
+const leaf = (header: string): string => header.slice(header.lastIndexOf('.') + 1);
+
+/**
+ * The header an alias list finds in this file, or null.
+ *
+ * Two passes, and the order between them matters: a whole header beats a nested one for EVERY
+ * alias before any nested key is considered. A file with both a top-level `name` and a
+ * `profile.name` means the top-level one, and doing it alias-by-alias would let a later alias
+ * matching a nested key beat an earlier alias matching a real column.
+ *
+ * The nested pass is what makes a JSON export's `profile.name` detectable at all. The reader now
+ * flattens nesting into dotted columns (json-rows.ts) so the key is visible and selectable; this
+ * is the other half — a key called `name` one level down is still a key called `name`.
+ */
+const detect = (aliases: string[], headers: string[]): string | null => {
+  const whole = aliases
+    .map((a) => headers.find((h) => norm(h) === norm(a)))
+    .find((h) => h !== undefined);
+  if (whole !== undefined) return whole;
+
+  const nested = aliases
+    .map((a) => headers.find((h) => h.includes('.') && norm(leaf(h)) === norm(a)))
+    .find((h) => h !== undefined);
+  return nested ?? null;
+};
+
+/** How many rows the column guess reads. A column's character is obvious well before this, and
+ *  the whole file is already in memory — this only bounds the work, not the evidence. */
+const GUESS_SAMPLE = 200;
+
+/**
+ * Does this header hint that people's names live in it? Not an alias — an alias is a whole header,
+ * this is a word inside one, and it only ever tips a guess between columns that look alike.
+ *
+ * Whole WORDS on the Latin side, with separators read as spaces first, so "contact_name" hints and
+ * "nickname" does not: a nickname column is not the column a roster is built on, and a substring
+ * test hands it the same standing as "Full Name". Thai is written without word breaks, so there
+ * substring is the only test there is.
+ */
+const hasNameHint = (header: string): boolean =>
+  /\b(name|contact|person|friend)\b/i.test(header.replace(/[_\-.]+/g, ' ')) ||
+  ['ชื่อ', 'สกุล'].some((k) => header.includes(k));
+
+/**
+ * Does this value look like a person's name?
+ *
+ * Deliberately a test of SHAPE, not of meaning — it is asked of a column whose header told us
+ * nothing, and the only evidence left is what the cells look like. It is written to be easy to
+ * fail: a digit, an @, a URL or more than five words all disqualify, which rules out ids, emails,
+ * phone numbers, dates, addresses, job titles-with-numbers and free-text notes. What survives is
+ * a short run of letters and the punctuation names actually carry.
+ */
+function looksLikePersonName(value: string): boolean {
+  if (value.length < 2 || value.length > 60) return false;
+  if (/\d/.test(value)) return false;
+  if (value.includes('@') || value.includes('://')) return false;
+  if (value.split(/\s+/).length > 5) return false;
+  if (!/\p{L}/u.test(value)) return false;
+  // \p{M} as well as \p{L}: Thai vowels and tone marks are combining marks, not letters, so a
+  // letters-only test calls every Thai name malformed — which is the wrong way round for a rule
+  // whose whole job is spotting the Thai name column nothing else could find.
+  return !/[^\p{L}\p{M}\s.'’\-()"]/u.test(value);
+}
+
+/**
+ * The column that holds people's names, worked out from the DATA — the last thing tried, and only
+ * when no header named a name column at all.
+ *
+ * The case it exists for is the one the bug report is about: a file whose name column is called
+ * something no alias list could have predicted. Detection had nothing to say about those, so the
+ * preview asked the user to map every slot by hand — on a file where the answer is obvious to
+ * anyone who looks at one row of it.
+ *
+ * A guess needs to be RIGHT more than it needs to be brave, so a column has to clear two bars, not
+ * one: four cells in five must look like a name (`looksLikePersonName`), AND the header must hint
+ * at names or most of the values must be more than one word. Name-shaped alone is far too easy —
+ * a column of single ordinary words ("Sales", "Active", "Bangkok") passes it, and the import would
+ * then cheerfully file a column of departments as people. Among the columns that do clear both,
+ * mostly-distinct values count for more: a roster repeats companies and job titles, and rarely
+ * repeats a person.
+ *
+ * The winner is marked `guessed` all the way to the screen, which says so and offers the same
+ * picker as ever — a guess is an opening bid, not a decision taken on the user's behalf.
+ */
+function guessNameColumn(headers: string[], rows: Record<string, string>[]): string | null {
+  const sample = rows.slice(0, GUESS_SAMPLE);
+  let best: string | null = null;
+  let bestScore = 0;
+
+  for (const header of headers) {
+    const values = sample.map((r) => (r[header] ?? '').trim()).filter((v) => v !== '');
+    if (values.length === 0) continue;
+
+    const nameish = values.filter(looksLikePersonName).length / values.length;
+    if (nameish < 0.8) continue;
+
+    const hinted = hasNameHint(header);
+    const multiword = values.filter((v) => v.split(/\s+/).length > 1).length / values.length;
+    if (!hinted && multiword < 0.5) continue;
+
+    const distinct = new Set(values.map((v) => v.toLowerCase())).size / values.length;
+    const score = nameish + (hinted ? 1 : 0) + distinct * 0.5;
+    if (score > bestScore) {
+      bestScore = score;
+      best = header;
+    }
+  }
+  return best;
+}
+
+/**
+ * The three name slots each side has: the unlabelled column, and the two labelled ones it routes
+ * into. Named once here because three functions have to agree about them — the router, the
+ * preview's raw/clean pairing and the "is this file usable" warnings — and a fourth spelling of
+ * "friend_name_th" is how the preview and the import start describing different files.
+ */
+interface NameSlots {
+  generic: string;
+  en: string;
+  th: string;
+}
+
+const FRIEND_SLOTS: NameSlots = { generic: 'friend_name', en: 'friend_name_en', th: 'friend_name_th' };
+const COMPANY_SLOTS: NameSlots = { generic: 'person_name', en: 'person_name_en', th: 'person_name_th' };
+
+/** What resolution decided about one target, before it becomes a `ColumnMapping`. */
+interface Resolved {
+  sourceColumn: string | null;
+  alsoColumn?: string | null;
+  guessed?: boolean;
+}
 
 /**
  * Resolve each target column to the header that supplies it, or null if the file has none.
  *
- * `overrides` is the user answering the question this function otherwise answers alone: a target
- * they named a column for takes that column, whatever the aliases say. It exists because an alias
- * list only knows the exports it was written against, and "not found" on the preview screen used
- * to be a dead end — the column was simply dropped and the file had to be re-exported or renamed
- * by hand.
+ * Four tiers, tried in order, each seeing only the headers the ones above it left alone:
  *
- * A named header the file does NOT have is ignored rather than honoured as null, and detection
- * runs for that target as usual. That is the file-swapped-underneath case (the UI resets its
- * choices with the file, but a scripted caller need not), and behaving as though no choice was
- * made is the only reading that can't quietly empty a column the file plainly has.
+ *   1. What the USER said — a target they named a column for takes that column, whatever anything
+ *      else thinks, and `null` means "take nothing" (the only way to undo a wrong detection).
+ *   2. The ALIAS lists — the vocabulary of the exports this app knows.
+ *   3. A name written as TWO columns — "First Name" + "Last Name", joined.
+ *   4. The DATA — when no header named a name column at all, the column that is full of things
+ *      shaped like people's names. Marked `guessed`, and never silent.
+ *
+ * Tiers 3 and 4 are new, and they are the "it doesn't auto-match" half of the bug they answer:
+ * before them a file whose headers weren't on a list resolved to nothing at all. Tier 1 running
+ * FIRST is the other half — until it did, a hand-mapped column could be claimed out from under
+ * the user by an alias that matched the same header for a different target.
  */
-function buildMapping(fields: FieldSpec[], headers: string[], overrides: ColumnOverrides = {}): ColumnMapping[] {
-  return fields.map(({ target, label, aliases, isName, isOwner, isGeneric }) => {
+function buildMapping(
+  fields: FieldSpec[],
+  headers: string[],
+  rows: Record<string, string>[],
+  overrides: ColumnOverrides = {}
+): ColumnMapping[] {
+  const resolved = new Map<string, Resolved>();
+  /** Headers already spoken for. A column feeds one target, so each tier below only sees what
+   *  the tiers above it left — which is what stops a guess re-using a column detection found. */
+  const taken = new Set<string>();
+  const free = () => headers.filter((h) => !taken.has(h));
+
+  const claim = (target: string, r: Resolved) => {
+    resolved.set(target, r);
+    if (r.sourceColumn) taken.add(r.sourceColumn);
+    if (r.alsoColumn) taken.add(r.alsoColumn);
+  };
+
+  // ── 1. What the user said, first — so nothing below can claim a column they spoke for ───────
+  // A generic slot takes detection only: the picker that would fill it isn't offered, and
+  // honouring a choice nothing can make would be a second way in with no way to see it.
+  for (const f of fields) {
+    if (f.isGeneric || !(f.target in overrides)) continue;
+    const want = overrides[f.target];
+    // Explicitly nothing. This is how a column detection got WRONG is emptied — see
+    // `ColumnOverridesSchema`. It has to sit in `resolved`, or the tiers below would fill it back in.
+    if (want === null) {
+      claim(f.target, { sourceColumn: null });
+      continue;
+    }
     // Matched the same forgiving way an alias is, so a header round-tripped through a UI or a
     // hand-written script ("Thai Name" vs "thai_name") still lands on the column it names.
-    // A generic slot takes detection only — the picker that would fill it isn't offered, and
-    // honouring a choice nothing can make would be a second way in with no way to see it.
-    const chosen = !isGeneric && overrides[target] ? detect([overrides[target]], headers) : null;
-    const sourceColumn = chosen ?? detect(aliases, headers);
+    const header = detect([want], headers);
+    // A named header the file does NOT have is ignored rather than honoured as null, and detection
+    // runs for that target as usual — the file-swapped-underneath case.
+    if (header) claim(f.target, { sourceColumn: header });
+  }
+
+  // ── 2. The alias lists ──────────────────────────────────────────────────────────────────────
+  for (const f of fields) {
+    if (resolved.has(f.target)) continue;
+    const header = detect(f.aliases, free());
+    if (header) claim(f.target, { sourceColumn: header });
+  }
+
+  // ── 3. A name written as two columns ────────────────────────────────────────────────────────
+  // After the aliases, deliberately: a file carrying both a whole name and its parts means the
+  // whole one, and only a file with no single name column needs these joined.
+  for (const f of fields) {
+    if (resolved.has(f.target) || !f.parts) continue;
+    const first = detect(f.parts.first, free());
+    const last = detect(f.parts.last, free());
+    if (first && last) claim(f.target, { sourceColumn: first, alsoColumn: last });
+  }
+
+  // ── 4. Reading the data, when no header named a name at all ─────────────────────────────────
+  // Gated on the whole file, not on one target: a bilingual export that found its Thai column and
+  // not its English one has nothing missing, and guessing at the remaining columns there would be
+  // inventing a second name for people who have one.
+  const named = fields.some((f) => f.isName && resolved.get(f.target)?.sourceColumn);
+  if (!named) {
+    const guessable = fields.find((f) => f.guessable && !resolved.has(f.target));
+    const header = guessable ? guessNameColumn(free(), rows) : null;
+    if (guessable && header) claim(guessable.target, { sourceColumn: header, guessed: true });
+  }
+
+  return fields.map(({ target, label, isName, isOwner, isGeneric }) => {
+    const r = resolved.get(target);
     return {
       target,
       label,
-      sourceColumn,
+      sourceColumn: r?.sourceColumn ?? null,
+      alsoColumn: r?.alsoColumn ?? null,
       // `cleaned` tells the preview which cells have a `<target>_clean` twin to show. An owner
       // gets one too: it is cleaned (titles stripped), so the file's own spelling is worth showing
       // beside what will be stored, for the same reason a friend's name is.
       cleaned: isName === true || isOwner === true,
       pickable: isGeneric !== true,
+      guessed: r?.guessed === true,
     };
   });
 }
 
 /** Headers the file has that no target column claims — the import will ignore them. */
 const ignoredColumns = (headers: string[], mapping: ColumnMapping[]): string[] => {
-  const claimed = new Set(mapping.map((m) => m.sourceColumn).filter(Boolean));
+  const claimed = new Set(mapping.flatMap((m) => [m.sourceColumn, m.alsoColumn]).filter(Boolean));
   return headers.filter((h) => !claimed.has(h));
 };
 
-/** Pull one target column out of a raw row. Empty string is absence, not a value. */
-const cell = (row: Record<string, unknown>, sourceColumn: string | null): string | null => {
-  if (!sourceColumn) return null;
-  const v = row[sourceColumn];
+/** One header's value in a raw row. Empty string is absence, not a value. */
+const headerCell = (row: Record<string, unknown>, header: string | null): string | null => {
+  if (!header) return null;
+  const v = row[header];
   if (v === null || v === undefined) return null;
   const s = String(v).trim();
   return s === '' ? null : s;
 };
 
+/** Pull one target column out of a raw row — both halves of it, where the file splits a name
+ *  across two columns (`alsoColumn`). One half present and the other blank is still a value:
+ *  a person with no surname in the file has a name, and it is the half that is there. */
+const cell = (row: Record<string, unknown>, m: ColumnMapping | undefined): string | null => {
+  if (!m) return null;
+  const parts = [headerCell(row, m.sourceColumn), headerCell(row, m.alsoColumn ?? null)].filter(
+    (v): v is string => v !== null
+  );
+  return parts.length === 0 ? null : parts.join(' ');
+};
+
 /** The raw cells a row supplies, keyed by target column — the file's own words, before cleaning.
  *  Only the preview reads this: the import stores cleaned names and nothing else. */
 const rawRow = (row: Record<string, unknown>, mapping: ColumnMapping[]): Record<string, string | null> =>
-  Object.fromEntries(mapping.map((m) => [m.target, cell(row, m.sourceColumn)]));
+  Object.fromEntries(mapping.map((m) => [m.target, cell(row, m)]));
 
 const mapCompanyRow = (row: Record<string, string>, mapping: ColumnMapping[]): CompanyContactRecord => {
-  const by = (target: string) => cell(row, mapping.find((m) => m.target === target)?.sourceColumn ?? null);
+  const by = (target: string) => cell(row, mapping.find((m) => m.target === target));
+  // Routed by script exactly as a friend's is — see `routeNames`. The company side gained an
+  // unlabelled slot when it gained headers that name a person without naming a language.
+  const { en, th } = routeNames(
+    cleanPersonName(by('person_name')),
+    cleanPersonName(by('person_name_en')),
+    cleanPersonName(by('person_name_th'))
+  );
   return {
     // A company name is only ever grouped and matched exactly, so it's tidied (whitespace,
     // invisible characters) but never de-titled: "Mr Pizza Co." is a company called Mr Pizza.
     company_name: tidyText(by('company_name')),
-    person_name_th: cleanPersonName(by('person_name_th')),
-    person_name_en: cleanPersonName(by('person_name_en')),
+    person_name_th: th,
+    person_name_en: en,
   };
 };
 
@@ -247,27 +630,33 @@ const mapCompanyRow = (row: Record<string, string>, mapping: ColumnMapping[]): C
  *
  * It only ever FILLS: a labelled column already holding a value is never displaced by the generic
  * one, which is the same "fill nulls, never overwrite" stance the import takes against the database.
+ *
+ * Both sides run this. It was `routeFriendNames` while only the friends file had an unlabelled
+ * name column; a company file now has one too (`person_name`), and one rule shared is the only way
+ * the two sides can't drift on the question of which column a Thai name lands in.
  */
-function routeFriendNames(
+function routeNames(
   generic: string | null,
   en: string | null,
   th: string | null
-): { friend_name_en: string | null; friend_name_th: string | null } {
+): { en: string | null; th: string | null } {
   if (generic) {
     if (hasThai(generic)) th = th ?? generic;
     else en = en ?? generic;
   }
-  return { friend_name_en: en, friend_name_th: th };
+  return { en, th };
 }
 
 const mapFriendRow = (row: Record<string, string>, mapping: ColumnMapping[]): FriendRecord => {
-  const by = (target: string) => cell(row, mapping.find((m) => m.target === target)?.sourceColumn ?? null);
+  const by = (target: string) => cell(row, mapping.find((m) => m.target === target));
+  const { en, th } = routeNames(
+    cleanPersonName(by('friend_name')),
+    cleanPersonName(by('friend_name_en')),
+    cleanPersonName(by('friend_name_th'))
+  );
   return {
-    ...routeFriendNames(
-      cleanPersonName(by('friend_name')),
-      cleanPersonName(by('friend_name_en')),
-      cleanPersonName(by('friend_name_th'))
-    ),
+    friend_name_en: en,
+    friend_name_th: th,
     // Cleaned but case-preserving — see cleanOwnerName. Null when the file has no owner column
     // OR when this particular row left it blank; both are "the file did not say", the typed owner
     // answers both, and nothing here needs to tell them apart.
@@ -286,7 +675,8 @@ const mapFriendRow = (row: Record<string, string>, mapping: ColumnMapping[]): Fr
 const previewRow = (
   raw: Record<string, string | null>,
   record: CompanyContactRecord | FriendRecord,
-  mapping: ColumnMapping[]
+  mapping: ColumnMapping[],
+  slots: NameSlots
 ): Record<string, string | null> => {
   const stored = record as unknown as Record<string, string | null | undefined>;
   const out: Record<string, string | null> = {};
@@ -294,15 +684,24 @@ const previewRow = (
     if (m.cleaned) {
       // A name column: the raw cell, plus the cleaned value that will be stored beneath it.
       out[m.target] = raw[m.target] ?? null;
-      // `friend_name` is the one target with no column of its own — `routeFriendNames` sends the
-      // unlabelled cell to whichever language its script indicates. So the stored value is looked
-      // up in the column it landed in, using the same script test that put it there. Cleaning
-      // never changes a name's script, so testing the RAW cell agrees with the routing by
-      // construction, and the value still comes off the record rather than being re-derived.
+      // The unlabelled slot is the one target with no column of its own — `routeNames` sends its
+      // cell to whichever language the script indicates. So the stored value is looked up in the
+      // column it landed in, using the same script test that put it there. Cleaning never changes
+      // a name's script, so testing the RAW cell agrees with the routing by construction, and the
+      // value still comes off the record rather than being re-derived.
+      //
+      // Except when the labelled column it routes into ALREADY has a value: routing only ever
+      // fills, so this cell was not used at all. `null` is how the sample says "not imported", and
+      // saying it here is the difference between a dropped cell being visible on this screen and
+      // being discovered in the data. It is a file with both a labelled and an unlabelled name
+      // column — an odd shape, and exactly the shape a wrong detection makes.
       out[`${m.target}_clean`] =
-        m.target === 'friend_name'
-          ? raw.friend_name
-            ? (hasThai(raw.friend_name) ? stored.friend_name_th : stored.friend_name_en) ?? null
+        m.target === slots.generic
+          ? raw[slots.generic]
+            ? (() => {
+                const routed = hasThai(raw[slots.generic] as string) ? slots.th : slots.en;
+                return raw[routed] ? null : stored[routed] ?? null;
+              })()
             : null
           : stored[m.target] ?? null;
     } else {
@@ -315,6 +714,43 @@ const previewRow = (
   }
   return out;
 };
+
+/**
+ * How many importable rows carry an ENGLISH name — the count an import's run turns into a
+ * requirement. See `ScorableRowsSchema` for why it is counted here rather than read off the
+ * mapping: an unlabelled column is routed by script, so this is a question about cells.
+ *
+ * Nameless rows are excluded by construction — a row with no name in either language has none in
+ * this one — which is the same set the `usable` gate in comparisons.route.ts drops.
+ *
+ * It counted Thai too until 2026-08-05, for an import screen that could choose a Thai run. It
+ * cannot: every import is `en_full`, so the Thai count had no reader and no rule behind it. Thai
+ * names are still imported and still comparable — by a run started from the Network page, over rows
+ * this import has already stored.
+ */
+const scorableRows = (
+  mapped: { person_name_en?: string | null; friend_name_en?: string | null }[]
+): { en: number } => ({
+  en: mapped.filter((r) => r.person_name_en ?? r.friend_name_en).length,
+});
+
+/**
+ * "No header named the names, so ‘f_002’ was read as them" — said out loud, in the warnings, not
+ * only as a badge on a table row.
+ *
+ * A guess is the one thing on this screen the file did not say and detection did not know, so it
+ * is the one thing most worth a reader's attention — and the row it sits on is easy to skim past
+ * on a file where everything else looks right. The wording names the column and says what to do
+ * if it is wrong, because "check this" without a next step is just unease.
+ */
+function guessNote(mapping: ColumnMapping[]): string[] {
+  return mapping
+    .filter((m) => m.guessed && m.sourceColumn)
+    .map(
+      (m) =>
+        `No header named the names, so “${m.sourceColumn}” was read as them — it is the column that looks most like people's names. If that's wrong, pick the right one below.`
+    );
+}
 
 /** "3 names will be cleaned…" — the preview's account of what cleaning will do to this file, so
  *  it's a thing you agreed to rather than a thing you discover in the grid afterwards.
@@ -355,14 +791,14 @@ export class FileParserService {
    */
   static async parseCompanyFile(filePath: string, overrides: ColumnOverrides = {}): Promise<CompanyContactRecord[]> {
     const { headers, rows } = await readTable(filePath);
-    const mapping = buildMapping(COMPANY_FIELDS, headers, overrides);
+    const mapping = buildMapping(COMPANY_FIELDS, headers, rows, overrides);
     return rows.map((r) => mapCompanyRow(r, mapping));
   }
 
   /** Parse a Facebook friends file into friend records. */
   static async parseFacebookFile(filePath: string, overrides: ColumnOverrides = {}): Promise<FriendRecord[]> {
     const { headers, rows } = await readTable(filePath);
-    const mapping = buildMapping(FACEBOOK_FIELDS, headers, overrides);
+    const mapping = buildMapping(FACEBOOK_FIELDS, headers, rows, overrides);
     return rows.map((r) => mapFriendRow(r, mapping));
   }
 
@@ -373,19 +809,56 @@ export class FileParserService {
     overrides: ColumnOverrides = {}
   ): Promise<UploadPreview> {
     const { headers, rows } = await readTable(filePath);
-    const mapping = buildMapping(COMPANY_FIELDS, headers, overrides);
+    const mapping = buildMapping(COMPANY_FIELDS, headers, rows, overrides);
     const mapped = rows.map((r) => mapCompanyRow(r, mapping));
     const raws = rows.map((r) => rawRow(r, mapping));
 
     const warnings: string[] = [];
     if (rows.length === 0) warnings.push('This file has no rows to import.');
 
-    for (const m of mapping) {
-      if (!m.sourceColumn) {
-        // Now an instruction rather than an obituary: the same screen that shows this warning
-        // offers the column list, so the file no longer has to be re-exported to fix it.
-        warnings.push(`No column matched “${m.label}” — pick the column it's in below, or it will be empty on every row.`);
-      }
+    // The NAME columns, asked ONCE — the three slots are three ways of answering one question, and
+    // a file only has to answer it once. Per target this warned about the unlabelled slot on every
+    // bilingual file, and pointed at a row that deliberately offers no picker. Same rule as the
+    // friends side below, for the same reason.
+    if (!mapping.some((m) => m.target.startsWith('person_name') && m.sourceColumn)) {
+      warnings.push(
+        "No column matched a contact's name — pick the column the names are in below, or this file will import nothing."
+      );
+    }
+
+    warnings.push(...guessNote(mapping));
+
+    /**
+     * Contacts with no COMPANY — the one column a company file must have besides the names.
+     *
+     * The company is the axis every run is selected by, so a contact filed under nothing can never
+     * be compared: it is not in "PTT", it is not in "all companies I picked", it is nowhere. Every
+     * row of a company file being like that means the file has no company column at all (or an
+     * empty one), which the import refuses — see comparisons.route.ts, which counts the same rows
+     * the same way so the screen and the import cannot disagree.
+     *
+     * Counted over IMPORTABLE rows only, exactly as `ownerlessRows` is: a row with no person name
+     * is dropped anyway, and holding its blank company against the file would block an import that
+     * was never going to include it.
+     *
+     * This is the ONLY warning about the company column, and it deliberately replaced a second one
+     * that fired off the mapping alone ("No column matched “Company” … or it will be empty on every
+     * row"). Two messages about one missing column is one too many, and that one was now wrong
+     * besides: an empty company column does not leave the rows empty, it stops the import.
+     */
+    const importable = mapped.filter((r) => r.person_name_th || r.person_name_en);
+    const companylessRows = importable.filter((r) => !r.company_name).length;
+    if (companylessRows > 0) {
+      const hasColumn = !!mapping.find((m) => m.target === 'company_name')?.sourceColumn;
+      warnings.push(
+        companylessRows === importable.length
+          ? hasColumn
+            ? 'No row names a company — the company column is empty on every row, and a contact with no company can never be compared. This file cannot be imported.'
+            : "No column matched the company — pick the column it's in below. A contact with no company can never be compared, so this file cannot be imported without one."
+          : `${companylessRows.toLocaleString()} row${companylessRows === 1 ? ' names' : 's name'} no company. ${
+              companylessRows === 1 ? 'It' : 'They'
+            } will import, but no run can reach ${companylessRows === 1 ? 'it' : 'them'} — every comparison is selected by company.`
+      );
     }
 
     // A contact the matcher cannot score is a contact that will not import — see the `usable`
@@ -401,12 +874,14 @@ export class FileParserService {
     }
 
     // Counted across the whole file, not just the sample — the sample is what you see, but
-    // the number has to describe what will actually be written.
+    // the number has to describe what will actually be written. The unlabelled slot is in here
+    // too: its cell is cleaned like any other name, and it is the only column some files have.
     warnings.push(
       ...cleaningNote(
         raws.flatMap((raw, i): [string | null, string | null][] => [
           [raw.person_name_th, mapped[i].person_name_th],
           [raw.person_name_en, mapped[i].person_name_en],
+          [raw.person_name, mapped[i].person_name_th ?? mapped[i].person_name_en],
         ])
       )
     );
@@ -418,11 +893,13 @@ export class FileParserService {
       sourceColumns: headers,
       ignoredColumns: ignoredColumns(headers, mapping),
       mapping,
-      sampleRows: raws.slice(0, SAMPLE_SIZE).map((raw, i) => previewRow(raw, mapped[i], mapping)),
+      sampleRows: raws.slice(0, SAMPLE_SIZE).map((raw, i) => previewRow(raw, mapped[i], mapping, COMPANY_SLOTS)),
       warnings,
       // A company contact is nobody's relationship — there is no owner column on this side and
       // nothing for the import screen to ask for. Always zero, never "not asked".
       ownerlessRows: 0,
+      scorableRows: scorableRows(mapped),
+      companylessRows,
     };
   }
 
@@ -433,7 +910,7 @@ export class FileParserService {
     overrides: ColumnOverrides = {}
   ): Promise<UploadPreview> {
     const { headers, rows } = await readTable(filePath);
-    const mapping = buildMapping(FACEBOOK_FIELDS, headers, overrides);
+    const mapping = buildMapping(FACEBOOK_FIELDS, headers, rows, overrides);
     const mapped = rows.map((r) => mapFriendRow(r, mapping));
     const raws = rows.map((r) => rawRow(r, mapping));
 
@@ -464,6 +941,8 @@ export class FileParserService {
         "No column matched a friend's name — pick the column the names are in below, or this file will import nothing."
       );
     }
+
+    warnings.push(...guessNote(mapping));
 
     // On the cleaned names, which is what the import's `usable` gate reads. NO usable name at all
     // is the only condition that drops a row — a friend with just one spelling imports normally
@@ -553,9 +1032,12 @@ export class FileParserService {
       sourceColumns: headers,
       ignoredColumns: ignoredColumns(headers, mapping),
       mapping,
-      sampleRows: raws.slice(0, SAMPLE_SIZE).map((raw, i) => previewRow(raw, mapped[i], mapping)),
+      sampleRows: raws.slice(0, SAMPLE_SIZE).map((raw, i) => previewRow(raw, mapped[i], mapping, FRIEND_SLOTS)),
       warnings,
       ownerlessRows,
+      scorableRows: scorableRows(mapped),
+      // A friend has no company — that column belongs to the other side of the import.
+      companylessRows: 0,
     };
   }
 }

@@ -1,9 +1,10 @@
 import { DBModel } from "@extensions/sqldb";
 import { sql, type SqlBool } from "kysely";
-import { matchStrength, parseCompareBy } from "@extensions/contract";
+import { DEFAULT_COMPARE_BY, matchStrength, parseCompareBy } from "@extensions/contract";
 import { friendPreferenceSql, ownerSql, sameFriendSql, scoredNameSql } from "./friend-identity";
 import type {
   CompanyConnection,
+  CompanySort,
   CompanyUploader,
   ConnectedUploader,
   CompareBy,
@@ -39,7 +40,8 @@ import {
  *
  * The method and route names were kept rather than swept, because they are wire names with a UI
  * and a contract type on the far end and the app already tolerates a name outliving its meaning
- * where it is written down (`X-Session-ID`, `upload_person_name`). Every user-visible label says
+ * where it is written down (`upload_person_name` is the surviving example; `X-Session-ID` was the
+ * other until the webhook headers were cut back to five). Every user-visible label says
  * "owner". What must NOT be reintroduced is a read of `upload.uploaded_by` in this file: it now
  * names who pressed the button, and grouping a roster by it merges two people's friends whenever
  * one export held both.
@@ -103,6 +105,24 @@ const score = (v: unknown): number | null => {
 const asMode = (v: unknown): CompareBy => parseCompareBy(typeof v === "string" ? v : null);
 
 /**
+ * A run's mode as a value that can be GROUPED BY — `compare_by`, with NULL resolved.
+ *
+ * The coalesce is not decoration. A run stored before the column existed holds NULL and IS an
+ * `en_full` run, so folding on the raw column would treat it as a fourth mode and show its finding
+ * beside an identical `en_full` one as though the two had asked different questions. Same reasoning
+ * as `ComparisonModel.findDuplicates`, and the same default, because they are the same judgement.
+ *
+ * `sql.lit`, NOT `sql.val`, and that is load-bearing rather than stylistic. This expression appears
+ * both in a `DISTINCT ON` list and in the `ORDER BY` that has to match it, and `sql.val` emits a
+ * bound parameter — a DIFFERENT `$n` at each site. Postgres compares the parsed expressions, sees
+ * `$3` against `$7`, and rejects the whole query with "SELECT DISTINCT ON expressions must match
+ * initial ORDER BY expressions". A literal renders identically in both places.
+ *
+ * Safe to inline because the value is our own compile-time constant, never user input.
+ */
+const resolvedModeSql = sql<string>`coalesce(comparison.compare_by, ${sql.lit(DEFAULT_COMPARE_BY)})`;
+
+/**
  * THE FRIEND A RESULT ROW IS ABOUT — and, now, THE OWNER OF THAT FRIEND. One lateral, both answers.
  *
  * ── Why the id ──
@@ -137,7 +157,11 @@ const asMode = (v: unknown): CompareBy => parseCompareBy(typeof v === "string" ?
 const friendLateral = (eb: any): any =>
   eb
     .selectFrom("friend as fx")
-    .select(["fx.id as id", "fx.relationship_owner as relationship_owner"])
+    .select([
+      "fx.id as id",
+      "fx.person_key as person_key",
+      "fx.relationship_owner as relationship_owner",
+    ])
     .where(sameFriendSql("comparison_result", "fx"))
     .orderBy(friendPreferenceSql("comparison_result", "fx"))
     .orderBy("fx.id", "asc")
@@ -148,8 +172,25 @@ const friendLateral = (eb: any): any =>
 const withFriend = <T>(q: T): T =>
   (q as any).leftJoinLateral(friendLateral, (join: any) => join.onTrue()) as T;
 
-/** The friend a result row is about, as an id. Requires `withFriend`. */
-const friendKeySql = sql<string>`fr.id`;
+/**
+ * THE FRIEND A RESULT ROW IS ABOUT, as a PERSON. Requires `withFriend`.
+ *
+ * Was `fr.id`, and moving it one column along is the single highest-leverage line in this file.
+ *
+ * Counting distinct NAME STRINGS was exact while a friend had one name and broke the moment they
+ * had two — a Thai run writes `สมชาย ใจดี` and an English run writes `somchai jaidee` for the same
+ * person, and a distinct count over strings sees two. That is why this became `fr.id`.
+ *
+ * Since 2026-08-04 imports STACK: one person re-imported is several `friend` rows, each with its
+ * own id, and `fr.id` would now count them as several people — re-breaking the very invariant the
+ * move to the id was meant to protect, in the same silent, flattering direction ("Connections 12"
+ * over a list of four). `person_key` is one uuid per person however many times they were imported,
+ * so it is exact under both failure modes.
+ *
+ * Note the lateral still resolves to ONE `friend` row, and still may pick any of a person's copies
+ * — which copy no longer matters, because every copy carries the same key.
+ */
+const friendKeySql = sql<string>`fr.person_key`;
 
 /**
  * Whose relationship that friend is. Requires `withFriend`.
@@ -179,7 +220,7 @@ const ownerKeySql = sql<string>`lower(${ownerNameSql})`;
  */
 const friendLateralSql = (cr: string) => sql`
   left join lateral (
-    select fx.id, fx.relationship_owner, fx.friend_name_en, fx.friend_name_th, u.uploaded_by
+    select fx.id, fx.person_key, fx.relationship_owner, fx.friend_name_en, fx.friend_name_th, u.uploaded_by
     from friend fx
     left join upload u on u.id = fx.upload_id
     where ${sameFriendSql(cr, "fx")}
@@ -228,6 +269,33 @@ const matchedFor = (statusColumn: string, similarityColumn: string, threshold: n
  */
 const withRun = <T>(q: T): T =>
   (q as any).innerJoin("comparison", "comparison.id", "comparison_result.comparison_id") as T;
+
+/**
+ * THE CONTACT A RESULT ROW MATCHED, as a person — the company-side twin of `withFriend`.
+ *
+ * A LEFT join, unlike the run above, because `company_contact_id` is nullable by design: an
+ * external workflow need not send one, rows predate the column, and the FK is `ON DELETE SET NULL`
+ * so rolling back a company import empties it rather than taking the history with it. An inner join
+ * would silently drop every such match from the roster page.
+ *
+ * `person_key` and not `id`, for exactly the reason `friendKeySql` is keyed that way: imports stack,
+ * so one contact re-imported is several `company_contact` rows with different ids and one key. A
+ * pairing folded on the id would split into two the moment somebody re-uploaded the company sheet.
+ *
+ * IDENTITY ONLY. Nothing downstream reads a NAME through this join — see the note on
+ * `ComparisonResult.company_contact_id`. What was compared is the frozen text on the result row;
+ * this answers "is that the same contact as the row above", which the frozen text cannot, since a
+ * Thai run and an English run record two different strings for one person.
+ */
+const withContact = <T>(q: T): T =>
+  (q as any).leftJoin(
+    "company_contact as cc",
+    "cc.id",
+    "comparison_result.company_contact_id"
+  ) as T;
+
+/** Which contact a result row is about. Requires `withContact`. Null when the row names none. */
+const contactKeySql = sql<string | null>`cc.person_key`;
 
 /** "Did this row come from a run that compared whole names?" — the confirmed test, for FILTER. */
 const isConfirmed = sql<SqlBool>`${matchStrengthSql("comparison.compare_by")} = ${sql.val("confirmed")}`;
@@ -296,7 +364,7 @@ export class NetworkModel extends DBModel {
   }
 
   /**
-   * Every person with a roster — the Overview picker's options.
+   * People with a roster, matching `q` — the Overview picker's options, a page at a time.
    *
    * Sourced from `friend.relationship_owner`, not from results, so an owner who has a friend list
    * but has never been compared still appears: their roster size is a real answer ("you have 40
@@ -307,17 +375,75 @@ export class NetworkModel extends DBModel {
    * rosters here — where the upload-level read could only ever see one, and quietly filed both
    * people's friends under whoever performed the import. The `kind = 'social'` filter goes with
    * it: only friends have owners, so the column is the filter.
+   *
+   * ── Searched and capped since 2026-08-04 ──
+   *
+   * It returned every owner, unbounded, and the Overview shipped that array on every request — see
+   * `NetworkOverviewDataSchema.owners` for what that cost. Both parameters are optional and the
+   * defaults reproduce the old behaviour closely enough for a caller that passes neither.
+   *
+   * `total` is counted separately rather than read off the slice, because it is what tells the
+   * picker it is showing a fraction. Two queries, not one windowed query: the count is over grouped
+   * rows, so it cannot ride along as a window function without a subquery that reads the same
+   * groups twice anyway.
    */
-  static async uploaders(): Promise<string[]> {
+  static async uploaders(
+    q: string | null = null,
+    limit: number | null = null
+  ): Promise<{ owners: string[]; total: number }> {
     const db = await this.getKyselyDB();
-    const rows = await db
+
+    // Case-insensitive substring. `q` is escaped for LIKE metacharacters — an owner search for
+    // "100%" must look for that name, not for every name.
+    const like = q ? `%${q.toLowerCase().replace(/([\\%_])/g, "\\$1")}%` : null;
+    const filtered = (qb: any) => {
+      let out = qb.where("relationship_owner", "is not", null);
+      if (like) out = out.where(sql`lower(relationship_owner)`, "like", like);
+      return out;
+    };
+
+    const [rows, countRow] = await Promise.all([
+      (() => {
+        let qb: any = filtered(db.selectFrom("friend"))
+          .select(sql<string>`min(relationship_owner)`.as("name"))
+          .groupBy(sql`lower(relationship_owner)`)
+          .orderBy(sql`min(relationship_owner) asc`);
+        if (limit !== null) qb = qb.limit(limit);
+        return qb.execute();
+      })(),
+      db
+        .selectFrom(
+          filtered(db.selectFrom("friend"))
+            .select(sql`lower(relationship_owner)`.as("key"))
+            .groupBy(sql`lower(relationship_owner)`)
+            .as("owners")
+        )
+        .select(sql<string>`count(*)`.as("total"))
+        .executeTakeFirst(),
+    ]);
+
+    return {
+      owners: (rows as any[]).map((r) => r.name),
+      total: Number((countRow as any)?.total) || 0,
+    };
+  }
+
+  /**
+   * How many distinct owners exist at all — the Overview's `owners` field.
+   *
+   * Separate from `uploaders()` above and deliberately not a call to it with `limit: 0`: this one
+   * runs on every overview request (every drag of the threshold bar), so it must be the single
+   * aggregate and never the grouped materialization. It is also asking a different question —
+   * "is there anything to filter by", not "what are the options".
+   */
+  static async ownerCount(): Promise<number> {
+    const db = await this.getKyselyDB();
+    const row = await db
       .selectFrom("friend")
-      .select(sql<string>`min(relationship_owner)`.as("name"))
+      .select(sql<string>`count(distinct lower(relationship_owner))`.as("total"))
       .where("relationship_owner", "is not", null)
-      .groupBy(sql`lower(relationship_owner)`)
-      .orderBy(sql`min(relationship_owner) asc`)
-      .execute();
-    return (rows as any[]).map((r) => r.name);
+      .executeTakeFirst();
+    return Number((row as any)?.total) || 0;
   }
 
   /**
@@ -348,7 +474,11 @@ export class NetworkModel extends DBModel {
         .select([
           sql<string>`lower(friend.relationship_owner)`.as("key"),
           sql<string>`min(friend.relationship_owner)`.as("name"),
-          sql<string>`count(*)`.as("friends"),
+          // PEOPLE, not rows. Imports stack, so `count(*)` here would grow every time somebody
+          // re-imported the same file — and since `matched` below counts distinct people,
+          // `noMatch = friends − matched` would drift upward with each re-import while the roster
+          // on screen stayed the same length.
+          sql<string>`count(distinct friend.person_key)`.as("friends"),
         ])
         .where("friend.relationship_owner", "is not", null)
         .groupBy(sql`lower(friend.relationship_owner)`)
@@ -433,22 +563,33 @@ export class NetworkModel extends DBModel {
     const key = name.toLowerCase();
 
     const [rosterRows, importerRows, matchedRows, nearMissRows] = await Promise.all([
-      // The roster: distinct friend names this uploader contributed, one display spelling each.
-      // The roster: one row per FRIEND, keyed by id rather than by folded name. Grouping by name
-      // was exact while a friend had one; with two spellings it would merge two different people
-      // who happen to share an English name, and split one person across their two names depending
-      // on which column a query happened to read. The id is the only thing that is neither.
+      /**
+       * The roster: one row per PERSON this uploader owns, with one display spelling each.
+       *
+       * Keyed by `person_key`, and read from the fold rather than the table. Grouping by name was
+       * exact while a friend had one; with two spellings it would merge two different people who
+       * share an English name, and split one person across their two names depending on which
+       * column a query happened to read. Keying by `friend.id` fixed that and then broke under
+       * stacking, where one person is several rows — the roster would list them once per import.
+       *
+       * `friend_current` answers both: one row per person, and its two name columns are coalesced
+       * across that person's rows, so somebody imported in English and later in Thai still has an
+       * English name to display rather than whichever spelling arrived last.
+       */
       db
-        .selectFrom("friend")
+        .selectFrom("friend_current")
         .select([
-          sql<string>`friend.id`.as("key"),
-          sql<string>`coalesce(friend.friend_name_en, friend.friend_name_th)`.as("name"),
+          sql<string>`friend_current.person_key`.as("key"),
+          sql<string>`coalesce(friend_current.friend_name_en, friend_current.friend_name_th)`.as("name"),
         ])
-        .where(sql`lower(friend.relationship_owner)`, "=", key)
+        .where(sql`lower(friend_current.relationship_owner)`, "=", key)
         .where((eb) =>
-          eb.or([eb("friend.friend_name_en", "is not", null), eb("friend.friend_name_th", "is not", null)])
+          eb.or([
+            eb("friend_current.friend_name_en", "is not", null),
+            eb("friend_current.friend_name_th", "is not", null),
+          ])
         )
-        .orderBy(sql`coalesce(friend.friend_name_en, friend.friend_name_th) asc`)
+        .orderBy(sql`coalesce(friend_current.friend_name_en, friend_current.friend_name_th) asc`)
         .execute(),
       // WHO PUT THIS ROSTER IN THE DATABASE — a different person from the one the page is about,
       // which is the entire reason it is worth stating.
@@ -470,28 +611,90 @@ export class NetworkModel extends DBModel {
         .groupBy(sql`lower(upload.uploaded_by)`)
         .orderBy(sql`min(upload.uploaded_by) asc`)
         .execute(),
-      // The matched pairs of this uploader, one row per (company, friend), carrying the matched
-      // contact's English and Thai names, how close the match was, and the mode that measured it.
-      //
-      // DISTINCT ON, not the GROUP BY + `min`/`max` this used to be — the same argument the near
-      // miss below already makes, now that a score arrives with a claim attached. `max(similarity)`
-      // folded over every run on file was picking the best number across modes that measure
-      // different things: a surname run's 96% could be carried onto a pairing a full-name run
-      // confirmed at 88%, and then rendered next to the full-name run's claim. The score and the
-      // mode beside it have to come from ONE row, so one row is what this selects.
-      //
-      // "Strongest mode first, then best score" — a whole-name match outranks any surname score,
-      // however high, because it is evidence of a different kind and not merely a bigger number.
-      withFriend(withRun(db.selectFrom("comparison_result")))
-        .distinctOn([sql`lower(comparison_result.company_name)`, friendKeySql])
+      /**
+       * The matched pairs of this uploader — ONE ROW PER RUN, carrying the matched contact's two
+       * names, how close the match was, and the mode that measured it.
+       *
+       * ── WHY THIS NO LONGER FOLDS TO ONE ROW PER (company, friend) ──
+       *
+       * It used to be `DISTINCT ON (company, friend)` ordered by strongest mode, then best score.
+       * That was the right shape while re-running the same data was impossible: a pairing had one
+       * finding, and the fold's only job was to stop `max(similarity)` carrying a surname run's 96%
+       * onto a full-name run's claim — the score and the mode beside it have to come from ONE row.
+       * They still do; every row here is a single result row, whole.
+       *
+       * What changed is that asking the SAME data a SECOND question is now the point. Comparing an
+       * `en_full` finding against a `th_given` one is why anyone re-imports, and the fold answered
+       * that by discarding the weaker mode — the `th_given` match vanished, silently, because
+       * `full` outranks `given` in `strengthRankSql`. The page showed one answer to a question the
+       * user had deliberately asked twice.
+       *
+       * So a pairing confirmed by two runs in DIFFERENT modes is two rows, each labelled with its
+       * own mode.
+       *
+       * ── BUT ONE ROW PER QUESTION, NOT PER RUN ──
+       *
+       * The fold is on (company, friend, MODE), and the mode is the load-bearing part. Running the
+       * SAME question twice is an ordinary thing to do — a company import re-run next month scores
+       * its contacts against friends that have arrived since, so the run is legitimately new even
+       * though nothing about the question changed. What it does not produce is a new FINDING:
+       * "somchai matched at 95% under en_full" twice over is one fact recorded twice, and listing
+       * it twice is indistinguishable from duplicated data.
+       *
+       * Removing the fold entirely (2026-08-04, first cut) got this wrong in exactly that way. The
+       * distinction is between asking a different question and asking the same one again.
+       *
+       * ── AND ONE ROW PER CONTACT, WHICH IT WAS NOT (2026-08-06) ──
+       *
+       * The fold key was (company, friend, mode) and had no term for WHO THE FRIEND MATCHED. That
+       * is not a display detail; it is the other half of the claim. One friend routinely lands on
+       * several different people at one company — `arnat rojanapruk` matched `arunee rojanapruk`
+       * under `en_surname` and `arnat wongsawat` under `en_name`, both at BANGKOK BANK — and with
+       * the contact absent from the key those two rows arrived as one person's two findings. The
+       * page rendered the second as "also found by <run>", i.e. as the SAME pairing re-found, while
+       * it named a different human entirely.
+       *
+       * Two matches to two contacts are two connections and always were; the fold was collapsing an
+       * axis it never had a term for. Worse, a friend matched to two contacts under ONE mode had one
+       * of them silently dropped by the DISTINCT ON — a lost match, not just a mislabelled one.
+       *
+       * `cc.person_key` and not `company_contact_id`, because imports stack; and NULL keys do not
+       * merge in a way that claims anything, since Postgres treats NULLs as equal in DISTINCT ON —
+       * two contactless rows under one mode still fold, which is the old behaviour for exactly the
+       * rows that carry no better answer.
+       *
+       * Within a (pairing, mode) the MOST RECENT run wins, not the best-scoring one. A later run was computed
+       * against the data as it now stands — after a contact was renamed, or more friends arrived —
+       * so its number is the current answer. Keeping the highest score across runs would pin the
+       * page to a stale high-water mark that no run would reproduce today.
+       *
+       * THE COUNTS DO NOT FOLLOW THIS. `connections`, `matched` and their confirmed subsets stay
+       * `count(distinct person_key)` — a person matched under two modes is one connection, not two.
+       * A list that shows both while the tally counts one is not an inconsistency; they answer
+       * different questions, and the alternative is a "Connections" number that grows every time
+       * somebody re-runs a comparison.
+       */
+      withContact(withFriend(withRun(db.selectFrom("comparison_result"))))
+        .distinctOn([
+          sql`lower(comparison_result.company_name)`,
+          friendKeySql,
+          contactKeySql,
+          resolvedModeSql,
+        ])
         .select([
           sql<string>`${friendKeySql}`.as("friendKey"),
+          sql<string | null>`${contactKeySql}`.as("contactKey"),
           "comparison_result.company_name as company",
           scoredNameSql("comparison_result", "comparison.compare_by").as("friend"),
           "comparison_result.person_name_en as en",
           "comparison_result.person_name_th as th",
           "comparison_result.similarity as similarity",
           "comparison.compare_by as mode",
+          // Which run said so. The rows are no longer unique per (company, friend), so the reader
+          // needs something to key them by — and "which comparison found this" is exactly the fact
+          // that makes two rows for one pairing legible rather than looking like a duplicate.
+          sql<string>`comparison.id::text`.as("runId"),
+          "comparison.name as runName",
         ])
         .where(ownerKeySql, "=", key)
         // "The row names a friend at all." Was a null test on the single `friend_name`; since
@@ -500,12 +703,18 @@ export class NetworkModel extends DBModel {
         .where(sql<SqlBool>`(comparison_result.friend_name_en is not null
                              or comparison_result.friend_name_th is not null)`)
         .where(matched(threshold))
-        // The two DISTINCT ON keys must lead the ORDER BY; the rest is the tie-break that decides
-        // WHICH row survives per (company, friend), and it ends on the primary key so the choice is
-        // stable across identical runs rather than left to the planner.
+        // The four DISTINCT ON keys must lead; what follows decides WHICH run survives for each
+        // (pairing, mode). Most recent run first — see the note above — then the better score, then
+        // the primary key so the choice is stable rather than left to the planner.
+        //
+        // This is NOT the display order. The rows come back grouped by mode, and the sort that
+        // decides what the reader sees runs in TypeScript below, where it can keep one pairing's
+        // several findings together.
         .orderBy(sql`lower(comparison_result.company_name)`)
         .orderBy(friendKeySql)
-        .orderBy(strengthRankSql("comparison.compare_by"))
+        .orderBy(contactKeySql)
+        .orderBy(resolvedModeSql)
+        .orderBy(sql`comparison.id desc`)
         .orderBy(sql`comparison_result.similarity desc nulls last`)
         .orderBy("comparison_result.id", "asc")
         .execute(),
@@ -565,20 +774,35 @@ export class NetworkModel extends DBModel {
         .map((r) => r.friendKey as string)
     );
 
-    // Group the company-bearing matches into one section per company, preserving row order (already
-    // company-then-friend sorted). Matches with no company are counted but have nowhere to group.
+    /**
+     * Group the company-bearing matches into one section per company, preserving row order (already
+     * company-then-friend sorted). Matches with no company are counted but have nowhere to group.
+     *
+     * `people` is one entry per RESULT ROW, so a pairing two runs both found appears twice, each
+     * entry labelled with its own mode and run. `confirmed` is one per PERSON — a set, not `+= 1`.
+     * That distinction is the whole reason the two are tracked separately here: counting rows would
+     * report a company as having three confirmed connections because one person was matched by
+     * three whole-name runs, which is one person and one introduction.
+     */
     const groups = new Map<
       string,
       {
         company: string;
         people: {
+          friendKey: string;
+          contactKey: string | null;
           friend: string;
           en: string | null;
           th: string | null;
           similarity: number | null;
           mode: CompareBy;
+          runId: string;
+          runName: string | null;
         }[];
-        confirmed: number;
+        /** Distinct friends in this group, so the group's size is people and not findings. */
+        friendKeys: Set<string>;
+        /** Distinct friends here whose evidence rests on a whole name. */
+        confirmedKeys: Set<string>;
       }
     >();
     for (const r of matchedRows as any[]) {
@@ -587,12 +811,18 @@ export class NetworkModel extends DBModel {
       const gkey = company.toLowerCase();
       let g = groups.get(gkey);
       if (!g) {
-        g = { company, people: [], confirmed: 0 };
+        g = { company, people: [], friendKeys: new Set(), confirmedKeys: new Set() };
         groups.set(gkey, g);
       }
       const rowMode = asMode(r.mode);
-      if (matchStrength(rowMode) === "confirmed") g.confirmed += 1;
+      const fk = r.friendKey as string | null;
+      if (fk) {
+        g.friendKeys.add(fk);
+        if (matchStrength(rowMode) === "confirmed") g.confirmedKeys.add(fk);
+      }
       g.people.push({
+        friendKey: fk ?? "",
+        contactKey: (r.contactKey as string | null) ?? null,
         friend: r.friend as string,
         en: (r.en as string | null) ?? null,
         th: (r.th as string | null) ?? null,
@@ -600,23 +830,91 @@ export class NetworkModel extends DBModel {
         // and a string here would reach the page and render as "0.83" where a percent belongs.
         similarity: score(r.similarity),
         mode: rowMode,
+        runId: String(r.runId),
+        runName: (r.runName as string | null) ?? null,
       });
     }
-    // Confirmed before leads inside each company, then alphabetical — the section is a to-do list
-    // and the rows you can act on without checking first belong at the top of it. A display order,
-    // not a tally: every one of these rows is in the group either way, and the group's `confirmed`
-    // was counted above from the same rows.
+    /**
+     * Confirmed before leads inside each company, then alphabetical — the section is a to-do list
+     * and the rows you can act on without checking first belong at the top of it. A display order,
+     * not a tally: every one of these rows is in the group either way, and the group's `confirmed`
+     * was counted above from the same rows.
+     *
+     * ── A PERSON'S ROWS MUST STAY TOGETHER, AND A PAIRING'S TIGHTER STILL ──
+     *
+     * The sort is over PEOPLE first and their findings second, which it was not when this list
+     * became one row per mode. Sorting rows directly by strength put a person's `en_full` row up
+     * with the confirmed matches and their `th_name` row down among the leads — the same human,
+     * twice, in two different parts of the section, with nothing to connect them. The reader sees
+     * duplicated data; the renderer's "also found by" line, which keys on the previous row being
+     * the same person, never fires because they are not adjacent.
+     *
+     * So a person is placed by their STRONGEST evidence (a confirmed match is a confirmed match,
+     * whatever else was also run), and their remaining findings follow immediately beneath it.
+     *
+     * Since the fold gained a contact term there is a THIRD level, and it is the one the renderer
+     * actually groups on: within a person, findings are ordered by PAIRING — every row naming the
+     * same contact together, strongest pairing first — and only then by strength inside it. Without
+     * it a friend matched to two contacts interleaves their evidence, and adjacency (the only thing
+     * a "found by" continuation can key on) stops meaning "the same claim".
+     *
+     * `friend` is deliberately not the sort key between people: it is the spelling the RUN scored,
+     * so one person's English row and Thai row carry different strings. The display name — the one
+     * their lead row will show — is what orders them, and `friendKey` settles two people who share
+     * it.
+     */
+    const isLead = (m: CompareBy): number => (matchStrength(m) === "lead" ? 1 : 0);
     for (const g of groups.values()) {
-      g.people.sort(
-        (a, b) =>
-          Number(matchStrength(a.mode) === "lead") - Number(matchStrength(b.mode) === "lead") ||
-          a.friend.localeCompare(b.friend)
-      );
+      /** How a person, and each of that person's pairings, ranks — and the name each is listed
+       *  under. Keyed by `friendKey` for the person and by `friendKey|contactKey` for the pairing,
+       *  so one pass fills both. A null contact key is its own bucket: rows that name no contact
+       *  cannot be told apart, and merging them on an absence would assert they are one person. */
+      const best = new Map<string, { rank: number; name: string }>();
+      const rank = (key: string, r: number, name: string) => {
+        const cur = best.get(key);
+        if (!cur || r < cur.rank) best.set(key, { rank: r, name });
+      };
+      const pairKey = (p: { friendKey: string; contactKey: string | null }, i: number) =>
+        `${p.friendKey}|${p.contactKey ?? ` ${i}`}`;
+      g.people.forEach((p, i) => {
+        rank(p.friendKey, isLead(p.mode), p.friend);
+        // The pairing is listed under the CONTACT's name, which is what the row's title shows —
+        // ordering it by the friend's would sort by a string the reader cannot see.
+        rank(pairKey(p, i), isLead(p.mode), p.en || p.th || p.friend);
+      });
+      // Frozen before sorting: `pairKey`'s fallback for a contactless row is its index, and the
+      // sort is about to move them.
+      const pairOf = new Map(g.people.map((p, i) => [p, pairKey(p, i)]));
+      g.people.sort((a, b) => {
+        const A = best.get(a.friendKey);
+        const B = best.get(b.friendKey);
+        const pa = best.get(pairOf.get(a)!);
+        const pb = best.get(pairOf.get(b)!);
+        return (
+          (A?.rank ?? 1) - (B?.rank ?? 1) ||
+          (A?.name ?? "").localeCompare(B?.name ?? "") ||
+          a.friendKey.localeCompare(b.friendKey) ||
+          // Within one person: each matched CONTACT in turn, strongest pairing first. This is the
+          // boundary the renderer draws a new row at.
+          (pa?.rank ?? 1) - (pb?.rank ?? 1) ||
+          (pa?.name ?? "").localeCompare(pb?.name ?? "") ||
+          (pairOf.get(a) ?? "").localeCompare(pairOf.get(b) ?? "") ||
+          // Within one pairing: its strongest finding leads, then the closest score. These are the
+          // rows the "also found by" lines hang beneath.
+          isLead(a.mode) - isLead(b.mode) ||
+          (b.similarity ?? -1) - (a.similarity ?? -1) ||
+          a.mode.localeCompare(b.mode)
+        );
+      });
     }
-    // Strongest first, then alphabetical — the Overview's own ordering for reached companies.
-    const matchedByCompany = [...groups.values()].sort(
-      (a, b) => b.people.length - a.people.length || a.company.localeCompare(b.company)
-    );
+    // Biggest first, then alphabetical — the Overview's own ordering for reached companies.
+    // Ordered by DISTINCT PEOPLE, not by row count: a company where one person was found by three
+    // runs must not outrank a company where three different people were found once each.
+    const matchedByCompany = [...groups.values()]
+      .sort(
+        (a, b) => b.friendKeys.size - a.friendKeys.size || a.company.localeCompare(b.company)
+      )
+      .map((g) => ({ company: g.company, people: g.people, confirmed: g.confirmedKeys.size }));
 
     const nearMissByKey = new Map((nearMissRows as any[]).map((r) => [r.friendKey as string, r]));
 
@@ -661,29 +959,95 @@ export class NetworkModel extends DBModel {
    * `friends` is how many friends the roster uploaded — counted from the friend list itself, so it
    * answers "how many friends did this user upload" even before a comparison exists.
    * `friendsMatched` is how many of those friends matched someone at any company (distinct name);
-   * the caller derives "no match" as `friends − friendsMatched`. `connected` is one row per company
-   * the roster reaches ("companies known"). `uploader === null` means "everyone".
+   * the caller derives "no match" as `friends − friendsMatched`. `connected` is one PAGE of the
+   * companies on file, each carrying this roster's reach into it; `companiesKnown` is how many of
+   * them the roster actually reaches. `uploader === null` means "everyone".
+   *
+   * ── `connected` IS EVERY COMPANY ON FILE, NOT ONLY THE REACHED ONES (2026-08-06) ──
+   *
+   * It was the reached set — a company appeared once some run had matched a friend into it, and a
+   * company nobody knows anyone at was invisible here, surviving only as the denominator in
+   * "Companies known 3 of 412". That made the list unable to answer the question people actually
+   * bring to it: "is ACME in here, and does anyone reach it?" A company absent from the list means
+   * two very different things — no contacts on file at all, or contacts but no connection — and the
+   * reader could not tell which, because both rendered as nothing.
+   *
+   * So the list's universe is now `company_contact` (folded by case, exactly as
+   * `CompanyContactModel.distinctCompanies` folds it, so the list and the `companiesOnFile`
+   * denominator beside it cannot disagree about what one company is), and the matched groups are
+   * joined ONTO it. A company with no connection comes back at `connections: 0, confirmed: 0` — a
+   * real answer, and the row a reader can press to see who works there.
+   *
+   * A FULL join, not a left one, and that is not symmetry for its own sake: `comparison_result`
+   * stores its company as frozen text with no FK, so a run can name a company that no longer has a
+   * contact row (renamed since, or its import rolled back). Those rows are counted by
+   * `companiesKnown` — which is computed from the results — so dropping them from the list would
+   * put "Companies known 4" above a list containing three of them, with nothing to explain the
+   * fourth. They keep their row, sourced from the result side of the join.
+   *
+   * The TALLIES are untouched by any of this. `companiesKnown` and `connections` are still counted
+   * over the REACHED groups only: they answer "where does this roster land", and a number that
+   * jumped to 412 the moment company data was imported would be answering "what is on file", which
+   * is the other tile.
+   *
+   * ── The company list is paged, searched and sortable; the tallies are none of those ──
+   *
+   * `connected` was every company the roster reaches, unbounded, and the caller summed it to get
+   * `connections`. That made the payload's size a property of the DATA rather than of the request,
+   * on the one endpoint re-read behind every drag of the threshold bar.
+   *
+   * So the list and the tallies are now computed separately, and the separation is the contract:
+   * `list.company` and `list.page` move the LIST only. `companiesKnown` and `connections` are
+   * counted over the whole roster — the first because "Companies known" is a fact about the roster
+   * and must not fall to 1 while somebody types a search, the second because it is a sum this
+   * method can no longer hand the caller a complete array to compute for itself.
    *
    * @param threshold the reader's bar, or null for the matchers' own verdicts. It moves everything
-   * derived from a result row — `friendsMatched`, its confirmed subset, and the whole `connected`
-   * list, which is why a raised bar can drop a company off the list entirely rather than merely
-   * shrinking its count. `friends` is counted from the friend table and stays put at every bar.
+   * derived from a result row — `friendsMatched`, its confirmed subset, and every count on the
+   * `connected` list, which is why a raised bar can drop a company's reach to 0. It no longer drops
+   * the company off the list: the row is on file whatever any matcher decided, and only its number
+   * moves. `friends` is counted from the friend table and stays put at every bar.
+   * @param list which slice of the companies to return, and in what order. The defaults reproduce
+   * the old ordering (most reach first, then alphabetical) over the first 20.
    */
   static async overview(
     uploader: string | null,
-    threshold: number | null = null
+    threshold: number | null = null,
+    list: { company?: string | null; sort?: CompanySort; page?: number; limit?: number } = {}
   ): Promise<{
     friends: number;
     friendsMatched: number;
     friendsConfirmed: number;
+    /** Total distinct (friend, company) matches across the whole roster — the sum this used to
+     *  leave to the caller, back when it was handed every row to sum. */
+    connections: number;
+    /** How many companies the roster REACHES, before `list.company` narrows anything — the
+     *  "Companies known" tile, and deliberately not the length of the list below it. */
+    companiesKnown: number;
     connected: CompanyConnection[];
+    /** How many companies the LIST holds — every one on file that matches `list.company`, reached
+     *  or not. Always ≥ `companiesKnown`. */
+    connectedTotal: number;
   }> {
     const db = await this.getKyselyDB();
+    const page = Math.max(1, Math.trunc(list.page ?? 1));
+    const limit = Math.max(1, Math.trunc(list.limit ?? 20));
+    const sortBy: CompanySort = list.sort ?? "connections";
+    // Case-insensitive substring over the company name, escaped so a search for "100%" looks for
+    // that name rather than for every name. Applied before the grouping, which is safe because it
+    // tests the grouping key itself.
+    const companyLike = list.company
+      ? `%${escapeLike(list.company.toLowerCase())}%`
+      : null;
 
     // The roster's size — from the friend rows' own owners, not from results and no longer via
     // the import. Reaching through `upload.uploaded_by` counted a file's whole contents against
     // whoever pressed the button, which is wrong the moment one file carries two owners.
-    let friendsQ: any = db.selectFrom("friend").select(sql<string>`count(*)`.as("friends"));
+    // PEOPLE, not rows — `matched` beside it counts distinct `person_key`, so this must too or
+    // `noMatch = friends − matched` drifts upward every time somebody re-imports a file.
+    let friendsQ: any = db
+      .selectFrom("friend")
+      .select(sql<string>`count(distinct friend.person_key)`.as("friends"));
     if (uploader)
       friendsQ = friendsQ.where(sql`lower(friend.relationship_owner)`, "=", uploader.toLowerCase());
 
@@ -691,14 +1055,115 @@ export class NetworkModel extends DBModel {
     // to the friend each one is about. Filter applied before select/groupBy.
     //
     // `withFriend` is unconditional, not only on the scoped branch: the "everyone" case still needs
-    // `fr.id` for its distinct-friend counts, and the two branches must count the same way or the
-    // roster totals would not sum to the everyone total.
+    // `fr.person_key` for its distinct-friend counts, and the two branches must count the same way
+    // or the roster totals would not sum to the everyone total.
     const scopedResults = (): any => {
       const base = withFriend(withRun(db.selectFrom("comparison_result")));
       return uploader ? base.where(ownerKeySql, "=", uploader.toLowerCase()) : base;
     };
 
-    const [friendsRow, matchedRow, connectedRows] = await Promise.all([
+    /**
+     * The REACHED companies, one row each — the roster's own findings, folded by case.
+     *
+     * Written once and used three ways (joined onto the list, counted, summed) rather than three
+     * near-copies of a grouped aggregate that must agree about what one company is. `search` is not
+     * filtered in here: the totals need the unfiltered groups, so the caller adds the predicate
+     * where it wants it.
+     *
+     * `key` is the fold itself, selected rather than left implicit in the GROUP BY, because it is
+     * what the company list joins on below — the same `lower(company_name)` both sides group by, so
+     * two spellings of one employer meet on one row instead of being listed twice.
+     */
+    const companyGroups = (): any =>
+      scopedResults()
+        .select([
+          sql<string>`lower(comparison_result.company_name)`.as("key"),
+          sql<string>`min(comparison_result.company_name)`.as("company"),
+          sql<string>`count(distinct ${friendKeySql})`.as("connections"),
+          sql<string>`count(distinct ${friendKeySql}) filter (where ${isConfirmed})`.as(
+            "confirmed"
+          ),
+        ])
+        .where(matched(threshold))
+        .where("comparison_result.company_name", "is not", null)
+        .groupBy(sql`lower(comparison_result.company_name)`);
+
+    const searched = (q: any): any =>
+      companyLike ? q.where(sql`lower(comparison_result.company_name)`, "like", companyLike) : q;
+
+    /**
+     * EVERY COMPANY ON FILE — the list's universe, and the half of it the roster has never reached.
+     *
+     * Grouped by `lower(company_name)` off the raw `company_contact` table, which is precisely what
+     * `CompanyContactModel.distinctCompanies` does: that method supplies `companiesOnFile` on the
+     * very same payload, so anything else here would let the list and its own denominator disagree
+     * about how many companies exist. `min()` picks the surviving spelling, as it does there.
+     *
+     * The search is applied HERE rather than to the join's output so it narrows the scan, and it
+     * tests the grouping key itself — the same predicate `searched` puts on the result side, so a
+     * company cannot match on one side of the join and be filtered out on the other.
+     */
+    const companiesOnFile = (): any => {
+      let q: any = db
+        .selectFrom("company_contact")
+        .select([
+          sql<string>`lower(company_contact.company_name)`.as("key"),
+          sql<string>`min(company_contact.company_name)`.as("company"),
+        ])
+        .where("company_contact.company_name", "is not", null)
+        .groupBy(sql`lower(company_contact.company_name)`);
+      if (companyLike) q = q.where(sql`lower(company_contact.company_name)`, "like", companyLike);
+      return q;
+    };
+
+    /**
+     * The list itself: every company on file, carrying this roster's reach into it.
+     *
+     * FULL, not LEFT — see the method header. A company on file with no match is `cc` with no `g`
+     * (the case this whole change is about); a company some run named that has no contact row left
+     * is `g` with no `cc`, and it must survive too or `companiesKnown` would count a company the
+     * list cannot show. `coalesce` on the name is what makes the second case renderable at all.
+     *
+     * Both sides are already grouped to one row per company, so the join is one row per company and
+     * `count(*)` over it is the list's length.
+     */
+    const companyRows = (): any =>
+      (
+        db
+          .selectFrom(companiesOnFile().as("cc"))
+          // `as any` on the join's result, not on its arguments: a FULL join makes BOTH sides'
+          // columns nullable, and Kysely expresses that by widening the context type to a union its
+          // `.select()` overloads can no longer be resolved against. The `sql` fragments below name
+          // their own columns anyway — as every other builder in this file does — so nothing is
+          // being lost that was checked in the first place.
+          .fullJoin(searched(companyGroups()).as("g"), (join: any) =>
+            join.onRef("g.key", "=", "cc.key")
+          ) as any
+      ).select([
+        sql<string>`coalesce(cc.company, g.company)`.as("company"),
+        sql<string>`coalesce(g.connections, 0)`.as("connections"),
+        sql<string>`coalesce(g.confirmed, 0)`.as("confirmed"),
+      ]);
+
+    // Ordered by total reach by default, not by confirmed reach: this list answers "where does this
+    // roster land", and a company reached by twelve leads is a bigger fact about the roster than one
+    // reached by a single confirmed match. The split rides on each row instead. The unreached
+    // companies sort to the bottom on their own, at 0 — which is why the default order survives the
+    // list growing to every company on file: the finding is still what page 1 shows.
+    //
+    // Alphabetical is the tie-break in BOTH orders, and in `name` it is the whole order. Every sort
+    // ends on a deterministic key because the list is paged: two companies tied on reach with no
+    // further tie-break can swap places between page 1 and page 2 and be shown twice, or not at all.
+    // That tie is now the common case rather than a rarity — every unreached company is tied with
+    // every other at 0 — so the name is load-bearing here, not a formality.
+    const orderedPage = (q: any): any =>
+      sortBy === "name"
+        ? q.orderBy(sql`coalesce(cc.company, g.company) asc`)
+        : q
+            .orderBy(sql`coalesce(g.connections, 0) desc`)
+            .orderBy(sql`coalesce(cc.company, g.company) asc`);
+
+    const [friendsRow, matchedRow, connectedRows, totalsRow, listRow] = await Promise.all([
       friendsQ.executeTakeFirst(),
       // Distinct friends that matched anywhere — the "matched names" count, and the confirmed
       // subset of it as a FILTER on the same aggregate so the two cannot disagree.
@@ -711,34 +1176,45 @@ export class NetworkModel extends DBModel {
         ])
         .where(matched(threshold))
         .executeTakeFirst(),
-      scopedResults()
-        .select([
-          sql<string>`min(comparison_result.company_name)`.as("company"),
-          sql<string>`count(distinct ${friendKeySql})`.as("connections"),
-          sql<string>`count(distinct ${friendKeySql}) filter (where ${isConfirmed})`.as(
-            "confirmed"
-          ),
-        ])
-        .where(matched(threshold))
-        .where("comparison_result.company_name", "is not", null)
-        .groupBy(sql`lower(comparison_result.company_name)`)
-        // Ordered by total reach, not by confirmed reach: this list answers "where does this roster
-        // land", and a company reached by twelve leads is a bigger fact about the roster than one
-        // reached by a single confirmed match. The split rides on each row instead.
-        .orderBy(sql`count(distinct ${friendKeySql}) desc`)
-        .orderBy(sql`min(comparison_result.company_name) asc`)
+      orderedPage(companyRows())
+        .limit(limit)
+        .offset((page - 1) * limit)
         .execute(),
+      // How many companies the roster REACHES, and how many (friend, company) matches that is.
+      // Read off the reached groups alone — the tiles state where the roster lands, so neither may
+      // be counted over the list, which now holds every company on file whether it is reached or
+      // not.
+      db
+        .selectFrom(companyGroups().as("g"))
+        .select([
+          sql<string>`count(*)`.as("companies"),
+          sql<string>`coalesce(sum(g.connections), 0)`.as("connections"),
+        ])
+        .executeTakeFirst(),
+      // How long the list is — what the pager divides into pages. Counted unconditionally now,
+      // where it used to be skipped unless something was being searched for: back then an unsearched
+      // list was exactly the reached set and `companiesKnown` already answered it. The two are
+      // different questions since the list grew to every company on file, so this one has to be
+      // asked every time rather than inferred.
+      db
+        .selectFrom(companyRows().as("rows"))
+        .select(sql<string>`count(*)`.as("companies"))
+        .executeTakeFirst(),
     ]);
 
+    const companiesKnown = Number((totalsRow as any)?.companies) || 0;
     return {
       friends: Number((friendsRow as any)?.friends) || 0,
       friendsMatched: Number((matchedRow as any)?.matched) || 0,
       friendsConfirmed: Number((matchedRow as any)?.confirmed) || 0,
+      connections: Number((totalsRow as any)?.connections) || 0,
+      companiesKnown,
       connected: (connectedRows as any[]).map((r) => ({
         company: r.company as string,
         connections: Number(r.connections) || 0,
         confirmed: Number(r.confirmed) || 0,
       })),
+      connectedTotal: Number((listRow as any)?.companies) || 0,
     };
   }
 
@@ -749,10 +1225,16 @@ export class NetworkModel extends DBModel {
    * only, and indexed (see the comparison_result name/company indexes). Company-wide reach is
    * network-wide (not scoped to one uploader): "who can get to this company", not "which roster".
    *
-   * Two ways to select the rows:
+   * Two ways to select the rows, and they compose:
    *   · `q`       — free-text ILIKE across the person names and the company.
-   *   · `company` — an EXACT (case-insensitive) company name, for the Overview's company popup.
-   * Exactly one is expected; `company` wins if both are somehow present.
+   *   · `company` — an EXACT (case-insensitive) company name, for the company page.
+   *   · both      — everyone at THAT company whose NAME contains `q`. The company page's search
+   *                 box, which exists because a company with four hundred contacts is twenty pages
+   *                 and cannot be searched by eye.
+   *
+   * `q` beside a `company` deliberately drops the company leg of the ILIKE. The company is already
+   * decided by the exact predicate, so matching it a second time would make every contact at
+   * "BANGKOK BANK" a hit for "bangkok" — a search box that returns the page it was meant to narrow.
    *
    * @param threshold the reader's bar. It grades the four connection subqueries and NOT the row
    * selection: which contacts come back is a fact about `company_contact`, and a bar that emptied
@@ -768,12 +1250,26 @@ export class NetworkModel extends DBModel {
     const offset = (page - 1) * limit;
 
     // The row selector, as one WHERE so it AND-combines cleanly and the count agrees with the page.
-    const constrain = (q: any): any => {
+    const constrain = (query: any): any => {
+      const text = params.q?.trim() ?? "";
+      const like = `%${escapeLike(text)}%`;
       if (params.company) {
-        return q.where(sql`lower(company_contact.company_name)`, "=", params.company.toLowerCase());
+        const scoped = query.where(
+          sql`lower(company_contact.company_name)`,
+          "=",
+          params.company.toLowerCase()
+        );
+        // The names only — see this method's header for why the company leg is dropped here.
+        return text
+          ? scoped.where((eb: any) =>
+              eb.or([
+                eb("company_contact.person_name_en", "ilike", like),
+                eb("company_contact.person_name_th", "ilike", like),
+              ])
+            )
+          : scoped;
       }
-      const like = `%${escapeLike(params.q ?? "")}%`;
-      return q.where((eb: any) =>
+      return query.where((eb: any) =>
         eb.or([
           eb("company_contact.person_name_en", "ilike", like),
           eb("company_contact.person_name_th", "ilike", like),
@@ -782,9 +1278,13 @@ export class NetworkModel extends DBModel {
       );
     };
 
+    // ONE ROW PER CONTACT. Aliased back to `company_contact` so every predicate, correlated
+    // subquery and selected column below reads exactly as it did — the only thing that changes is
+    // which relation they resolve against. Searching the raw table would list a re-imported contact
+    // once per import, each copy carrying identical counts, which reads as a data-entry mistake.
     const rowsQuery = constrain(
       db
-        .selectFrom("company_contact")
+        .selectFrom("company_contact_current as company_contact")
         .select([
           "company_contact.id as id",
           "company_contact.company_name",
@@ -793,7 +1293,7 @@ export class NetworkModel extends DBModel {
         ])
         .select([
           sql<string>`(
-            select count(distinct fr.id)
+            select count(distinct fr.person_key)
             from comparison_result cr
             ${friendLateralSql("cr")}
             where cr.company_name is not null
@@ -805,7 +1305,7 @@ export class NetworkModel extends DBModel {
           // with or without the join, and making every row pay for it to produce a number it does
           // not use would be a join for symmetry's sake.
           sql<string>`(
-            select count(distinct fr.id)
+            select count(distinct fr.person_key)
             from comparison_result cr
             join comparison c on c.id = cr.comparison_id
             ${friendLateralSql("cr")}
@@ -940,7 +1440,10 @@ export class NetworkModel extends DBModel {
 
     const [rows, countRow] = await Promise.all([
       rowsQuery.execute(),
-      constrain(db.selectFrom("company_contact").select(db.fn.countAll().as("count"))).executeTakeFirst(),
+      // The same relation the page is built from, or the total would count copies the list folds.
+      constrain(
+        db.selectFrom("company_contact_current as company_contact").select(db.fn.countAll().as("count"))
+      ).executeTakeFirst(),
     ]);
 
     // The jsonb tuples above, as the contract's types. Nameless entries are dropped rather than

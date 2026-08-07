@@ -32,15 +32,8 @@ COPY . .
 # them to pin a specific host (e.g. an internet-facing tunnel URL).
 ARG NEXT_PUBLIC_API_BASE_URL=
 ARG NEXT_PUBLIC_WS_BASE_URL=
-# Which sign-in the login form drives: `center` (the default, forwards to Center) or
-# `local` (Network Intel's own password + emailed one-time code). It has to be a build
-# arg like the two above: .dockerignore excludes **/.env.*, so frontend/.env.local never
-# reaches the image, and without this the containerised login page silently falls back to
-# Center — which fails at the first submit on any stack that has no CENTER_PLAYME_URL.
-ARG NEXT_PUBLIC_AUTH_MODE=
 ENV NEXT_PUBLIC_API_BASE_URL=$NEXT_PUBLIC_API_BASE_URL \
-    NEXT_PUBLIC_WS_BASE_URL=$NEXT_PUBLIC_WS_BASE_URL \
-    NEXT_PUBLIC_AUTH_MODE=$NEXT_PUBLIC_AUTH_MODE
+    NEXT_PUBLIC_WS_BASE_URL=$NEXT_PUBLIC_WS_BASE_URL
 
 WORKDIR /app/frontend
 RUN npm run build

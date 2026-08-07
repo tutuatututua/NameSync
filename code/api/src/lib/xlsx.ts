@@ -1,6 +1,6 @@
 import ExcelJS from 'exceljs';
 import { BadRequest } from './errors';
-import { assertUniqueHeaders, type Sheet } from './sheet';
+import { assertUniqueHeaders, findHeaderRow, type Sheet } from './sheet';
 
 /**
  * Reads a spreadsheet into headers + row objects — one of the readers behind `readTable`
@@ -34,8 +34,25 @@ function cellText(value: ExcelJS.CellValue): string {
 
 export type { Sheet };
 
+/** The top of the sheet as plain text, for `findHeaderRow` to look at. Bounded, because the
+ *  header is never far down and the whole sheet is read row-by-row below anyway. */
+function topRows(sheet: ExcelJS.Worksheet, limit: number): string[][] {
+  const grid: string[][] = [];
+  for (let r = 1; r <= Math.min(sheet.rowCount, limit); r++) {
+    const row = sheet.getRow(r);
+    const cells: string[] = [];
+    for (let c = 1; c <= sheet.columnCount; c++) cells.push(cellText(row.getCell(c).value).trim());
+    grid.push(cells);
+  }
+  return grid;
+}
+
 /**
- * Read the first worksheet: row 1 is the header, the rest are data.
+ * Read the first worksheet: the header row, then the data under it.
+ *
+ * Usually the header is row 1. A sheet that opens with a title or a note above the table is read
+ * the same way a CSV with a preamble is — see `findHeaderRow` — so the two formats can't disagree
+ * about the same table written twice.
  *
  * Rows that are entirely empty are dropped — trailing blank rows are what a spreadsheet
  * hands you for free, and counting them would inflate every "N rows will be imported".
@@ -51,7 +68,10 @@ export async function readSheet(filePath: string): Promise<Sheet> {
   const sheet = workbook.worksheets[0];
   if (!sheet) throw new BadRequest('This workbook has no sheets.');
 
-  const headerRow = sheet.getRow(1);
+  // 1-based, and `findHeaderRow` answers in grid offsets.
+  const headerIndex = findHeaderRow(topRows(sheet, 25)) + 1;
+
+  const headerRow = sheet.getRow(headerIndex);
   const headers: string[] = [];
   // `values` is 1-based with a hole at index 0, and a header the user left blank still
   // occupies a column — keep the position so later cells line up with the right header.
@@ -64,7 +84,7 @@ export async function readSheet(filePath: string): Promise<Sheet> {
   assertUniqueHeaders(headers);
 
   const rows: Record<string, string>[] = [];
-  for (let r = 2; r <= sheet.rowCount; r++) {
+  for (let r = headerIndex + 1; r <= sheet.rowCount; r++) {
     const row = sheet.getRow(r);
     const record: Record<string, string> = {};
     let hasValue = false;

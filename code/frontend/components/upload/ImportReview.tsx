@@ -1,23 +1,23 @@
 "use client";
 
 import * as React from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
   ArrowRight,
   ChevronLeft,
   ChevronRight,
   FileText,
-  GitCompareArrows,
   Upload,
   X,
 } from "lucide-react";
 import { toast } from "sonner";
 import {
-  DEFAULT_COMPARE_BY,
+  precheckBlocks,
   sourceLabel,
   type ColumnMapping,
   type ColumnOverrides,
-  type CompareBy,
+  type ImportPrecheck,
   type UploadPreview,
 } from "@extensions/contract";
 import { Button } from "@/components/ui/button";
@@ -33,24 +33,9 @@ import {
   SelectSeparator,
   SelectTrigger,
 } from "@/components/ui/select";
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from "@/components/ui/alert-dialog";
 import { LoadingButton } from "@/components/loading-button";
 import { Callout } from "@/components/callout";
-import { CompareModeControl } from "@/components/compare-mode";
 import { TypePicker } from "@/components/upload/TypePicker";
-import { SourcePicker } from "@/components/source-picker";
-import {
-  NewComparisonDialog,
-  type ComparisonSeed,
-} from "@/components/network/NewComparisonDialog";
 import { useAuth } from "@/components/auth-provider";
 import { ApiError } from "@/lib/api/client";
 import { cn } from "@/lib/utils";
@@ -154,20 +139,6 @@ export function ImportReview({ source, file, onCancel, onComplete }: Props) {
    *  see the picker below. `facebook` is the starting value because it is what the drop card the
    *  user just used is called. */
   const [type, setType] = React.useState<string>(isCompany ? "" : "facebook");
-  const [compareBy, setCompareBy] = React.useState<CompareBy>(DEFAULT_COMPARE_BY);
-  /**
-   * Which friends the run this import starts should cover — COMPANY imports only.
-   *
-   * A separate piece of state from `type` one line up, and deliberately so: `type` is what this
-   * FILE is (written to every row, permanently), this is what the RUN covers (one comparison,
-   * re-runnable with a different answer). The two were briefly one control and it made a permanent
-   * property of the data read as a per-run setting.
-   *
-   * Null is every source. A friends import leaves it null and the server ignores it there anyway —
-   * that path hands the workflow its own rows, so there is no population to narrow.
-   */
-  const [compareSources, setCompareSources] = React.useState<string[] | null>(null);
-
   // The session arrives a beat after first render (AuthGuard resolves it), so the initial value
   // above can be empty on the first frame. Fill it in when it lands — but never over a value the
   // user has already typed.
@@ -176,29 +147,6 @@ export function ImportReview({ source, file, onCancel, onComplete }: Props) {
     if (fromSession) setUploader((u) => u || fromSession);
   }, [user]);
 
-  /**
-   * The import landed but added nothing, so no run was opened and there is nowhere to go.
-   *
-   * Held in state because this is the one outcome that has to be *said*. Every other path
-   * either sends you to a run or leaves an obviously changed table behind it; this one looks
-   * exactly like a no-op, and a toast that fades after four seconds is not an explanation —
-   * it is the reason this case kept getting reported as "the button did nothing".
-   */
-  const [nothingNew, setNothingNew] = React.useState<{ duplicates: number } | null>(null);
-
-  /**
-   * The way OUT of the dialog above — a run over the data that was already on file.
-   *
-   * This is the whole point of the "nothing new" case, and until 2026-08-04 it was missing: the
-   * dialog said what happened and then closed the door, advising "import a file with new rows".
-   * That is the wrong instruction for the commonest reason anyone re-imports a file they already
-   * have, which is to ask a DIFFERENT QUESTION of it — Thai instead of English, given name instead
-   * of full name. Re-importing can never do that (the mode is a property of the run, not of the
-   * data) and the thing that can was one click away on another page, unmentioned.
-   *
-   * Non-null holds the seed the run dialog opens with; see `ComparisonSeed`.
-   */
-  const [reCompare, setReCompare] = React.useState<ComparisonSeed | null>(null);
 
   /**
    * Columns the user mapped by hand, because detection found none — target column → the header
@@ -229,8 +177,25 @@ export function ImportReview({ source, file, onCancel, onComplete }: Props) {
     const form = new FormData();
     form.append(fieldName(source), file);
     if (Object.keys(overrides).length > 0) form.append("columnOverrides", JSON.stringify(overrides));
+    /**
+     * The two fields the pre-check needs — "have you already imported this?" is a question about
+     * WHO and about WHOSE, neither of which is in the file (see `ImportPrecheckSchema`).
+     *
+     * They are also why this effect re-runs on both: each is one of the two things that turns a
+     * refusal into a perfectly ordinary import, so typing either has to re-ask the question live.
+     * That is exactly the case people are in when they hit the refusal — the fix is a box on this
+     * screen, and a screen that made them re-upload to find out whether it worked would be sending
+     * them back through the thing it just refused.
+     *
+     * The mode used to be the third, and re-previewing on it is the behaviour this replaces: an
+     * import is always `en_full` now, so "ask a different question" is no longer something you do
+     * by importing at all.
+     */
+    if (uploader.trim()) form.append("uploaderName", uploader.trim());
+    if (owner.trim()) form.append("uploadPersonName", owner.trim());
+    if (type) form.append("sourceType", type);
     runPreview(form);
-  }, [file, source, overrides, runPreview]);
+  }, [file, source, overrides, uploader, owner, type, runPreview]);
 
   // A different file has different headers, so choices made against the old one cannot be
   // carried over — they would name columns this file may not have. `NO_OVERRIDES` is a constant
@@ -287,12 +252,63 @@ export function ImportReview({ source, file, onCancel, onComplete }: Props) {
   const ownerNeeded = !isCompany && ownerlessRows > 0;
   /** The file has its own owner column, so typing here replaces what it says. */
   const ownerOverwrites = !isCompany && !!ownerColumn && !!owner.trim();
+
+  /**
+   * THE TWO COLUMNS THIS IMPORT CANNOT DO WITHOUT.
+   *
+   * A company file must name a company: every comparison is selected by company, so a contact filed
+   * under nothing is data that goes in and can never come out.
+   *
+   * And any file must name somebody in ENGLISH, because an import's run is `en_full` — one
+   * language, and this is the one. It used to be whichever language the box below was set to, and
+   * the check offered two fixes: map the missing column, or switch the mode. With the mode gone
+   * there is one fix, and it is the one that was almost always right anyway — a file that tripped
+   * this gate was usually a file whose name column had not been recognised, and switching language
+   * was the workaround that started a run over a mapping nobody had checked.
+   *
+   * ── THIS IS NOT A CEILING ON THAI ──
+   *
+   * Thai names in this file are stored, in full, exactly as before: the import gate has never
+   * filtered by language and must never learn to (see `runLanguage` in comparisons.route.ts). What
+   * changes is only which question the run this import opens asks. A Thai comparison is a run you
+   * start from the Network page over the rows this import is about to write.
+   *
+   * Both mirror gates in comparisons.route.ts, computed from counts the server sent, so the button
+   * is disabled exactly when the request would be refused. Neither is a guess made on screen.
+   */
+  const scorable = data?.scorableRows?.en ?? 0;
+  /** No row this run could score: the comparison would come back empty, and an empty comparison
+   *  reads as "nobody knows these people" rather than "this file had no English names". */
+  const noEnglishNames = !!data && data.totalRows > 0 && scorable === 0;
+  /** A company file where no row names a company — an unmapped column and an empty one both land
+   *  here, because from the data's point of view they are the same thing. */
+  const noCompany = !!data && isCompany && data.totalRows > 0 && data.companylessRows >= data.totalRows;
+
+  /**
+   * HOW MANY ROWS THIS IMPORT WOULD ACTUALLY WRITE.
+   *
+   * Read off the PRE-CHECK, which computed it from the same function the merge drops rows with, so
+   * the number on the button is the number the import reports afterwards. Falls back to the file's
+   * row count for a server predating the field — the pessimistic direction would be zero, which
+   * would disable the button over a payload shape rather than over the data.
+   */
+  const willImport = data?.precheck?.newRows ?? data?.totalRows ?? 0;
+
+  /**
+   * Nothing left to write — the one case the server refuses, and the same predicate it refuses on,
+   * so the button and the 400 cannot drift.
+   */
+  const nothingToImport = !!data?.precheck && precheckBlocks(data.precheck);
+
   // `refreshing` bars the button while a column choice is still being read back: the table on
   // screen describes the file as it was mapped a moment ago, and importing against it would be
   // importing something the user hasn't been shown.
   const canImport =
     !!data &&
     data.totalRows > 0 &&
+    !nothingToImport &&
+    !noEnglishNames &&
+    !noCompany &&
     (!ownerNeeded || !!owner.trim()) &&
     !!uploader.trim() &&
     !busy &&
@@ -308,14 +324,6 @@ export function ImportReview({ source, file, onCancel, onComplete }: Props) {
     if (owner.trim()) form.append("uploadPersonName", owner.trim());
     form.append("uploaderName", uploader.trim());
     if (type) form.append("sourceType", type);
-    form.append("compareBy", compareBy);
-    // Sent only when the user narrowed, and only from the company path — the field the server
-    // reads is separate from `sourceType` above, and an absent value means every source. JSON in
-    // a form field, like `columnOverrides` below: multipart carries text, and a repeated field
-    // name is read differently by every parser in the chain.
-    if (isCompany && compareSources?.length) {
-      form.append("compareSources", JSON.stringify(compareSources));
-    }
     // The same choices the preview above was drawn from, byte for byte — this is what makes the
     // screen a promise rather than a demonstration.
     if (Object.keys(overrides).length > 0) form.append("columnOverrides", JSON.stringify(overrides));
@@ -341,31 +349,31 @@ export function ImportReview({ source, file, onCancel, onComplete }: Props) {
       }
 
       /**
-       * Nothing new landed — every row of this file was already on file.
+       * There is no "nothing new to import" any more, and its removal IS the fix.
        *
-       * No run is opened for an import that adds nothing (there would be nothing for the
-       * matcher to look at), so unlike the branch above there is no run to send anyone to.
-       * Re-importing a file you have already imported is the ordinary way to reach this, and
-       * from the outside it is indistinguishable from a broken button: the screen resets and
-       * the app appears to have ignored you. Say what happened, on the page you said it on.
+       * A re-import used to add no rows, open no run, and land here on a dead-end callout that had
+       * to explain that the "How to compare" the user had just picked was not used. That was the
+       * reported bug: re-importing the same file to ask a DIFFERENT question is the commonest
+       * reason anyone re-imports, and it did nothing.
+       *
+       * Imports stack now, so this file has a complete row set of its own whether or not those
+       * people were already on file, and the branch above always takes it to the run. What used to
+       * be `added === 0` is now `duplicates === added` — the same situation, reported rather than
+       * refused. Reaching here at all means the internal matcher is on, where an import really is
+       * just an import.
        */
-      if (added === 0) {
-        setNothingNew({ duplicates: dupes });
-        return;
-      }
-
-      // Internal matcher: an import is just an import. Nothing is running, and there is
-      // nowhere to send anyone.
       toast.success(
-        `Imported ${added.toLocaleString()} new row${added === 1 ? "" : "s"} (${dupes.toLocaleString()} duplicate${
-          dupes === 1 ? "" : "s"
-        } skipped)`
+        dupes > 0
+          ? `Imported ${added.toLocaleString()} row${added === 1 ? "" : "s"} (${dupes.toLocaleString()} already on file)`
+          : `Imported ${added.toLocaleString()} row${added === 1 ? "" : "s"}`
       );
       onComplete?.();
     } catch {
       /* mutations surface errors as toasts */
     }
   }
+
+
 
   return (
     <div className="space-y-5">
@@ -396,6 +404,24 @@ export function ImportReview({ source, file, onCancel, onComplete }: Props) {
         </Callout>
       )}
 
+      {/*
+        THE IMPORT ADDED NOTHING — said in place of the review, not on top of it.
+        ─────────────────────────────────────────────────────────────────────────
+        This was an AlertDialog until 2026-08-04, and it had to stop being one the moment it grew
+        a second action. Opening the run dialog from inside it swapped one Radix modal for another
+        in a single commit: the closing layer's cleanup (focus restore, dismissable-layer teardown)
+        landed after the new Dialog had mounted, so the click that opened it was read as an outside
+        interaction and dismissed it again — and since dismissal here also meant "the import is
+        finished", that took the whole review down with it. From the outside: pick a company, and
+        the screen jumps back to the file picker.
+
+        Inline removes the class of bug rather than timing around it. There is only ever one modal
+        on screen, opened over an ordinary page — the same shape the Network page has always used.
+
+        It REPLACES the review body (`data && …` below is gated on this being null) for the reason
+        the dialog originally covered it: the import is over, and leaving a live "Upload & run 412
+        rows" button underneath only invites the same no-op a second time.
+      */}
       {data && (
         <>
           <ColumnMap
@@ -403,18 +429,40 @@ export function ImportReview({ source, file, onCancel, onComplete }: Props) {
             overrides={overrides}
             onPick={(target, header) =>
               setOverrides((prev) => {
-                const next = { ...prev };
-                // Clearing removes the key rather than storing null: "said nothing about this
-                // target" is exactly what the parser's fall-back-to-detection case reads, and
-                // an empty map is how "no choices at all" is spelled everywhere else.
-                if (header) next[target] = header;
-                else delete next[target];
-                return Object.keys(next).length === 0 ? NO_OVERRIDES : next;
+                // "Leave empty" STORES null rather than dropping the key. Dropping it means
+                // "resolve this target however you would have", which for a column detection got
+                // wrong puts the wrong column straight back — the one answer that can't help.
+                // See `ColumnOverridesSchema`: absent and null are deliberately different words.
+                return { ...prev, [target]: header };
               })
             }
             disabled={busy}
             refreshing={refreshing}
           />
+
+          {/*
+            THE COMPANY COLUMN IS MISSING — said directly under the table that fixes it.
+
+            Not a warning among warnings: this one bars the import, because a contact with no
+            company is not in any set a run can select and so can never be compared at all. It sits
+            here rather than beside the button because the fix is one row up — pick the column —
+            and an error a scroll away from its own remedy is how a required field gets read as a
+            wall rather than as an instruction.
+          */}
+          {noCompany && (
+            <Callout tone="danger" title="No company on any row">
+              <p>
+                Every comparison is selected by company, so a contact filed under nothing could never
+                be compared — it would go in and never come out. This file can&apos;t be imported
+                until it names one.
+              </p>
+              <p>
+                Pick the company column in the table above. If the file genuinely has none, add it
+                and export again.
+              </p>
+            </Callout>
+          )}
+
           {/* The typed owner rides down into the table: it is what every row will be filed under
               once it is typed — the file's own owner column included — and this is the only place
               that can be seen before the import. */}
@@ -429,6 +477,11 @@ export function ImportReview({ source, file, onCancel, onComplete }: Props) {
               </ul>
             </Callout>
           )}
+
+          {/* "Have you already imported this?" — said here, before the button, rather than as a 400
+              after it. The server computes the verdict and refuses the blocking one from the same
+              function, so this is a preview of the answer and not a second opinion. */}
+          <PrecheckNote precheck={data.precheck} />
 
           <div className="space-y-5 border-t pt-5">
             <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
@@ -542,75 +595,150 @@ export function ImportReview({ source, file, onCancel, onComplete }: Props) {
             </div>
 
             {/*
-              The comparison mode lives HERE, and not only on the ad-hoc compare dialog, because
-              this is the path that reaches the external matcher: an import auto-starts a run and
-              forwards its rows to the workflow, while the dialog runs the internal matcher and
-              sends no webhook at all. A mode picked only in the dialog could never configure the
-              workflow it was meant for.
+              WHAT THIS IMPORT'S RUN WILL DO — stated, not configured.
+
+              The mode picker stood here until 2026-08-05 and is gone. It was on this screen because
+              the import is the path that reaches the external matcher, which was true and was not
+              the whole story: what people were doing with it was re-uploading a file they had
+              already imported in order to ask a different question of it. That wrote a second
+              complete row set and put a second paid job through the workflow to change one column
+              on the run above it.
+
+              ── NOTHING IN HERE IS A CONTROL ANY MORE ──
+
+              "Whose friends" (the compare-source picker, company imports only) went the same way
+              on the same day, and for a reason worth keeping written down: it was the one control
+              here that WAS about this file — and it still did not belong, because what it selects
+              is a property of the RUN. Narrowing to LinkedIn changes the answer and nothing else,
+              so a reader who wanted a different answer had to upload their contacts again to ask
+              for it. A re-askable question on a screen whose act is permanent teaches people to
+              re-import, which is precisely the habit this whole screen was feeding.
+
+              Both questions now live on the compare dialog, where they compose: "BlueBrick's
+              contacts, against LinkedIn friends, by Thai surname" is one run over rows already
+              stored. So this box is two sentences — what the import WILL do, and what to do
+              instead if that is not the question you have.
             */}
             <div className="space-y-3 rounded-lg border bg-muted/30 p-4">
-              <p className="text-sm font-medium">How to compare</p>
+              <p className="text-sm font-medium">How this import is compared</p>
 
               {/*
-                COMPANY IMPORTS ONLY — and the asymmetry is the whole reason this is a separate
-                field from Type rather than the same one.
+                The mode, as a fact rather than a control — and with the way to change it named,
+                because a sentence that only closes a door is worse than the control it replaced.
 
-                A company import stores contacts and then scores them against the friends ALREADY
-                on file, which came from every roster. "Match these against LinkedIn only" is a
-                real question, it has a different answer every time it is asked, and nothing about
-                the uploaded file implies it.
-
-                A friends import has no such question. Its run scores the rows it just brought in,
-                every one of them carrying the single Type chosen above, so a picker here would be
-                offering to narrow a set by the property all of its members share. That is stated
-                as a sentence below instead of being offered as a control that cannot do anything.
+                It says "English, whole names" in the same words `compareByLabel` would, but written
+                out rather than imported: a chip here would look like the thing that used to be
+                clickable, and the one thing this line has to do is not read as a disabled picker.
               */}
-              {isCompany && (
-                <div className="space-y-1.5">
-                  <Label htmlFor="import-compare-sources" className="text-xs">
-                    Whose friends
-                  </Label>
-                  <SourcePicker
-                    id="import-compare-sources"
-                    selected={compareSources}
-                    onChange={setCompareSources}
-                    disabled={busy}
-                  />
-                  <p className="text-xs text-muted-foreground">
-                    Which friends these contacts are matched against. Not the same as the file&apos;s
-                    own type — this applies to this run only.
-                  </p>
-                </div>
-              )}
+              <p className="text-xs text-muted-foreground">
+                Every import is compared on{" "}
+                <span className="font-medium text-foreground">English whole names</span>
+                {isCompany ? (
+                  <>
+                    , against{" "}
+                    <span className="font-medium text-foreground">every friend on file</span>
+                  </>
+                ) : null}
+                . Thai names in this file are still stored.
+              </p>
+              {/*
+                WHERE TO GO INSTEAD — named, and named concretely, because this box now removes two
+                choices and a screen that only says "you can't do that here" is worse than the
+                controls it replaced. The wording differs by side because the questions do: a
+                company import's reader wants to narrow WHO their contacts are held against, a
+                friends import's reader wants a different language or name part.
+              */}
+              {/* Names ONE place, and it has moved twice in a day — first off the Network header's
+                  "Find connections", then off the Uploads table's own Compare button, both removed
+                  on 2026-08-06. Runs are started from Network → Results now, which is the screen
+                  whose subject is runs. Worth re-checking against the app whenever a control moves:
+                  copy that names a button is only as good as the button. */}
+              <p className="text-xs text-muted-foreground">
+                To ask something else of this data once it is in —{" "}
+                {isCompany ? "one roster instead of all of them, another language, " : "another language, "}
+                or just the surname — go to{" "}
+                <span className="font-medium text-foreground">Network → Results</span> once this
+                import&apos;s run appears and press Compare on it. Nothing needs re-uploading.
+              </p>
 
-              <CompareModeControl
-                idPrefix="import"
-                value={compareBy}
-                onChange={setCompareBy}
-                disabled={busy}
-              />
+              {/*
+                THE FILE HAS NOTHING THIS RUN COULD SCORE — said here, where the fix is.
+
+                The import is barred (see `noEnglishNames`) and the server refuses the same request
+                for the same reason, but being told by a 400 after the upload is the wrong place to
+                learn it: the fix is the column picker at the top of this screen.
+
+                It used to name two ways out and lead with the wrong one — "switch the language" was
+                a click, so it was the one people took, and it started a run over a mapping nobody
+                had checked. There is one way out now and it is the one that fixes the file.
+              */}
+              {noEnglishNames && (
+                <Callout tone="danger" title="No English names in this file">
+                  <p>
+                    Imports are compared on <span className="font-medium">English</span> names, and
+                    not one of the {data.totalRows.toLocaleString()} row
+                    {data.totalRows === 1 ? "" : "s"} has one — so this import&apos;s comparison would
+                    score nothing at all.
+                  </p>
+                  <p>
+                    Pick the English name column in the table above. If the file genuinely has none,
+                    it can still be imported once a column is mapped — but the names in it will only
+                    be matchable by a Thai comparison run from the Network page.
+                  </p>
+                </Callout>
+              )}
               {/*
                 What the Type above implies for THIS run — stated, not asked.
 
                 A friends import's run scores the rows this file just brought in, and every one of
                 them carries that single type, so there is no compare-scope choice to make on this
                 path: the population IS the file. That is why this is a sentence rather than a
-                second picker. Choosing which friends to compare is the Find-connections dialog's
-                job, over the friends already on file.
+                second picker. Choosing which friends to compare is the comparison dialog's job,
+                over the friends already on file — reached from Network → Results since 2026-08-06.
               */}
               {!isCompany && type && (
                 <p className="text-xs text-muted-foreground">
                   This run covers the {sourceLabel(type)} friends in this file. To compare across
-                  sources already on file, use Find connections on the Network page.
+                  sources already on file, press Compare on a run under{" "}
+                  <span className="font-medium">Network → Results</span>.
                 </p>
               )}
             </div>
 
-            <div className="flex justify-end">
-              <LoadingButton variant="gradient" isLoading={busy} disabled={!canImport} onClick={commit}>
+            <div className="flex flex-wrap items-center justify-end gap-3">
+              {/* Why the button is dead, beside the button. Both reasons are explained in full
+                  further up — this is the pointer for a long file where the callout has scrolled
+                  away, and it says which of them applies rather than "something is wrong". */}
+              {(noCompany || noEnglishNames || nothingToImport) && (
+                <p className="text-xs text-destructive">
+                  {noCompany
+                    ? "Pick the company column above to import."
+                    : noEnglishNames
+                      ? "Nothing here can be compared in English — see above."
+                      : "Every row is already on file — see above."}
+                </p>
+              )}
+              {/*
+                ONE BUTTON, and it counts what will actually be WRITTEN.
+
+                There is no "Import anyway" any more, because there is nothing left to override:
+                duplicate rows are dropped whatever you press, and a file with none left to write is
+                an import that would store nothing. Offering a second button for that would be
+                offering to create an empty upload and a run with nothing in it.
+
+                The count is `newRows` and not `totalRows` — the promise on the face of the button
+                has to be the number of rows that exist afterwards, or a 500-row file that is 480
+                repeats would say "Upload & run 500 rows" and then report 20.
+              */}
+              <LoadingButton
+                variant="gradient"
+                isLoading={busy}
+                disabled={!canImport}
+                onClick={() => commit()}
+              >
                 <Upload className="h-4 w-4" />
-                {data.totalRows > 0
-                  ? `Upload & run ${data.totalRows.toLocaleString()} row${data.totalRows === 1 ? "" : "s"}`
+                {willImport > 0
+                  ? `Upload & run ${willImport.toLocaleString()} row${willImport === 1 ? "" : "s"}`
                   : "Nothing to import"}
               </LoadingButton>
             </div>
@@ -618,95 +746,122 @@ export function ImportReview({ source, file, onCancel, onComplete }: Props) {
         </>
       )}
 
-      {/* Closing it returns to the file picker. The import is over — leaving the review up
-          with a live "Import 42 rows" button would only invite the same no-op a second time. */}
-      <AlertDialog
-        open={nothingNew !== null}
-        onOpenChange={(open) => {
-          if (open) return;
-          setNothingNew(null);
-          onComplete?.();
-        }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Nothing new to import</AlertDialogTitle>
-            <AlertDialogDescription>
-              {nothingNew && nothingNew.duplicates > 0
-                ? `Every row in ${file.name} — all ${nothingNew.duplicates.toLocaleString()} of them — was already imported, so nothing was added and no matching run was started.`
-                : `${file.name} added no new rows, so no matching run was started.`}
-              {" "}
-              {/* The correction to the old copy, which sent people off to re-export a file. An
-                  import decides who is on file; a run decides what was asked of them. Only the
-                  second one is what somebody re-uploading a file they already have is after. */}
-              This data is still on file — to ask a different question of it, such as another
-              language or just the given name, start a run instead of importing again.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            {/*
-              A plain Button, not an AlertDialogAction: that one closes through Radix, which fires
-              `onOpenChange` and hands the screen back to the file picker — resetting the review out
-              from under the dialog we are about to open. Clearing `nothingNew` closes this the
-              controlled way, silently, and `onComplete` waits until the run dialog is done with.
-            */}
-            <Button
-              variant="gradient"
-              onClick={() => {
-                setNothingNew(null);
-                setReCompare({
-                  // Every company: a whole-table run is what "compare this data again" means when
-                  // the data in question is the roster, and the file named no company to narrow to.
-                  companies: null,
-                  // A friends file knows which roster it was — seed it, so the run covers what was
-                  // just re-imported rather than silently widening to every source on file. A
-                  // company file has no such axis and takes the default (all sources).
-                  sources: !isCompany && type ? [type] : null,
-                });
-              }}
-            >
-              <GitCompareArrows className="h-4 w-4" />
-              Compare these again
-            </Button>
-            <AlertDialogAction>Close</AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-
-      {/* Opened only from the dialog above. `onComplete` fires on the way out of THIS one, so the
-          review stays put behind it and the file picker returns once the user is actually done. */}
-      <NewComparisonDialog
-        open={reCompare !== null}
-        onOpenChange={(open) => {
-          if (open) return;
-          setReCompare(null);
-          onComplete?.();
-        }}
-        initial={reCompare ?? undefined}
-      />
     </div>
   );
 }
 
-/** Radix reserves the empty string, so "no column" needs a value of its own. It can never
- *  collide with a header: it is not offered unless a header is currently chosen, and it is
- *  translated back to null the moment it is picked. */
+/**
+ * WHAT OF THIS FILE IS ALREADY HERE — said before the button rather than after it.
+ *
+ * Duplicate rows are dropped at write time now (see `ImportPrecheckSchema`), so this is not a
+ * warning about a refusal — it is the account of what the import is about to leave out. That
+ * distinction is the whole design: the reader is not being stopped, they are being shown.
+ *
+ * Two tones, because there are two situations and only one of them costs anything. Some rows
+ * dropped is an ordinary import with a footnote; EVERY row dropped is an import that would write
+ * nothing, which is the one case the server refuses — and there is no "import anyway", because
+ * there would be nothing to import.
+ */
+function PrecheckNote({ precheck }: { precheck: ImportPrecheck | undefined }) {
+  // Nothing already here, nothing to say. Undefined only from a server predating the field.
+  if (!precheck || precheck.duplicateRows === 0) return null;
+
+  const dropped = precheck.duplicateRows.toLocaleString();
+  const kept = precheck.newRows.toLocaleString();
+  const prior = precheck.priorImport;
+  const priorDate = prior ? new Date(prior.createdAt).toLocaleDateString() : null;
+  /**
+   * The import these rows are already on file from — linked to the page that lists it.
+   *
+   * `/uploads` rather than a per-import URL, because there is no such page: an import is a row in
+   * a table with a rollback beside it, which is exactly where somebody told "you already have
+   * these" wants to be sent.
+   */
+  const priorLink = prior ? (
+    // An ANCHOR on this page, not a link off it: the import history sits below these drop zones
+    // (`#past-imports` on /uploads), so "you already imported these" can point at the named import
+    // without taking the reader away from the file they are part-way through deciding about.
+    <Link href="/uploads#past-imports" className="font-medium underline-offset-2 hover:underline">
+      {prior.name || `import ${prior.id}`}
+    </Link>
+  ) : null;
+  const from =
+    prior && priorDate ? (
+      <>
+        {" "}
+        from {prior.uploadedBy ? `${prior.uploadedBy}'s ` : "your "}
+        {priorLink} on {priorDate}
+      </>
+    ) : null;
+
+  // Every row would be dropped — the one case the import is refused, because it would write
+  // nothing. The button is dead and the way forward is a change to what gets recorded.
+  if (precheck.newRows === 0) {
+    return (
+      <Callout tone="warning" title="Nothing here to import">
+        <p>
+          All {dropped} row{precheck.duplicateRows === 1 ? " is" : "s are"} already on file, exactly
+          as {precheck.duplicateRows === 1 ? "it is" : "they are"} in this file{from}. Importing
+          would store nothing and compare nothing.
+        </p>
+        <p>
+          If these are someone else&apos;s friends, put their name in{" "}
+          <span className="font-medium">Relationship owner</span> below; if someone else is
+          importing, change <span className="font-medium">Uploaded by</span>. To compare what is
+          already here — in Thai, or on surnames — press Compare on the earlier import&apos;s run
+          under <span className="font-medium">Network → Results</span>.
+        </p>
+      </Callout>
+    );
+  }
+
+  return (
+    <Callout tone="info" title={`${dropped} row${precheck.duplicateRows === 1 ? "" : "s"} will be skipped`}>
+      <p>
+        {precheck.duplicateRows === 1 ? "One row is" : `${dropped} rows are`} already on file exactly
+        as written here{from}, so {precheck.duplicateRows === 1 ? "it" : "they"} won&apos;t be stored
+        again. <span className="font-medium text-foreground">{kept}</span> row
+        {precheck.newRows === 1 ? "" : "s"} will be imported and compared.
+      </p>
+      {/* WHICH ones — marked in the table above, which is the difference between a number and an
+          answer. Only said when at least one of them is actually visible up there; on a 4,000-row
+          file whose duplicates all sit past the sample, pointing at the table would be pointing at
+          nothing. */}
+      <p>
+        A row counts as already here only when every column matches — including the relationship
+        owner and who imported it. Skipped rows are struck through in the sample above.
+      </p>
+    </Callout>
+  );
+}
+
+/** Radix reserves the empty string, so "no column" needs a value of its own. It can never collide
+ *  with a header: it is translated to an explicit `null` choice the moment it is picked. */
 const NO_COLUMN = "__none__";
 
 /**
- * Which column of the file lands in which column of the table — and, where nothing landed, the
- * place to say which one should.
+ * Which column of the file lands in which column of the table — and the place to say which one
+ * should, for every row, whatever detection made of it.
  *
  * A "not found" here is still how you catch a wrong export before it is in the database. What has
  * changed is what you can do about it: detection knows the exports this app was written against,
  * so a file whose name column is called "ชื่อ-นามสกุล" or "Contact (full)" used to be a dead end
  * — the column was silently dropped and the only fix was to rename the header and export again.
- * Now the row that reports the miss also offers the file's own spare columns.
  *
- * Only a target with nowhere to come from gets a picker (plus one already chosen, so a choice can
- * be changed or taken back). A column detection DID find is left alone deliberately: it is right
- * nearly always, it agrees with what the import has always done, and turning every row into a
- * control invites re-mapping a file that needed nothing.
+ * EVERY pickable row is a picker now, over EVERY header in the file. It used to be only the rows
+ * nothing was found for, over only the file's spare columns, and both halves of that turned out to
+ * be the bug rather than the restraint they were meant as:
+ *
+ *   · A wrong detection was unfixable. A file whose "eng" column is a department, not a name, has
+ *     that column locked to "English name" with no way to move it or empty it — and the column
+ *     that DOES hold the names sits under it, unofferable, because the target it belongs to
+ *     already "found" something.
+ *   · A spare-columns-only list can be empty. Every header claimed by something means every picker
+ *     on the screen offers nothing, on exactly the file where the mapping is most likely wrong.
+ *
+ * The cost is a screen of dropdowns on a file that needed none, which is a cosmetic price for a
+ * dead end. What detection decided is still what each one shows, so an untouched screen imports
+ * what it always did.
  */
 function ColumnMap({
   preview,
@@ -723,16 +878,23 @@ function ColumnMap({
   /** A choice is being read back; the table describes the file as it was mapped a moment ago. */
   refreshing?: boolean;
 }) {
-  // The pool a hand-mapped column comes from: the headers no target claims. A header already
-  // feeding one column is not offered to a second, so a single column can't quietly land in two
-  // places — and since this list is rebuilt from each preview, a column chosen here leaves the
-  // pool for every other target as soon as the choice lands.
+  // Which headers nothing claims. No longer the pool a pick comes from — that is every header now
+  // — but still worth telling apart: a column already feeding another target is a odd thing to
+  // point a second one at, and the list says so rather than hiding it.
   const spare = new Set(preview.ignoredColumns);
+
+  /** Where each header currently lands, so the picker can say "this one is already in use, as
+   *  Company" instead of offering it as though it were free. */
+  const usedBy = new Map<string, string>();
+  for (const m of preview.mapping) {
+    if (m.sourceColumn) usedBy.set(m.sourceColumn, m.label);
+    if (m.alsoColumn) usedBy.set(m.alsoColumn, m.label);
+  }
 
   /**
    * A slot nothing found and nobody can fill is left out entirely.
    *
-   * That is exactly one row — the unlabelled `friend_name` (`pickable: false`), which a bilingual
+   * That is exactly one row — the unlabelled name slot (`pickable: false`), which a bilingual
    * file never fills because it says which language each of its name columns is in. Listed, it read
    * "Friend name … not found", which is a report of a problem that isn't one, on a row whose whole
    * point is that there is no question to ask. Every other miss stays: those are questions, and the
@@ -757,21 +919,23 @@ function ColumnMap({
           </TableHeader>
           <TableBody>
             {rows.map((m) => {
-              const chosen = overrides[m.target] ?? null;
-              // The chosen header stays on its own list even though it is no longer spare —
-              // otherwise the one column you can undo is the one you can't see.
-              const options = preview.sourceColumns.filter((h) => spare.has(h) || h === chosen);
-              // Nothing found it, or the user pointed it somewhere by hand. Either way this row
-              // is a question, not a statement — unless the server says the target isn't one
-              // anybody can answer (`pickable: false`: the unlabelled name, routed by script).
-              const askable = m.pickable !== false && (!m.sourceColumn || chosen !== null);
+              // Three states, and the middle one is why `null` is a value the wire carries:
+              // no key at all means "whatever detection says", a header means that header, and
+              // `null` means "nothing, regardless of what detection found". Without the third,
+              // a column detection got WRONG could not be emptied.
+              const picked = m.target in overrides ? overrides[m.target] : undefined;
+              const shown = picked === undefined ? m.sourceColumn : picked;
+              // The unlabelled name slot is the one row nobody can answer: it is routed by script,
+              // and "let the app guess the language" is a worse answer than the two rows either
+              // side of it that say outright.
+              const askable = m.pickable !== false;
 
               return (
                 <TableRow key={m.target}>
                   <TableCell>
-                    {askable && options.length > 0 ? (
+                    {askable ? (
                       <Select
-                        value={chosen ?? NO_COLUMN}
+                        value={shown ?? NO_COLUMN}
                         onValueChange={(v) => onPick(m.target, v === NO_COLUMN ? null : v)}
                         disabled={disabled}
                       >
@@ -779,45 +943,58 @@ function ColumnMap({
                           className="h-8 w-[15rem]"
                           aria-label={`Column holding ${m.label}`}
                         >
-                          {chosen ? (
-                            <span className="truncate font-mono text-xs">{chosen}</span>
+                          {shown ? (
+                            <span className="truncate font-mono text-xs">{shown}</span>
                           ) : (
                             <span className="text-xs text-muted-foreground">
-                              Not found — pick a column
+                              {/* Emptied on purpose reads differently from never found — the
+                                  first needs no fixing, and calling it "not found" would nag
+                                  about a decision the user just made. */}
+                              {picked === null ? "Left empty" : "Not found — pick a column"}
                             </span>
                           )}
                         </SelectTrigger>
                         <SelectContent>
-                          {options.map((h) => (
+                          {preview.sourceColumns.map((h) => (
                             <SelectItem key={h} value={h} className="font-mono text-xs">
                               {h}
+                              {/* Already feeding another target. Offered anyway — moving a column
+                                  from the wrong row to the right one is the point — but never
+                                  silently, because doing it leaves the other row empty. */}
+                              {!spare.has(h) && usedBy.get(h) !== m.label && (
+                                <span className="ml-2 font-sans text-muted-foreground">
+                                  · in use as {usedBy.get(h)}
+                                </span>
+                              )}
                             </SelectItem>
                           ))}
-                          {chosen && (
-                            <>
-                              <SelectSeparator />
-                              <SelectItem value={NO_COLUMN} className="text-xs text-muted-foreground">
-                                Leave empty
-                              </SelectItem>
-                            </>
-                          )}
+                          <SelectSeparator />
+                          <SelectItem value={NO_COLUMN} className="text-xs text-muted-foreground">
+                            Leave empty
+                          </SelectItem>
                         </SelectContent>
                       </Select>
-                    ) : m.sourceColumn ? (
-                      <code className="font-mono text-xs">{m.sourceColumn}</code>
                     ) : (
-                      // Nothing found it and the file has no spare column to offer — every
-                      // header it has is already feeding something else.
-                      <Badge variant="outline" className="text-muted-foreground">
-                        not found
-                      </Badge>
+                      // Routed by script rather than chosen — show what it landed on, including
+                      // the second half of a split name ("First Name + Last Name").
+                      <code className="font-mono text-xs">
+                        {m.sourceColumn}
+                        {m.alsoColumn && ` + ${m.alsoColumn}`}
+                      </code>
                     )}
                   </TableCell>
                   <TableCell className="text-muted-foreground">
                     <ArrowRight className="h-3.5 w-3.5" />
                   </TableCell>
-                  <TableCell className={m.sourceColumn ? "font-medium" : "text-muted-foreground"}>
+                  <TableCell className={shown ? "font-medium" : "text-muted-foreground"}>
                     {m.label}
+                    {/* Worked out from the data, not from the header — a different kind of answer
+                        from an alias match, and the screen has to say which one it is doing. */}
+                    {m.guessed && picked === undefined && (
+                      <Badge variant="outline" className="ml-2 font-normal text-muted-foreground">
+                        guessed
+                      </Badge>
+                    )}
                   </TableCell>
                 </TableRow>
               );

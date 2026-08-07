@@ -1,7 +1,8 @@
 import { z } from 'zod';
-import { PaginationQuerySchema, SourceTypeSchema } from './common';
+import { OptionsQuerySchema, PaginationQuerySchema, SourceTypeSchema } from './common';
 import { CompareBySchema, DEFAULT_COMPARE_BY } from './compare-by';
 import { CompareSourcesSchema, normalizeSources } from './compare-sources';
+import { RequestableFilterBySchema } from './run-scope';
 
 /**
  * Shared search/filter query for the upload-history and upload-session tables.
@@ -96,6 +97,17 @@ export const ColumnMappingSchema = z.object({
   /** The header found in the uploaded file, or null if nothing matched. */
   sourceColumn: z.string().nullable(),
   /**
+   * A SECOND header joined onto the first, for the one shape a single column can't express: a
+   * file that splits the name into “First Name” and “Last Name”. LinkedIn's export does, most
+   * CRM exports do, and with one column per target the whole file previously resolved to no
+   * name at all — nothing detected, and a hand-mapped pick of either half would import only
+   * half of everybody's name.
+   *
+   * Only detection produces this. A hand-mapped column is always exactly the one column the
+   * user pointed at, and choosing one clears the pair.
+   */
+  alsoColumn: z.string().nullable().optional(),
+  /**
    * This column is a person's name, so it is cleaned on import (titles, suffixes,
    * nicknames and middle names removed) and each sample row carries a `<target>_clean`
    * key beside the raw one. The preview shows both — the raw name is what the file said,
@@ -115,11 +127,23 @@ export const ColumnMappingSchema = z.object({
    * columns.
    */
   pickable: z.boolean().optional(),
+  /**
+   * Nothing on the alias list matched, so this column was worked out from the DATA — see
+   * `guessNameColumn` in api/src/services/file-parser.service.ts.
+   *
+   * Flagged rather than presented as a find, because it is a different kind of answer: an alias
+   * match knows what the header means, a guess only knows the column is full of things shaped like
+   * people's names. It is right often enough to be worth making (it is what turns a file with an
+   * unrecognised header from "map three columns by hand" into "check one row"), and wrong often
+   * enough that the screen has to say which one it is doing.
+   */
+  guessed: z.boolean().optional(),
 });
 export type ColumnMapping = z.infer<typeof ColumnMappingSchema>;
 
 /**
- * The columns the user picked by hand: target column → the header in their file that supplies it.
+ * The columns the user picked by hand: target column → the header in their file that supplies it,
+ * or `null` for “take nothing, whatever detection thinks”.
  *
  * Detection (`aliases` in api/src/services/file-parser.service.ts) covers the exports this app was
  * built around, and nothing else. A file whose name column is called “ชื่อ-นามสกุล” is not a broken
@@ -130,8 +154,17 @@ export type ColumnMapping = z.infer<typeof ColumnMappingSchema>;
  * A choice here BEATS detection for that target and is otherwise inert — every target the user
  * says nothing about resolves exactly as it always did, so a caller that sends none of this
  * behaves identically to one written before it existed.
+ *
+ * ── NULL IS A CHOICE, AND IT HAS TO BE ──
+ *
+ * `null` used to be refused, on the reasoning that clearing a choice drops the key and every other
+ * spelling of “empty” is a caller’s bug. That held only while a choice could exist for a column
+ * detection had missed. It cannot hold now that every column is re-mappable: dropping the key means
+ * “resolve this target as you always would”, which for a column detection got WRONG is the one
+ * answer that doesn’t help. Without a way to say “no column”, a header the aliases claimed by
+ * mistake — `eng` on a file where that is a department, not a name — is unremovable.
  */
-export const ColumnOverridesSchema = z.record(z.string(), z.string().trim().min(1));
+export const ColumnOverridesSchema = z.record(z.string(), z.string().trim().min(1).nullable());
 export type ColumnOverrides = z.infer<typeof ColumnOverridesSchema>;
 
 /**
@@ -170,53 +203,146 @@ export const ColumnOverridesFieldSchema = z
   });
 
 /**
- * `compareSources` as it arrives on a multipart import — a JSON array in a form field.
+ * How many importable rows carry an ENGLISH name — the fact an import's run turns into a
+ * requirement.
  *
- * JSON in a string for the same reason `columnOverrides` above is: multipart carries text, and a
- * repeated field name is read differently by every parser in the chain. One field, one value, one
- * decoding.
+ * A run compares one language and one language only (see `COMPARE_BY_VALUES`), and an import's run
+ * is always `en_full` since 2026-08-05. So a file with no English names is a file whose run cannot
+ * return anything — not a run that finds nothing, which is a different and much more misleading
+ * outcome, because it reads as "nobody at this company knows these people".
  *
- * ── THIS IS NOT `sourceType`, AND THE TWO MUST NEVER BE MERGED ──
+ * ── IT USED TO CARRY BOTH LANGUAGES, AND THE SECOND ONE HAD NOBODY LEFT TO TELL ──
  *
- * `sourceType` is the imported FILE's provenance: it is written to `upload.source` and to
- * `friend.source` on every row, it is permanent, and it describes the data.
+ * `th` sat beside `en` while the import screen carried a mode picker: the count answered "would the
+ * Thai run you just selected score anything", and the screen offered switching language as one of
+ * the two ways out of a refusal. With the picker gone there is no Thai import to be about. Keeping
+ * the number would have left a field on the wire that no reader consults and no rule enforces, which
+ * is the shape that quietly acquires a wrong consumer later.
  *
- * This is the RUN's scope: which friends the comparison this import starts should cover. It is
- * written to `comparison.sources`, it belongs to one run, and asking again with a different value
- * is a supported thing to do.
+ * A Thai comparison is still entirely available — it is a run you ask for from the Network page,
+ * over rows already stored, and the import gate deliberately never filtered by language, so every
+ * Thai name in this file is on file for it to find. See `runLanguage` in comparisons.route.ts.
  *
- * They were briefly the same control on the import screen and it was wrong in both directions —
- * a permanent property of the data read as a per-run setting, and a per-run setting looked like
- * something already answered.
+ * Counted server-side over the WHOLE file rather than derived on screen from the mapping, because
+ * the mapping is not the answer. An unlabelled name column is routed to a language by script
+ * (`routeNames`), so "does this file have English names" is a question about the cells, not about
+ * the headers.
  *
- * ── COMPANY IMPORTS ONLY ──
- *
- * A friends import's run scores the rows that import just brought in, and all of them carry the
- * one `sourceType`. There is no population to narrow, so the field is ignored on that path rather
- * than being offered and quietly doing nothing. A COMPANY import is the case with a real choice:
- * its contacts are scored against the friends already on file, and those come from every roster.
- *
- * Absent / empty → null → every source, which is what this path did before the field existed.
+ * Nameless rows are excluded: they will not be imported at all, by the same `usable` gate in
+ * comparisons.route.ts that this pairs with.
  */
-export const CompareSourcesFieldSchema = z
-  .string()
-  .trim()
-  .optional()
-  .transform((raw, ctx): string[] | null => {
-    if (!raw) return null;
-    let json: unknown;
-    try {
-      json = JSON.parse(raw);
-    } catch {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Compare sources are not readable JSON' });
-      return z.NEVER;
-    }
-    if (!Array.isArray(json) || json.some((v) => typeof v !== 'string')) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Compare sources must be a list of names' });
-      return z.NEVER;
-    }
-    return normalizeSources(json as string[]);
-  });
+export const ScorableRowsSchema = z.object({
+  en: z.number(),
+});
+export type ScorableRows = z.infer<typeof ScorableRowsSchema>;
+
+/**
+ * ── THE IMPORT PRE-CHECK: "what of this file is already here?" ────────────────
+ *
+ * Answered on the PREVIEW screen, before a single row is written, and enforced by `POST /run` from
+ * the same function so the two cannot disagree.
+ *
+ * ── Why this exists ──
+ *
+ * Imports stack: every row of every import is written under its own `upload_id`, because the
+ * external workflow selects what to match with `WHERE upload_id = :session_id` and cannot see rows
+ * filed under an earlier import. That makes an ACCIDENTAL repeat expensive rather than free. It
+ * writes a second complete row set, opens a run, and puts a job through somebody else's workflow,
+ * which is metered and has been seen to answer 402 when an upstream provider ran out of balance.
+ *
+ * ── WHAT IT ASKS CHANGED ON 2026-08-05, AND THE OLD QUESTION IS GONE ──
+ *
+ * It used to ask whether the same COMPARISON had been run: same people, same mode, nothing moved on
+ * the opposite side since. That question only made sense while an import carried a mode. It no
+ * longer does — every import is `en_full` — so "re-import the same file to ask a different
+ * question" is not a thing anybody can be doing any more, and a check built to permit it was
+ * permitting the one case it existed to stop.
+ *
+ * The question now is about the IMPORT, not the run: **have these exact people already been filed,
+ * by you, under this owner?** Two people importing the same roster is real work — it records that
+ * both of them know these people. One person importing it twice is not, and is refused.
+ *
+ * ── The two escape hatches are the two things that make a repeat meaningful ──
+ *
+ * A DIFFERENT UPLOADER is a different fact about provenance, and `upload.uploaded_by` records it.
+ * A DIFFERENT RELATIONSHIP OWNER is a different fact about the people — and it falls out of the
+ * identity rule rather than being special-cased, because the owner is half the dedup key: filed
+ * under somebody else, these are not the same friends at all, and the check sees them as new.
+ *
+ * ── Why it refuses instead of deleting ──
+ *
+ * The obvious alternative is to let the import happen and then drop the duplicate rows. There is no
+ * ordering that makes that safe: the run and the rows are the same fact. Delete the rows and keep
+ * the run, and the workflow finds nothing under that `upload_id` — a run that completes empty over
+ * a file that was full. Delete both, and you have reproduced the original bug with a message
+ * attached. Refusing BEFORE anything is written has the identical outcome and nothing to clean up,
+ * and it is the rule this endpoint already follows for every other refusal (parse before write).
+ */
+export const ImportPrecheckSchema = z.object({
+  /** Rows the import would consider — nameless ones already excluded. */
+  importableRows: z.number(),
+  /**
+   * Rows that would actually be WRITTEN. `importableRows - duplicateRows`, sent rather than derived
+   * so every surface that shows it is showing the same subtraction.
+   *
+   * Zero is the one case still refused: an import that writes nothing opens a run over nothing.
+   */
+  newRows: z.number(),
+  /**
+   * Rows that would be DROPPED — already on file, verbatim, from this same uploader.
+   *
+   * "Verbatim" is strict: every column, including the relationship owner and the source. A row that
+   * shares a PERSON with one on file but differs anywhere — a spelling the old row lacked, another
+   * source, another owner, another importer — is not a duplicate and is written, because it carries
+   * something the stored row does not.
+   */
+  duplicateRows: z.number(),
+  /**
+   * WHICH ones, as indexes into the file's rows in order.
+   *
+   * The whole point of the pre-check being a preview rather than a count: the reader can see the
+   * rows that will vanish, in the sample table, before committing. Indexes rather than a parallel
+   * boolean array so a caller can slice the sample without the two falling out of step.
+   *
+   * Over the WHOLE file, so it is longer than the sample on screen — a reader looking at ten rows
+   * gets the ones among those ten, and `duplicateRows` tells them how many more there are.
+   */
+  duplicateIndexes: z.array(z.number()),
+  /**
+   * The import these rows are already on file from, if any — what makes the note worth reading
+   * ("you imported friends.csv on 4 Aug") rather than a bare count.
+   *
+   * Resolved by PERSON rather than by the strict row key, deliberately: the reader wants to be
+   * pointed at the import they are repeating, and that is the one holding these people.
+   */
+  priorImport: z
+    .object({
+      id: z.string(),
+      /** The file it came from — `upload.name`, which the import screen sets to the filename. */
+      name: z.string().nullable(),
+      uploadedBy: z.string().nullable(),
+      createdAt: z.string(),
+    })
+    .nullable(),
+});
+export type ImportPrecheck = z.infer<typeof ImportPrecheckSchema>;
+
+/**
+ * Does this pre-check stop the import?
+ *
+ * ONE function, called by the import screen to decide whether the button works and by `POST /run`
+ * to decide whether to refuse. A second copy of this condition is how a screen that says "go ahead"
+ * and a server that says 400 end up in the same product.
+ *
+ * ── IT IS NO LONGER ABOUT REPETITION ──
+ *
+ * It used to mean "this is a duplicate import". Duplicates are now dropped row by row, so a
+ * partly-repeated file simply imports the part that is new and nobody is stopped. What is left is
+ * the degenerate case: a file with NOTHING left to write. That is refused for the same reason an
+ * empty file is — it would create an import that stored nothing and a run with nothing to score —
+ * and there is deliberately no override, because forcing it could only produce that empty pair.
+ */
+export const precheckBlocks = (p: ImportPrecheck): boolean => p.newRows === 0;
 
 export const UploadPreviewSchema = z.object({
   kind: z.enum(['company', 'facebook']),
@@ -248,12 +374,66 @@ export const UploadPreviewSchema = z.object({
    * which is the reading that leaves the old behaviour of every caller unchanged.
    */
   ownerlessRows: z.number().default(0),
+  /**
+   * How many importable rows carry an English name — see `ScorableRowsSchema`.
+   *
+   * The import screen reads it so "this run compares English names and yours has none" is answered
+   * before the upload rather than by a run that comes back empty. The same count is re-derived at
+   * import (comparisons.route.ts), which is what actually refuses it.
+   *
+   * Defaulted to zero for a payload predating the field. That is the pessimistic direction and it
+   * is the safe one HERE only because the screen treats "0" as "say so, and let the server decide"
+   * rather than as grounds to block on its own.
+   */
+  scorableRows: ScorableRowsSchema.default({ en: 0 }),
+  /**
+   * How many importable rows name no company — COMPANY imports only, always zero for friends.
+   *
+   * The company is the axis every run is selected by ("compare my friends against PTT"), so a
+   * contact with no company is a contact no run can ever reach. When this equals the importable
+   * row count the file has no company column at all, or an empty one, and the import is refused
+   * rather than stored where nobody can select it.
+   */
+  companylessRows: z.number().default(0),
+  /**
+   * "Have you already imported this?" — see `ImportPrecheckSchema`.
+   *
+   * ALWAYS COMPUTED since 2026-08-05. It used to depend on a `compareBy` the caller might not send,
+   * and was absent when it didn't; the verdict no longer turns on a mode, so there is nothing left
+   * for the preview to be uncertain about and no reason to withhold the one answer that decides
+   * whether the button on this screen works.
+   *
+   * Still optional in the schema, and only for that reason: a payload predating the field must
+   * parse. The screen renders nothing when it is absent.
+   */
+  precheck: ImportPrecheckSchema.optional(),
 });
 export type UploadPreview = z.infer<typeof UploadPreviewSchema>;
 
-/** GET /api/comparisons/companies — distinct companies to compare against. */
+/**
+ * GET /api/comparisons/companies — distinct companies to compare against, searched and capped.
+ *
+ * Took no querystring until 2026-08-04, and returned every company on file; it now takes
+ * `OptionsQuerySchema` (`q`, `limit`) because the picker it feeds cannot hold the whole list at this
+ * database's size. With both omitted it returns the head of the list rather than nothing, so a
+ * caller that has not been updated still gets a usable answer.
+ */
+export const CompaniesQuerySchema = OptionsQuerySchema;
+export type CompaniesQuery = z.infer<typeof CompaniesQuerySchema>;
+
 export const CompaniesDataSchema = z.object({
+  /** The slice — at most `limit`, one spelling per case-folded company, alphabetical. */
   companies: z.array(z.string()),
+  /**
+   * How many companies match `q` in total. NOT `companies.length`.
+   *
+   * The compare dialog reads its "all companies" size from here, and that is the reason this field
+   * is not optional. An all-companies run's warning ("scored against every contact at all N
+   * companies on file") is the one number on that screen taken from the picker's list rather than
+   * from the selection, so sourcing it from a capped array would have quietly rewritten the largest
+   * run the app can start as a 50-company one.
+   */
+  total: z.number(),
 });
 export type CompaniesData = z.infer<typeof CompaniesDataSchema>;
 
@@ -287,23 +467,47 @@ export type CompaniesData = z.infer<typeof CompaniesDataSchema>;
  * that can only ever return nothing. Collapsing at the boundary is what stops both shapes reaching
  * the database — exactly the argument `CompareSourcesSchema` makes for its own axis.
  */
-export const CompareByCompanyBodySchema = z.object({
-  company_names: z
-    .array(z.string().trim().min(1))
-    .nullish()
-    .transform((names) => (names?.length ? [...new Set(names)] : null)),
-  /**
-   * How to compare — see `CompareBy`. Optional, and defaulted rather than required, so an
-   * existing caller (or a scripted one) gets the behaviour it has always got instead of a 400.
-   */
-  compare_by: CompareBySchema.default(DEFAULT_COMPARE_BY),
-  /**
-   * WHICH friends to compare — see `CompareSourcesSchema`. Omitted, null or empty all mean every
-   * source, which is what this endpoint did before the field existed, so no existing caller changes
-   * behaviour by not sending it.
-   */
-  sources: CompareSourcesSchema,
-});
+export const CompareByCompanyBodySchema = z
+  .object({
+    company_names: z
+      .array(z.string().trim().min(1))
+      .nullish()
+      .transform((names) => (names?.length ? [...new Set(names)] : null)),
+    /**
+     * How to compare — see `CompareBy`. Optional, and defaulted rather than required, so an
+     * existing caller (or a scripted one) gets the behaviour it has always got instead of a 400.
+     *
+     * THIS ENDPOINT IS NOW THE ONLY PLACE THE MODE IS CHOSEN. The import screen carried a copy of
+     * the control until 2026-08-05 and no longer does — an import is always `en_full` — so a
+     * `th_surname` run is something you ask for here, over data already on file, rather than
+     * something you get by re-uploading a file to ask a different question of it.
+     */
+    compare_by: CompareBySchema.default(DEFAULT_COMPARE_BY),
+    /**
+     * WHICH friends to compare — see `CompareSourcesSchema`. Omitted, null or empty all mean every
+     * source, which is what this endpoint did before the field existed, so no existing caller changes
+     * behaviour by not sending it.
+     */
+    sources: CompareSourcesSchema,
+    /**
+     * WHICH ROWS to compare — see `RunScopeSchema`. Omitted is the legacy shape: `company_names`
+     * (or its null) decides the run on its own, exactly as it always did.
+     *
+     * It does NOT replace `company_names`, and the overlap between `filter_by='company'` and a
+     * one-company list is real rather than accidental. They are the same run asked from two places:
+     * the dialog's picker builds a list, a company row builds a scope, and the server stores both so
+     * a run opened either way is found by the duplicate check and rendered by the same chip. What the
+     * scope adds is the two axes a company list cannot express at all.
+     */
+    filter_by: RequestableFilterBySchema.optional(),
+    filter_value: z.string().trim().min(1).optional(),
+  })
+  /** Both keys or neither — see `RunScopeSchema`, whose rule this is and which states why half a
+   *  scope is a run nobody can describe. */
+  .refine((b) => (b.filter_by === undefined) === (b.filter_value === undefined), {
+    message: 'A run scope needs both filter_by and filter_value, or neither',
+    path: ['filter_value'],
+  });
 export type CompareByCompanyBody = z.infer<typeof CompareByCompanyBodySchema>;
 
 /**

@@ -21,6 +21,7 @@ import {
 } from "./row-status";
 import {
   rowFilterWhere,
+  rowSearchWhere,
   toRunRow,
   type RawRunRow,
   type RunRowFilter,
@@ -277,13 +278,33 @@ export class ComparisonResultModel extends DBModel {
     filter: RunRowFilter,
     sort: RunRowSort,
     /** The reader's chosen bar, or null for the run's own verdicts. See `regradeVerdict`. */
-    threshold: number | null = null
+    threshold: number | null = null,
+    /**
+     * The search box's text, or null.
+     *
+     * BOTH SIDES of the pairing here, where the import readers get one — and that is not an
+     * inconsistency, it is the same rule ("the row's own columns") applied to a table whose row IS
+     * the pair. A result row carries the friend's spellings, the contact's, the employer and the
+     * owner, so all of them are searchable without a join the count query could not make.
+     */
+    q: string | null = null
   ): Promise<PaginatedResult<RunRow>> {
     const db = await this.getKyselyDB();
     const offset = (page - 1) * limit;
     // No scorable expression: every row in this table was scored, so the bucket collapses to the
     // verdict. The rows the mode ruled out are not here to be filtered — see statusCounts.
     const where = rowFilterWhere(runRowBucketSql(verdict(threshold), null), filter);
+    const search = rowSearchWhere(
+      [
+        "comparison_result.friend_name_en",
+        "comparison_result.friend_name_th",
+        "comparison_result.person_name_en",
+        "comparison_result.person_name_th",
+        "comparison_result.company_name",
+        "comparison_result.upload_name",
+      ],
+      q
+    );
 
     let rows = db
       .selectFrom("comparison_result")
@@ -292,11 +313,13 @@ export class ComparisonResultModel extends DBModel {
       .innerJoin("comparison", "comparison.id", "comparison_result.comparison_id")
       .where("comparison_result.comparison_id", "=", comparisonId);
     if (where) rows = rows.where(where);
+    if (search) rows = rows.where(search);
 
     let count = db
       .selectFrom("comparison_result")
       .where("comparison_result.comparison_id", "=", comparisonId);
     if (where) count = count.where(where);
+    if (search) count = count.where(search);
 
     const selected = rows
       .leftJoinLateral(
@@ -498,12 +521,24 @@ export class ComparisonResultModel extends DBModel {
      */
     // "Has a name, but not in this run's language" — a fact about the data since 2026-07-28,
     // where it used to be a script-test of the one stored name and therefore an inference.
-    const nameColumn = language === "th" ? "friend.friend_name_th" : "friend.friend_name_en";
+    // ONE ROW PER PERSON, matching what the matcher actually scored. `MatcherService` reads
+    // `friend_current`, so a run's `total` is people; counting the raw table here would add a
+    // re-imported friend to "Not compared" once per import and inflate the denominator only —
+    // producing a run whose tabs sum to more rows than the table beneath them can list.
+    //
+    // The fold's name columns are coalesced across the person's rows, which is also what makes this
+    // test right: somebody imported in English and later in Thai HAS a Thai name and must not be
+    // reported as uncompared by a `th` run just because one of their rows lacks one.
+    const nameColumn =
+      language === "th" ? "friend_current.friend_name_th" : "friend_current.friend_name_en";
     let unscoredQ = db
-      .selectFrom("friend")
+      .selectFrom("friend_current")
       .select((eb) => eb.fn.countAll().as("count"))
       .where((eb) =>
-        eb.or([eb("friend.friend_name_en", "is not", null), eb("friend.friend_name_th", "is not", null)])
+        eb.or([
+          eb("friend_current.friend_name_en", "is not", null),
+          eb("friend_current.friend_name_th", "is not", null),
+        ])
       )
       .where(sql<SqlBool>`${sql.ref(nameColumn)} is null`);
 
@@ -525,8 +560,16 @@ export class ComparisonResultModel extends DBModel {
      * rows disagree.
      */
     if (sources !== null) {
-      unscoredQ = unscoredQ.where(
-        sql<SqlBool>`lower(friend.source) = any(${sql.val(sources)}::text[])`
+      // Asked against the RAW rows, exactly as `findAllForMatching` does — the fold has to collapse
+      // `source` to one value, and a person imported from two sources belongs to both rosters. The
+      // two must select the same population or the denominator and the rows disagree.
+      unscoredQ = unscoredQ.where(({ exists, selectFrom }) =>
+        exists(
+          selectFrom("friend")
+            .select("friend.id")
+            .whereRef("friend.person_key", "=", "friend_current.person_key")
+            .where(sql<SqlBool>`lower(friend.source) = any(${sql.val(sources)}::text[])`)
+        )
       );
     }
 

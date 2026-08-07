@@ -141,6 +141,29 @@ function bestOf(mine: Set<string>[], theirs: Set<string>[]): number {
   return best;
 }
 
+/**
+ * A run's scope, resolved into the two questions this matcher can actually ask.
+ *
+ * The route translates `filter_by` / `filter_value` into these before calling, rather than passing
+ * the stored pair through, because the mapping is not one-to-one and the missing step is where a
+ * bug would live: `filter_by='file'` selects FRIENDS for a social import and CONTACTS for a company
+ * one, which is a fact about the named upload and not about the scope's spelling. Resolving it once
+ * at the boundary — where the upload has just been looked up anyway — keeps this function about
+ * matching.
+ *
+ * `filter_by='company'` is deliberately absent: it resolves to `companyNames`, which this function
+ * has always taken, and giving it a second spelling here would create two ways to say one thing
+ * that could disagree.
+ */
+export interface MatchScope {
+  /** Only friends whose `relationship_owner` is this, folded. */
+  friendOwner?: string | null;
+  /** Only friends who arrived in this import. */
+  friendUploadId?: string | null;
+  /** Only contacts who arrived in this import. */
+  contactUploadId?: string | null;
+}
+
 export class MatcherService {
   /**
    * Score every friend against every contact at any of `companyNames`, keep each friend's best
@@ -190,18 +213,32 @@ export class MatcherService {
    * Facebook rows reporting a question nobody asked; hiding language-excluded friends would erase
    * the one signal that says "run this again in Thai". The header states the source filter so an
    * unexpectedly small denominator is explained on the page rather than by reading this comment.
+   *
+   * `scope` says WHICH ROWS, and it is the internal matcher's half of the same instruction the
+   * external workflow gets as `filter_by` / `filter_value` (see `WebhookService.notify`).
+   * Both matchers have to honour it identically or a scoped run means one thing in dev and another
+   * in production — which is the failure this parameter exists to make impossible, since with the
+   * flag off there is nobody else to select the rows.
+   *
+   * It narrows like `sources` rather than like the language axis: an excluded row is not in the run
+   * at all, rather than in it and unscoreable. That is the right reading — the reader asked about
+   * one company, one owner or one file, and rows outside it were never the question.
    */
   static async run(
     comparisonId: string,
     companyNames: string[] | null,
     compareBy: CompareBy = DEFAULT_COMPARE_BY,
-    sources: string[] | null = null
+    sources: string[] | null = null,
+    scope: MatchScope = {}
   ): Promise<number> {
     const { language, type } = compareByAxes(compareBy);
 
     const [contacts, friends] = await Promise.all([
-      CompanyContactModel.findByCompanies(companyNames),
-      FriendModel.findAllForMatching(sources),
+      CompanyContactModel.findByCompanies(companyNames, scope.contactUploadId ?? null),
+      FriendModel.findAllForMatching(sources, {
+        owner: scope.friendOwner ?? null,
+        uploadId: scope.friendUploadId ?? null,
+      }),
     ]);
 
     // Scored on the stored names directly: they were cleaned and lower-cased at import

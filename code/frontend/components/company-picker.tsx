@@ -1,56 +1,46 @@
 "use client";
 
-import * as React from "react";
-import { ChevronDown, X } from "lucide-react";
-import {
-  DropdownMenu,
-  DropdownMenuCheckboxItem,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
+import { X } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Combobox } from "@/components/combobox";
 import { ALL_COMPANIES_LABEL } from "@extensions/contract";
 import { cn } from "@/lib/utils";
 
 /**
  * Pick the companies to compare against — one, or several.
  *
- * This replaced a plain `Select`, and the shape of the control is the argument for the change: a
- * radio list says "which one of these", and the question is now "which of these". The trigger keeps
- * the Select's exact metrics and border so it still reads as the same field in the same form; what
- * changed is what it can hold.
+ * ── Why this is a combobox now (2026-08-04) ──
  *
- * Built on `DropdownMenu`, which already does the three things this needs and which are genuinely
- * hard to retrofit: a portal that escapes the card's overflow, dismiss-on-outside-click, and
- * keyboard navigation with type-to-jump. What it does NOT do is stay open across a selection —
- * hence the `preventDefault` below, which is the one behaviour we have to take back from it.
+ * It was a `DropdownMenu` over every company on file, and it carried a long, honest note explaining
+ * why it had NO SEARCH BOX: Radix focuses the first item of a menu on open, keeps `onOpenAutoFocus`
+ * private on `MenuRootContentTypeProps`, and runs its own typeahead on the content root, all of
+ * which an input inside it has to fight. Every word of that was true. The note also named its own
+ * expiry date — "if the company list ever grows past what typeahead and a scroll can carry, the
+ * honest fix is a real combobox primitive, not a text input smuggled into a menu" — and at 100k
+ * rows that is where the list is.
  *
- * NO SEARCH BOX, deliberately. A filter input inside a menu cannot reliably hold the caret: Radix
- * focuses the first item on open and keeps `onOpenAutoFocus` private on menus specifically (it is
- * stripped in `MenuRootContentTypeProps`), because a menu is not a combobox. It also runs its own
- * typeahead on the content root, which eats the keystrokes an input would want. Both are fightable
- * with effects and `stopPropagation`, and both fights are lost on the next Radix minor.
+ * So this is the fix it asked for rather than the one it refused. The search box is not smuggled
+ * into a menu; the menu is gone. `components/ui/popover.tsx` has no roving focus and no typeahead
+ * and exposes `onOpenAutoFocus`, so the caret stays in the input without a single
+ * `stopPropagation`, and `components/combobox.tsx` does the searching against the server.
  *
- * The parity argument settles it: the `Select` this replaced had no filter either — both it and
- * this rely on Radix's built-in typeahead, so typing "ban" still jumps to BANGKOK BANK exactly as
- * it did before. Nobody loses a filter they had. If the company list ever grows past what typeahead
- * and a scroll can carry, the honest fix is a real combobox primitive, not a text input smuggled
- * into a menu.
+ * The parity argument the old note closed with survives intact, pointed the other way: typing "ban"
+ * still reaches BANGKOK BANK. It now also reaches the eleventh company starting with B, which
+ * typeahead never could.
  *
- * SELECTION IS NOT SUBMISSION. Ticking a company does not start anything; the Compare button does.
+ * SELECTION IS NOT SUBMISSION. Ticking a company does not start anything; the Run button does.
  * That is what makes an unbounded multi-select safe here — a mis-tick costs a second tick, not a
- * run over the wrong data.
+ * run over the wrong data. It is also why the popover stays open across a tick.
  *
  * ── THREE STATES, AND WHY THIS ONE PICKER NEEDS ALL THREE ──
  *
- * `SourcePicker` has two (`null` = every source, a list = those sources), and the reason it can is
- * that its field is answered the moment the dialog opens: "all friends" is the right run. This
- * field is not. So:
+ * Unchanged by the rebuild, and the reason this file still exists rather than the dialog calling
+ * `Combobox` directly. `SourcePicker` has two (`null` = every source, a list = those sources), and
+ * the reason it can is that its field is answered the moment the dialog opens: "all friends" is the
+ * right run. This field is not. So:
  *
  *   · `[]`      — UNANSWERED. Placeholder, and the dialog's button stays disabled.
- *   · `null`    — every company, chosen deliberately from the menu's first item.
+ *   · `null`    — every company, chosen deliberately from the pinned row.
  *   · `[...]`   — exactly these.
  *
  * The empty array carrying "unanswered" is the one place this departs from the codebase's usual
@@ -63,17 +53,26 @@ import { cn } from "@/lib/utils";
  * stored list is a SNAPSHOT: a run named for the 412 companies on file today still says 412 after
  * tomorrow's import, so a re-run of "everything" quietly stops meaning it. NULL is the standing
  * answer, it is what `comparison.selected_companies` has always used for a whole-table run, and it
- * is what lets the duplicate check see two all-company runs as the same question.
+ * is what lets the duplicate check see two all-company runs as the same question. It is now also
+ * the only shape that COULD express this, since the client no longer holds every name to list.
  */
 export function CompanyPicker({
   companies,
+  total,
+  isLoading,
+  onQueryChange,
   selected,
   onChange,
   disabled,
   id,
   placeholder = "Select companies…",
 }: {
+  /** The page of companies the server returned for the current search — never the whole list. */
   companies: string[];
+  /** How many companies match the search in total. Drives the pinned row's count. */
+  total: number;
+  isLoading?: boolean;
+  onQueryChange: (q: string) => void;
   /** `[]` unanswered · `null` every company · a list, those companies. See the header. */
   selected: string[] | null;
   onChange: (next: string[] | null) => void;
@@ -81,56 +80,38 @@ export function CompanyPicker({
   id?: string;
   placeholder?: string;
 }) {
-  // A Set for the ticks: the list renders per company and `includes` over an array would make
-  // drawing a long list quadratic in the number selected.
-  //
-  // Nothing is ticked under "All companies". The individual boxes answer "which ones", and that
-  // question is not being asked when the answer is "all of them" — ticking all 412 to represent it
-  // would also make unticking one read as "all except this", which is not a run this can express.
-  const picked = React.useMemo(() => new Set(selected ?? []), [selected]);
   const all = selected === null;
 
   /**
-   * Toggling preserves the *picker's* order, not the click order.
+   * Toggling preserves the order the user built, not the picker's.
    *
-   * The list is what names the run, and a run named "BANPU, PTT" when you ticked PTT first reads as
-   * though something reordered your answer. Rebuilding from `companies` means the name always
-   * matches the order on screen — and it is also what the API's tie-break assumes (of two equally
-   * good matches the earlier company wins), so the two agree by construction rather than by luck.
-   */
-  /**
-   * Ticking a box out of "All companies" starts a NAMED selection from that one company, rather
-   * than from all 412 minus none. "All" is not a set here, it is a different answer — see the
-   * header — so there is nothing for the first tick to subtract from.
+   * This is the one behaviour the rebuild had to change, and it is worth stating why. The old
+   * version rebuilt the selection as `companies.filter(c => next.has(c))` — the picker's own
+   * alphabetical order — which was exact while `companies` held every company. It cannot be now:
+   * the array is a SEARCH RESULT, so filtering through it would silently drop every already-picked
+   * company that the current search does not happen to return. Ticking PTT, typing "bang", then
+   * ticking BANGKOK BANK would have discarded PTT.
+   *
+   * So selection order it is, which is stable under a changing options list and is the only order
+   * the client can still know. The API's tie-break (of two equally good matches the earlier company
+   * wins) reads `company_names` as sent, so the run's tie-break now follows the order the user
+   * built rather than the alphabet — a different rule, still a predictable one, and still exactly
+   * the order the trigger and the dialog's summary name it in.
    */
   const toggle = (company: string) => {
-    const next = new Set(all ? [] : picked);
-    if (next.has(company)) next.delete(company);
-    else next.add(company);
-    onChange(companies.filter((c) => next.has(c)));
+    // Ticking out of "All companies" starts a NAMED selection from that one company, rather than
+    // from all 412 minus none. "All" is not a set here, it is a different answer — see the header —
+    // so there is nothing for the first tick to subtract from.
+    const base = all ? [] : (selected ?? []);
+    onChange(base.includes(company) ? base.filter((c) => c !== company) : [...base, company]);
   };
-
-  /**
-   * The way to say "every company", and the only control that sets it.
-   *
-   * It shipped as "Select all N", which ticked every box and emitted the whole list — so "re-run
-   * across everything" was expressible, but only as a snapshot of the names on file at that moment
-   * (see the header for why that decays). It emits NULL now, which is the same answer without the
-   * expiry date, and which `POST /comparisons/compare` has accepted since 2026-08-04.
-   *
-   * The count rides in the trailing slot rather than the label, exactly as SourcePicker's does:
-   * this menu is unbounded by design and the size of "all" should land before the click, but it is
-   * a fact about the choice, not part of its name.
-   */
-  const chooseAll = () => onChange(null);
 
   /**
    * One name, or a count — never a truncated list of names.
    *
    * "PTT, BANGKOK BANK, BLUEB…" in a 9rem field is worse than "3 companies": it commits the space
-   * to the two names you can already see in the open menu, and then lies about the third by cutting
-   * it. The count is the fact the trigger is actually able to carry at this size, and the menu
-   * beneath it holds the detail.
+   * to the two names you can already see in the open list, and then lies about the third by cutting
+   * it. The count is the fact the trigger is actually able to carry at this size.
    */
   const label = all
     ? ALL_COMPANIES_LABEL
@@ -142,79 +123,65 @@ export function CompanyPicker({
 
   return (
     <div className="flex min-w-0 items-center gap-2">
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild disabled={disabled || companies.length === 0}>
-          <button
-            id={id}
-            type="button"
-            className={cn(
-              // Deliberately the SelectTrigger's own classes — this sits where a Select used to and
-              // must not read as a different species of field.
-              "flex h-9 w-full min-w-0 items-center justify-between whitespace-nowrap rounded-md border border-input bg-transparent px-3 py-2 text-sm shadow-sm ring-offset-background",
-              "focus:outline-none focus:ring-1 focus:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
-            )}
-          >
-            {/* Muted only while UNANSWERED. "All companies" is a set value and is styled like
-                one — the same argument SourcePicker makes for its own resting label. */}
-            <span
-              className={cn(
-                "line-clamp-1 text-left",
-                !all && selected.length === 0 && "text-muted-foreground"
-              )}
-            >
-              {label}
-            </span>
-            <ChevronDown className="ml-2 h-4 w-4 shrink-0 opacity-50" aria-hidden />
-          </button>
-        </DropdownMenuTrigger>
+      <Combobox
+        id={id}
+        multiple
+        /* This picker's only home is `NewComparisonDialog`, and a portalled popover inside a dialog
+           makes every tick read as a click outside it — the dialog dismissed itself and took the
+           run with it. Rendering in place keeps the content a descendant of `DialogContent`, which
+           is the containment Radix actually tests. See `Combobox`'s `portal` for the whole story,
+           including why the modal-layer fix that looks right froze the entire page. */
+        portal={false}
+        options={companies.map((c) => ({ value: c, label: c }))}
+        total={total}
+        isLoading={isLoading}
+        onQueryChange={onQueryChange}
+        selected={all ? [] : (selected ?? [])}
+        onSelect={toggle}
+        disabled={disabled}
+        triggerLabel={label}
+        /* Muted only while UNANSWERED. "All companies" is a set value and is styled like one — the
+           same argument SourcePicker makes for its own resting label. */
+        triggerMuted={!all && selected.length === 0}
+        searchPlaceholder="Search companies…"
+        emptyText="No companies match"
+        /*
+          The way to say "every company", and the only control that sets it. Pinned above the
+          results, so it survives a search — see `Combobox`'s `header`.
 
-        <DropdownMenuContent
-          align="start"
-          /* Matches the trigger's width so the menu reads as the field opening rather than as a
-             separate panel, but with a floor — the trigger can be narrow on a phone and a 6rem
-             menu would truncate every company in it. */
-          className="max-h-[min(20rem,var(--radix-dropdown-menu-content-available-height))] w-[var(--radix-dropdown-menu-trigger-width)] min-w-[14rem]"
-        >
-          {/* Inside the menu, not beside the trigger: that row already carries the field plus the
-              clear-X and gets tight on a phone. `inset` puts it on the checkbox items' own `pl-8`,
-              so it aligns with the list it acts on instead of hanging off its left edge. */}
-          <DropdownMenuItem
-            inset
-            onSelect={(e) => e.preventDefault()}
-            onClick={chooseAll}
-            className={cn("font-medium", all && "text-muted-foreground")}
+          It does NOT close the popover, unlike the roster filter's "Everyone": this is a
+          multi-select and the reader may be mid-adjustment. Nothing is ticked underneath it either,
+          because the individual boxes answer "which ones" and that question is not being asked when
+          the answer is "all of them" — ticking all 412 to represent it would also make unticking one
+          read as "all except this", which is not a run this can express.
+
+          The count is `total`, the server's, never `companies.length`: this row's whole job is to
+          say how big "everything" is, and the array beside it is one capped page of it.
+        */
+        header={() => (
+          <button
+            type="button"
+            onClick={() => onChange(null)}
+            className={cn(
+              "flex w-full items-center rounded-sm px-2 py-1.5 text-left text-sm font-medium hover:bg-accent hover:text-accent-foreground",
+              all && "text-muted-foreground"
+            )}
           >
             {ALL_COMPANIES_LABEL}
             <span className="ml-auto pl-3 tabular-nums text-xs text-muted-foreground">
-              {companies.length.toLocaleString()}
+              {total.toLocaleString()}
             </span>
-          </DropdownMenuItem>
-          <DropdownMenuSeparator />
-
-          {companies.map((c) => (
-            <DropdownMenuCheckboxItem
-              key={c}
-              checked={picked.has(c)}
-              /* Keeps the menu open across a tick. Without this it closes on the first company,
-                 which turns picking three into opening the menu three times — i.e. back to the
-                 single Select this replaced, only slower. */
-              onSelect={(e) => e.preventDefault()}
-              onCheckedChange={() => toggle(c)}
-            >
-              <span className="truncate" title={c}>
-                {c}
-              </span>
-            </DropdownMenuCheckboxItem>
-          ))}
-        </DropdownMenuContent>
-      </DropdownMenu>
+          </button>
+        )}
+      />
 
       {/* Only once there is something to clear, and never as the only way out — unticking works
-          too. It earns its place at three companies, where undoing by hand is three trips.
+          too. It earns its place at three companies, where undoing by hand is three trips, and it
+          earns it more now that the three may be spread across three different searches.
 
           Absent under "All companies", which is a chosen answer and not a selection: an X beside it
           would suggest clearing does something, and what it would actually do is un-answer the
-          field and disable the button. The menu's first item is how you get back. */}
+          field and disable the button. The pinned row is how you get back. */}
       {!all && selected.length > 0 && (
         <Button
           type="button"

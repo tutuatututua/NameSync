@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { PaginationQuerySchema } from './common';
+import { OptionsQuerySchema, PaginationQuerySchema, PaginationSchema } from './common';
 import { CompareBySchema } from './compare-by';
 import { ThresholdSchema } from './threshold';
 
@@ -37,10 +37,17 @@ import { ThresholdSchema } from './threshold';
 
 // ── Overview: one roster's connections across every company ──────────────────
 
-/** A company the roster reaches, and how many distinct people reach it. */
+/**
+ * A company on file, and how many distinct people in the roster reach it.
+ *
+ * `connections: 0` is an ordinary row, not an absence: the list is every company on file (see
+ * `NetworkOverviewDataSchema.connected`), so a company nobody knows anyone at appears here with a
+ * zero rather than not appearing at all. Renderers must not treat that as "no data" — it is the
+ * answer, and the row is still worth pressing to see who works there.
+ */
 export const CompanyConnectionSchema = z.object({
   company: z.string(),
-  /** Distinct people (friends) in the roster with a match at this company. */
+  /** Distinct people (friends) in the roster with a match at this company. Zero when none do. */
   connections: z.number(),
   /**
    * How many of those `connections` rest on a whole-name match — always ≤ `connections`, and the
@@ -52,22 +59,70 @@ export const CompanyConnectionSchema = z.object({
 export type CompanyConnection = z.infer<typeof CompanyConnectionSchema>;
 
 /**
+ * How the company list is ordered.
+ *
+ * Two orders, because the list answers two questions and neither can be read off the other.
+ * `connections` is the finding — where does this roster actually land — and stays the default:
+ * every company the roster reaches sorts above every company it does not, so page 1 is still the
+ * finding even though the list now runs to every company on file. `name` is how you CHECK a
+ * finding: "is BANGKOK BANK in here at all" is a lookup, and a list sorted by reach is the one
+ * order in which that question has no answer short of reading every row.
+ */
+export const CompanySortSchema = z.enum(['connections', 'name']);
+export type CompanySort = z.infer<typeof CompanySortSchema>;
+
+/**
  * GET /api/network/overview — `uploader` scopes to one person's roster; omitted means everyone.
  * Matched case-insensitively against `friend.relationship_owner` — whose relationship a friend is,
  * not who imported them. (It was `comparison_result.upload_name` until 2026-07-30; see
  * `api/src/models/network.model.ts` for why an externally-written column stopped being the key.)
+ *
+ * ── `page` / `limit` / `company` / `sort` page ONE FIELD of the payload (2026-08-04) ──
+ *
+ * They govern `connected` and nothing else. Every other number here is a tally over the whole
+ * roster and is deliberately immune to them: a reader searching for "BANGKOK" must not watch
+ * "Companies known" fall to 1, and paging to the second screen of companies cannot change how many
+ * friends they have. The tab therefore reads its tiles from the counts and its list from the page,
+ * which is why `companiesKnown` exists as a field rather than as `connected.length`.
+ *
+ * The list was unbounded until this date and that was the payload's one remaining unbounded thing —
+ * a roster reaching four thousand companies shipped four thousand rows on every drag of the
+ * threshold bar, to draw a list nobody scrolls past the top of.
  */
-export const NetworkOverviewQuerySchema = z.object({
+export const NetworkOverviewQuerySchema = PaginationQuerySchema.extend({
   uploader: z.string().trim().min(1).optional(),
   /** Read every tally on this tab at a bar the reader picked; omitted = the matchers' own
    *  verdicts. See the file header. */
   threshold: ThresholdSchema.optional(),
+  /**
+   * Narrow `connected` to companies whose name contains this, case-insensitively.
+   *
+   * A filter on the LIST, never on the tallies — see the header above. Server-side because the
+   * list is paged: filtering the twenty rows on screen would search page one and call it the
+   * network. It searches every company on file, not only the reached ones, so "is ACME in here"
+   * now has an answer whether or not anybody reaches it.
+   */
+  company: z.string().trim().min(1).optional(),
+  sort: CompanySortSchema.default('connections'),
 });
 export type NetworkOverviewQuery = z.infer<typeof NetworkOverviewQuerySchema>;
 
 export const NetworkOverviewDataSchema = z.object({
-  /** Every uploader who has uploaded friends — the roster picker's options. */
-  uploaders: z.array(z.string()),
+  /**
+   * HOW MANY relationship owners exist — not who they are. The roster picker's options moved to
+   * `GET /api/network/owners` (2026-08-04).
+   *
+   * This field used to be `uploaders: string[]`, every owner on file, and it was the most expensive
+   * thing on the payload for the least reason. The picker needs its options when someone OPENS it;
+   * this endpoint is re-fetched on every drag of the threshold bar, so a database with four thousand
+   * owners shipped four thousand strings per drag to populate a menu nobody had touched. It also
+   * forced the tab to hold the entire list client-side in order to render a `Select`, which is the
+   * shape that has no answer at 100k rows.
+   *
+   * A count and not a boolean, because the tab has two things to decide and `> 0` only settles one:
+   * whether to offer the filter at all, and whether "Everyone" is worth saying beside a number.
+   */
+  owners: z.number(),
   /** The roster this payload describes, or null for "everyone". */
   uploader: z.string().nullable(),
   /** How many friends this roster uploaded — the true roster size, from the friend list itself
@@ -86,14 +141,77 @@ export const NetworkOverviewDataSchema = z.object({
    * goes *inside* the number instead, as the Matched tile's hint.
    */
   friendsConfirmed: z.number(),
-  /** Every distinct company on file — the denominator for "no connection". */
+  /** Every distinct company on file — the denominator for "no connection", and (bar the odd
+   *  company named only by a run whose contacts are gone) the length of the whole `connected`
+   *  list before `company` narrows it. */
   companiesOnFile: z.number(),
-  /** Total distinct (person, company) matches — one person counted once per company they reach. */
+  /** Total distinct (person, company) matches — one person counted once per company they reach.
+   *  Over the WHOLE roster, not over the page of `connected` below. */
   connections: z.number(),
-  /** Companies the roster reaches ("companies known"), strongest first. `companiesKnown = connected.length`. */
+  /**
+   * How many companies the roster REACHES — the "Companies known" tile.
+   *
+   * A field rather than `connected.length`, which is what it was until `connected` became a page,
+   * and which it is now further than ever from being: the list holds every company on file, so its
+   * length is the denominator and this is the numerator. Counted before `company` narrows anything,
+   * because the tile states a fact about the roster and a number that fell to 1 while somebody
+   * typed a search would be answering a question nobody asked.
+   */
+  companiesKnown: z.number(),
+  /**
+   * One page of the companies, in the order `sort` asked for.
+   *
+   * EVERY COMPANY ON FILE, not only the reached ones (2026-08-06) — a company nobody in the roster
+   * knows anyone at is a row with `connections: 0`, not a row that is missing. It was the reached
+   * set until then, which left "ACME is not in this list" meaning either "no contacts on file" or
+   * "contacts, but no connection" with no way to tell the two apart; the second is the actionable
+   * one and was the one being hidden.
+   *
+   * The tallies above deliberately did NOT follow: `companiesKnown` is still the reach. So a fresh
+   * database reads "Companies known 0 of 412" over a list of 412 rows each saying "no connections",
+   * which is the honest picture — the companies exist, the connections do not yet.
+   */
   connected: z.array(CompanyConnectionSchema),
+  /** Where that page sits — `total` is how many companies match `company` (all of them when it is
+   *  unset), never how many are reached. */
+  connectedPagination: PaginationSchema,
 });
 export type NetworkOverviewData = z.infer<typeof NetworkOverviewDataSchema>;
+
+// ── The roster picker's options, searched server-side ────────────────────────
+
+/**
+ * GET /api/network/owners — distinct relationship owners, matching `q`, capped at `limit`.
+ *
+ * Its own endpoint rather than a field on the overview payload, and the split is the same one
+ * `GET /network/grading` already makes: this describes what the PICKER can offer, which changes
+ * only when friends are imported, where the overview describes a reading of the results and changes
+ * on every turn of the threshold bar. Folding them together meant re-sending a slow-moving list at
+ * the cadence of a fast-moving one.
+ *
+ * Searched on the server because at this database's size the client cannot hold the list: see
+ * `frontend/components/combobox.tsx` for why the answer is a capped search rather than a virtualized
+ * scroll. `q` is a case-insensitive substring over `friend.relationship_owner`.
+ *
+ * A read, and one a reviewer needs — it populates the filter on the only page they can open — so it
+ * is on the reviewer allowlist beside the other `/api/network` reads.
+ */
+export const OwnerOptionsQuerySchema = OptionsQuerySchema;
+export type OwnerOptionsQuery = z.infer<typeof OwnerOptionsQuerySchema>;
+
+export const OwnerOptionsDataSchema = z.object({
+  /** The slice — at most `limit`, one display spelling per case-folded owner, alphabetical. */
+  owners: z.array(z.string()),
+  /**
+   * How many owners match `q` in total, which is usually MORE than `owners.length`.
+   *
+   * The picker states the gap ("Showing 50 of 1,204"). Without it a capped list reads as a complete
+   * one, and "your colleague has not uploaded anything" is a very different thing to tell someone
+   * than "your colleague is not in the first fifty alphabetically".
+   */
+  total: z.number(),
+});
+export type OwnerOptionsData = z.infer<typeof OwnerOptionsDataSchema>;
 
 // ── How much of the stored evidence the bar can move ─────────────────────────
 
@@ -170,22 +288,67 @@ export type UploadersData = z.infer<typeof UploadersDataSchema>;
  * Smith"), so it rides alongside the uploaded name rather than replacing it.
  */
 export const MatchedPersonSchema = z.object({
+  /**
+   * WHICH PERSON this finding is about — `friend.person_key`, stable across every row and every
+   * run for one person.
+   *
+   * The client needs it because this list is one entry per RUN: the same pairing found by an
+   * `en_full` run and a `th_given` run is two entries, and nothing else on the object identifies
+   * them as one person. Not the name — `friend` is the spelling the RUN scored, so the two entries
+   * legitimately carry different strings for the same human.
+   *
+   * Everything the UI counts as "people" (the section header, the confirmed split) folds on this;
+   * everything it LISTS does not. That is the same split the server makes.
+   */
+  friendKey: z.string(),
+  /**
+   * WHICH CONTACT this finding names — `company_contact.person_key`, reached through
+   * `comparison_result.company_contact_id`.
+   *
+   * The other half of the pairing, and the field this list was unreadable without. `friendKey`
+   * alone says which of the owner's friends a row is about; it says nothing about who they were
+   * matched TO, and one friend routinely lands on several different contacts at one company — a
+   * surname run finds `arunee rojanapruk`, a given-name run finds `arnat wongsawat`, and both are
+   * rows about `arnat rojanapruk` at BANGKOK BANK. Folded on `friendKey` alone those are one
+   * person's "two findings", which is how the roster page rendered them: one name, with the second
+   * match reduced to an anonymous "also found by <run>" line naming a completely different human.
+   *
+   * A CONNECTION IS A PAIRING. The client groups on (`friendKey`, `contactKey`), so repeated
+   * findings collapse only when they really are the same claim found again, and a second contact
+   * gets a row of its own carrying their name.
+   *
+   * The identity, never the display name — see `ComparisonResult.company_contact_id`: the text
+   * columns below are the frozen record of what was compared, and resolving a name through the id
+   * is how a rename starts rewriting history. This is for grouping and counting only.
+   *
+   * Null when the row names no contact row: an external workflow that posted a match without one,
+   * or a contact deleted since (`ON DELETE SET NULL`). The client then falls back to the frozen
+   * names below as the identity — two findings naming the same contact strings are the same claim —
+   * which is weaker (a Thai run and an English run record different strings for one person, so it
+   * over-splits) but never merges two people, which is the failure that matters.
+   */
+  contactKey: z.string().nullable(),
   /** The friend's name as uploaded (their social name), cleaned + lower-cased. */
   friend: z.string(),
-  /** The matched contact's English name, or null if the contact has only a Thai one. */
+  /**
+   * The matched contact's English name, or null if the contact has only a Thai one.
+   *
+   * FROZEN TEXT AS THE RUN RECORDED IT, which on this database means it is not reliably English:
+   * the external workflow writes the spelling it scored into this column, so a `th_*` run leaves a
+   * Thai name here and an identical one in `th`. Renderers must treat the two as one name when the
+   * strings match rather than printing both — see the roster page's `contactNames`.
+   */
   en: z.string().nullable(),
-  /** The matched contact's Thai name, or null. */
+  /** The matched contact's Thai name, or null. Same frozen-text caveat as `en`. */
   th: z.string().nullable(),
   /**
-   * How close the match was, in [0, 1] — the score of the STRONGEST-MODE run that matched this
-   * pairing, and the best score among the runs that share that mode.
+   * How close the match was, in [0, 1] — THIS run's score for this pairing.
    *
-   * It used to be `max(similarity)` across every run on file, and that was a category error: a
+   * It was once `max(similarity)` across every run on file, and that was a category error: a
    * surname run and a full-name run measure different things, so the maximum of the two could carry
    * a surname run's number onto a pairing a full-name run confirmed — the score and the claim
-   * beside it coming from two different runs. The fold is now "strongest mode first, then best
-   * score", which is the same argument the near-miss query already makes about composing a person
-   * who does not exist.
+   * beside it coming from two different runs. The score and the mode beside it come from ONE result
+   * row, which is what this object now IS.
    *
    * Read it together with `mode`: the number is only meaningful as a measurement OF something, and
    * `mode` is what it measured. On a partial mode the UI states the unit (`surname 94%`).
@@ -204,6 +367,24 @@ export const MatchedPersonSchema = z.object({
    * pre-chewed label the client could disagree with.
    */
   mode: CompareBySchema,
+  /**
+   * WHICH RUN FOUND THIS — and why one pairing can now appear more than once in a group.
+   *
+   * This list used to hold at most one entry per (company, friend): a `DISTINCT ON` kept the
+   * strongest-mode row and dropped the rest. That silently discarded the second half of the exact
+   * comparison people re-import in order to make — an `en_full` finding beside a `th_given` one —
+   * because `full` outranks `given`, so the Thai answer simply vanished from the page.
+   *
+   * Both are shown now, one entry per run, and these two fields are what make that legible rather
+   * than looking like a duplicate row: the same pairing under two modes is two findings, and each
+   * says which comparison produced it.
+   *
+   * The COUNTS deliberately do not follow: a person matched under two modes is one connection.
+   * See `friendsMatched` and the company tiles.
+   */
+  runId: z.string(),
+  /** The run's name, for the label beside the mode. Null for a run nobody named. */
+  runName: z.string().nullable(),
 });
 export type MatchedPerson = z.infer<typeof MatchedPersonSchema>;
 
@@ -313,10 +494,23 @@ export type UploaderDetailData = z.infer<typeof UploaderDetailDataSchema>;
 // ── Search: find a person, see their company and its connections ─────────────
 
 /**
- * GET /api/network/search — two ways in, exactly one required:
+ * GET /api/network/search — two ways in, at least one required:
  *   · `q`       — free text, matched against a person's name or their company (case-insensitive).
  *   · `company` — an EXACT company name; returns everyone at that company. Powers the company
- *                 popup opened from the Overview, where the company is known precisely.
+ *                 page, where the company is known precisely.
+ *
+ * ── Both together is a third, narrower thing (2026-08-04) ──
+ *
+ * `company` used to WIN outright when both arrived, so a `q` sent beside it was silently dropped.
+ * The company page is paged twenty contacts at a time, and a company with four hundred people on
+ * file cannot be searched by eye across twenty pages — so its search box sends `q` alongside the
+ * exact `company`, and the two AND together: everyone at THIS company whose name contains that.
+ *
+ * The asymmetry is deliberate. `q` alone searches the person names AND the company (it is a lookup
+ * across the whole table, and "PTT" is a perfectly good thing to type into it); `q` beside a
+ * `company` searches the person names ONLY, because the company is already answered and matching it
+ * again would make every contact at "BANGKOK BANK" a hit for "bangkok" — a filter that filters
+ * nothing.
  */
 export const NameSearchQuerySchema = PaginationQuerySchema.extend({
   q: z.string().trim().min(1).optional(),

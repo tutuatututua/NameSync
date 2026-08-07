@@ -35,12 +35,13 @@ const CO_CSV = "company_name,thai_name,eng_name\nACME,สมชาย ใจด�
 async function importFriends(
   headers: string,
   rows: string[],
-  opts: { owner?: string; compareBy?: string } = {}
+  opts: {
+    owner?: string;
+  } = {}
 ) {
   const form = new FormData();
   form.append("name", "Friends");
   form.append("uploadPersonName", opts.owner ?? "Alex");
-  if (opts.compareBy) form.append("compareBy", opts.compareBy);
   form.append("facebookFile", Buffer.from(`${headers}\n${rows.join("\n")}\n`, "utf8"), {
     filename: "friends.csv",
     contentType: "text/csv",
@@ -48,12 +49,19 @@ async function importFriends(
   return app.inject({ method: "POST", url: "/api/comparisons/run", payload: form, headers: form.getHeaders() });
 }
 
+/**
+ * The friends on file, as PEOPLE — the fold, not the raw table.
+ *
+ * Imports stack, so `friend` holds a row per (person, import); `friend_current` is one row per
+ * person with each language resolved to the oldest row that had one. That resolution is what
+ * REPLACED enrichment, so these tests assert it in the place it now happens.
+ */
 const storedFriends = async (): Promise<
   { en: string | null; th: string | null; owner: string | null }[]
 > => {
   const rows = await sql<{ en: string | null; th: string | null; owner: string | null }>`
     select friend_name_en as en, friend_name_th as th, relationship_owner as owner
-      from lakeshore.friend order by id asc
+      from lakeshore.friend_current order by id asc
   `.execute(await db());
   return rows.rows;
 };
@@ -86,18 +94,16 @@ beforeEach(async () => {
   mock.state.compare.length = 0;
 });
 
-describe("the import stores every friend, whatever the run's mode", () => {
-  it("stores English-only friends on a th_full import — the mode scores, it does not filter", async () => {
+describe("the import stores every friend, whatever a run could score", () => {
+  it("stores Thai-only friends on an import — the run scores, it does not filter", async () => {
     await importCompany(app, { csv: CO_CSV, owner: "Alex" });
-    const res = await importFriends(
-      "name",
-      ["สมชาย ใจดี", "Preecha Wong", "Malee Srisai"],
-      { compareBy: "th_full" }
-    );
+    const res = await importFriends("name", ["สมชาย ใจดี", "Preecha Wong", "Malee Srisai"]);
     expect(res.statusCode, res.body).toBe(200);
 
-    // ALL THREE are on file. Two of them have no Thai name and could not be scored by this run —
-    // that is a fact about the run, and it must not become a fact about the database.
+    // ALL THREE are on file. The import's own run is `en_full` and could not score the Thai-only
+    // one — that is a fact about the run, and it must not become a fact about the database. It is
+    // also what a later `th_*` run from the Network page depends on: it can only find rows that
+    // are here.
     const friends = await storedFriends();
     expect(friends).toHaveLength(3);
     expect(friends.filter((f) => f.th !== null)).toHaveLength(1);
@@ -164,9 +170,21 @@ describe("a friend matched in both languages counts ONCE", () => {
     expect(detail.friends).toBe(1);
     expect(detail.matched).toBe(1);
     expect(detail.noMatch).toBe(0);
-    // One company section, one person in it — not the same person twice under their two names.
+    // One company section, and BOTH runs' findings in it — the Thai one and the English one, each
+    // labelled with the mode that produced it. Comparing those two is the entire reason anyone runs
+    // the second comparison, and until 2026-08-04 the page discarded the weaker mode and showed one.
     expect(detail.matchedByCompany).toHaveLength(1);
-    expect(detail.matchedByCompany[0].people).toHaveLength(1);
+    const people = detail.matchedByCompany[0].people;
+    expect(people).toHaveLength(2);
+    expect(people.map((p) => p.mode).sort()).toEqual(["en_full", "th_full"]);
+    // Two findings, ONE person. This is the line that keeps the split honest: the list grows with
+    // the number of questions asked, the counts never do. `confirmed` is people too — a friend
+    // confirmed by two whole-name runs is one person to introduce you, not two.
+    expect(new Set(people.map((p) => p.friendKey)).size).toBe(1);
+    expect(detail.matchedByCompany[0].confirmed).toBe(1);
+    // Each finding names the run behind it, so two rows for one pairing read as two answers rather
+    // than as duplicated data.
+    expect(new Set(people.map((p) => p.runId)).size).toBe(2);
   });
 
   it("still counts a friend whose result row carries no friend_id — the external-workflow path", async () => {
@@ -219,7 +237,8 @@ describe("enrichment — fill a null spelling, never overwrite one", () => {
     // The same person from a business card, which prints both. A strict key over the pair would
     // make this a second roster entry — a visible regression, and the reason the key is "either
     // spelling" rather than "both".
-    const res = await importFriends("eng_name,thai_name", ['"Somchai Jaidee",สมชาย ใจดี']);
+    const res = await importFriends("eng_name,thai_name", ['"Somchai Jaidee",สมชาย ใจดี'], {
+    });
     expect(res.statusCode).toBe(200);
 
     expect(await storedFriends()).toEqual([{ en: "somchai jaidee", th: "สมชาย ใจดี", owner: "Alex" }]);
@@ -233,7 +252,8 @@ describe("enrichment — fill a null spelling, never overwrite one", () => {
     // every row an external workflow wrote, so an overwrite would orphan those rows and break the
     // counts retroactively and silently. The stored value wins; the console is the visible way to
     // change a name on purpose.
-    const res = await importFriends("eng_name,thai_name", ['"Somchai Jaidee",สมชาย ใจงาม']);
+    const res = await importFriends("eng_name,thai_name", ['"Somchai Jaidee",สมชาย ใจงาม'], {
+    });
     expect(res.statusCode).toBe(200);
 
     expect(await storedFriends()).toEqual([{ en: "somchai jaidee", th: "สมชาย ใจดี", owner: "Alex" }]);
@@ -259,21 +279,39 @@ describe("enrichment — fill a null spelling, never overwrite one", () => {
     ]);
   });
 
-  it("an enrich-only import is not a no-op — it opens a run and reports what changed", async () => {
+  it("a re-import that names nobody new still imports its rows and opens a run", async () => {
     await importCompany(app, { csv: CO_CSV, owner: "Alex" });
     await importFriends("name", ["Somchai Jaidee"]);
 
-    // Adds no row, but the friend now carries a Thai spelling no run has ever matched against.
-    // Before bilingual friends, "an import that adds nothing sends no request at all" was correct
-    // because nothing had changed; it is not correct any more.
+    /**
+     * The second file names the same PERSON and is not a duplicate ROW — which is the distinction
+     * the drop key exists to make.
+     *
+     * It carries a Thai spelling the stored row does not have. The key compares every column, so
+     * "same person, more information" fails to match and the row is written; only a row that adds
+     * nothing at all is dropped. Nothing is counted as a duplicate here, and that is the correct
+     * reading rather than a near miss.
+     *
+     * This used to report `facebookAdded: 0`, because a row matching an existing PERSON was
+     * skipped. That was the bug: the row never landed under THIS upload, so the external workflow
+     * — which selects by `upload_id` — could not see it, and the import opened no run at all.
+     */
     const res = await importFriends("eng_name,thai_name", ['"Somchai Jaidee",สมชาย ใจดี']);
     const data = res.json().data;
-    expect(data.facebookAdded).toBe(0);
+    expect(data.facebookAdded).toBe(1);
+    expect(data.facebookDuplicates).toBe(0);
     expect(data.sessionId).not.toBeNull();
 
-    // The enriched row is matchable by a Thai run, which is the point of storing it.
+    // Still ONE person, with both spellings resolved across their two rows — the fold doing what
+    // enrichment used to do to a single row.
+    expect(await storedFriends()).toEqual([
+      { en: "somchai jaidee", th: "สมชาย ใจดี", owner: "Alex" },
+    ]);
+
+    // And matchable by a Thai run, which is the point of storing the second spelling at all.
     await startCompare(app, ["ACME"], "th_full");
     const ov = await overview("Alex");
+    expect(ov.friends).toBe(1);
     expect(ov.friendsMatched).toBe(1);
   });
 });

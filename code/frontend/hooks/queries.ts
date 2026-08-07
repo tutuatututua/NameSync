@@ -1,9 +1,41 @@
 "use client";
 
 import { useQuery, keepPreviousData } from "@tanstack/react-query";
-import type { CompareBy, SourceType, TableQueryBody } from "@extensions/contract";
-import { api, type RunRowsParams, type UploadListParams } from "@/lib/api/client";
+import type {
+  CompanySort,
+  CompareBy,
+  RequestedScope,
+  SourceType,
+  TableQueryBody,
+} from "@extensions/contract";
+import { api, type RunListFilter, type RunRowsParams, type UploadListParams } from "@/lib/api/client";
 import { qk } from "./queryKeys";
+
+// ── Audit trail ─────────────────────────────────────────────────────────────
+
+/**
+ * Every tally on the Audit trail.
+ *
+ * `placeholderData: keepPreviousData` because the window selector re-fetches the whole payload to
+ * change one chart: without it, switching from 30 to 90 days blanks eleven tiles that are not going
+ * to change, and the page strobes on a control that moves a sparkline.
+ */
+export function useAuditSummary(days: number) {
+  return useQuery({
+    queryKey: qk.auditSummary(days),
+    queryFn: () => api.audit.summary(days),
+    placeholderData: keepPreviousData,
+  });
+}
+
+/** The trail — runs and imports interleaved, newest first. */
+export function useAuditActivity(params: { page: number; limit: number; kind?: "run" | "import" }) {
+  return useQuery({
+    queryKey: qk.auditActivity(params),
+    queryFn: () => api.audit.activity(params),
+    placeholderData: keepPreviousData,
+  });
+}
 
 // ── Database console ────────────────────────────────────────────────────────
 
@@ -70,9 +102,44 @@ export function useDataStats() {
   return useQuery({ queryKey: qk.dataStats(), queryFn: api.comparisons.dataStats });
 }
 
-/** Distinct companies you can compare against (populated as company data is imported). */
-export function useCompanies() {
-  return useQuery({ queryKey: qk.companies(), queryFn: () => api.comparisons.companies().then((d) => d.companies) });
+/**
+ * Distinct companies you can compare against — the picker's options for one search.
+ *
+ * Returns the whole payload rather than just the array, and callers must respect the difference:
+ * `companies` is a capped SLICE and `total` is how many matched. The one number that must never
+ * come from `.length` is the size of an all-companies run (see `CompaniesDataSchema.total`).
+ *
+ * `placeholderData: keepPreviousData` for the same reason the overview has it — the list holds
+ * still while the next search lands, so typing narrows a visible list instead of flashing an empty
+ * one between every keystroke.
+ */
+export function useCompanies(q = "") {
+  return useQuery({
+    queryKey: qk.companies(q),
+    queryFn: () => api.comparisons.companies(q || undefined),
+    placeholderData: keepPreviousData,
+  });
+}
+
+/**
+ * The roster filter's options for one search — names only, no tallies, no threshold.
+ *
+ * Deliberately not folded into `useNetworkOverview`, where this list lived until 2026-08-04: the
+ * options change when friends are imported, the overview changes on every drag of the threshold
+ * bar, and pairing them meant re-sending the slower list at the faster one's cadence.
+ *
+ * `enabled` is for the caller that only wants owners for a query somebody actually typed. The
+ * Network query bar reads this beside a company search: an empty box means "show the whole list",
+ * which is a statement about companies and not a request for every owner on file.
+ */
+export function useOwnerOptions(q = "", enabled = true) {
+  return useQuery({
+    queryKey: qk.networkOwners(q),
+    queryFn: () => api.network.owners(q || undefined),
+    placeholderData: keepPreviousData,
+    staleTime: 60 * 1000,
+    enabled,
+  });
 }
 
 /** The import "type" pick-list. Rarely changes and is read on every import screen, so it is
@@ -103,12 +170,17 @@ export function useUploadSources() {
 export function useDuplicateRun(
   companyNames: string[] | null,
   compareBy: CompareBy,
-  sources: string[] | null
+  sources: string[] | null,
+  /** The run's scope, when the dialog was opened on one. Part of the question, so part of the key. */
+  scope?: RequestedScope | null
 ) {
   return useQuery({
-    queryKey: qk.duplicateRun(companyNames, compareBy, sources),
-    queryFn: () => api.comparisons.duplicateRun(companyNames, compareBy, sources),
-    enabled: companyNames === null || companyNames.length > 0,
+    queryKey: qk.duplicateRun(companyNames, compareBy, sources, scope),
+    queryFn: () => api.comparisons.duplicateRun(companyNames, compareBy, sources, scope),
+    // A SCOPED run always has a question to ask, even with no company selected: its rows come from
+    // the scope, not from the picker. Only the unscoped dialog has an "unanswered" state worth
+    // waiting through — see `CompanyPicker`, where `[]` is unanswered and `null` is every company.
+    enabled: !!scope || companyNames === null || companyNames.length > 0,
     staleTime: 0,
   });
 }
@@ -140,10 +212,26 @@ export function useNetworkGrading() {
  * the new ones land. It is on the roster read for the same reason, since that page is reached at a
  * bar and can be re-tuned from the link that brought you there.
  */
-export function useNetworkOverview(uploader: string | null, threshold?: number) {
+export function useNetworkOverview(
+  uploader: string | null,
+  threshold?: number,
+  /** Which slice of the reached-companies list to fetch. The tallies in the payload ignore it —
+   *  see NetworkOverviewQuerySchema — so a search here narrows the list and not the tiles. */
+  list: { company?: string; sort?: CompanySort; page?: number; limit?: number } = {}
+) {
   return useQuery({
-    queryKey: qk.networkOverview(uploader, threshold),
-    queryFn: () => api.network.overview(uploader ?? undefined, threshold),
+    queryKey: qk.networkOverview(uploader, threshold, list),
+    queryFn: () =>
+      api.network.overview({
+        uploader: uploader ?? undefined,
+        threshold,
+        // Empty is "no search", and must be omitted rather than sent: the schema's `min(1)` would
+        // reject `company=`, and the tab sets this from an input that starts empty.
+        company: list.company?.trim() || undefined,
+        sort: list.sort,
+        page: list.page,
+        limit: list.limit,
+      }),
     placeholderData: keepPreviousData,
   });
 }
@@ -220,8 +308,36 @@ export function useUploadSessions(params: UploadListParams) {
 
 /** "Past runs" — every comparison, newest first. There is no saved-snapshot table to read
  *  from any more: the run is the record, and useResults(id) reads its rows. */
-export function useComparisons() {
-  return useQuery({ queryKey: qk.comparisons(), queryFn: api.comparisons.list });
+/**
+ * Past runs — every one, or the ones covering one scope.
+ *
+ * `filter` is what puts a run on the page its scope belongs to: a company's runs on the company
+ * page, an owner's on theirs, the unscoped ones on the Network workspace. Omitted is every run.
+ * See `RunListFilter`.
+ */
+export function useComparisons(filter?: RunListFilter) {
+  return useQuery({
+    queryKey: qk.comparisons(filter),
+    queryFn: () => api.comparisons.list(filter),
+  });
+}
+
+/**
+ * One page of run SUBJECTS — what `RecentRuns` reads.
+ *
+ * `keepPreviousData` for the same reason the network reads have it, and it matters more here: the
+ * search runs on the server now, so without it every pause while typing blanks the list to a
+ * skeleton and the reader is narrowing against nothing. The previous page stays on screen, dimmed
+ * by the caller, until the next one lands.
+ */
+export function useRunSubjects(
+  params: RunListFilter & { q?: string; page: number; limit: number }
+) {
+  return useQuery({
+    queryKey: qk.comparisonSubjects(params),
+    queryFn: () => api.comparisons.subjects(params),
+    placeholderData: keepPreviousData,
+  });
 }
 
 /** @param threshold read the run at this bar rather than at its stored verdicts. Undefined is the

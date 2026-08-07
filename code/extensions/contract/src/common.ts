@@ -42,6 +42,30 @@ export const PaginationQuerySchema = z.object({
 });
 export type PaginationQuery = z.infer<typeof PaginationQuerySchema>;
 
+/**
+ * What a PICKER asks for — a searched, capped slice of some column's distinct values.
+ *
+ * Not `PaginationQuerySchema`, and the missing `page` is the point. These feed comboboxes, where
+ * the way to reach an option that is not on screen is to TYPE, never to page: nobody walks to page
+ * 40 of an alphabetical company list looking for one name. Offering a page number would also make
+ * the cursor meaningful across a changing table, which for a list that shifts on every import it
+ * is not.
+ *
+ * The endpoints return `total` alongside the slice so the caller can say what it is not showing.
+ * That number is load-bearing beyond the notice: "all companies" runs report their own size from
+ * it, and reading a capped array's `.length` instead would tell someone their whole-database run
+ * covers 50 companies when it covers four thousand.
+ */
+export const OPTION_LIMIT_DEFAULT = 50;
+export const OPTION_LIMIT_MAX = 200;
+
+export const OptionsQuerySchema = z.object({
+  /** Case-insensitive substring. Omitted means the head of the list, not "no results". */
+  q: z.string().trim().min(1).optional(),
+  limit: z.coerce.number().int().min(1).max(OPTION_LIMIT_MAX).default(OPTION_LIMIT_DEFAULT),
+});
+export type OptionsQuery = z.infer<typeof OptionsQuerySchema>;
+
 /** `{ success: true, message?, data }` */
 export const apiSuccess = <T extends z.ZodTypeAny>(data: T) =>
   z.object({ success: z.literal(true), message: z.string().optional(), data });

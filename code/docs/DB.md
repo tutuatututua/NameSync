@@ -112,10 +112,18 @@ whatever schema the runner happened to land in.
   reason — it counts "Not compared" off `friend`, and without the filter a LinkedIn run would
   count Facebook friends it never looked at.
 
-  **Nothing stops a run being repeated.** There is no unique index on `comparison` beyond its
-  primary key, deliberately: re-running after importing more friends is correct, and the server
-  cannot tell that time from a misclick. `GET /api/comparisons/duplicate` is advisory only — it
-  drives a callout in the new-run dialog and the POST that follows does not consult it.
+  **A run cannot be repeated while it would read the same rows** (2026-08-06). There is still no
+  unique index on `comparison` beyond its primary key, and there deliberately never will be: the
+  rule is not "this run already exists" — re-running after importing more friends is correct — but
+  "this run already exists *and nothing it reads has moved since*", which no constraint can express.
+  `GET /api/comparisons/duplicate` returns that verdict as `blocked`, the compare dialog disables
+  its button on it, and `POST /api/comparisons/compare` reaches the same verdict itself and answers
+  **409**. Both go through `duplicateVerdict` in `routes/comparisons.route.ts`, which composes
+  `ComparisonModel.findDuplicates` (same scope, companies, mode, sources) with
+  `FriendModel.changedSince` / `CompanyContactModel.changedSince` — each narrowed to the rows that
+  run actually reads, so a LinkedIn run is not unblocked by a Facebook import. Importing a covered
+  friend or contact lifts the block on its own; nothing has to be deleted. Import-driven runs are
+  untouched by any of it, since an import has by definition just added rows.
 - **`upload_source` is a pick-list, not a constraint.** Nothing has a foreign key into it, so
   `upload.source` / `friend.source` accept any string (the Database console writes them directly),
   and deleting an entry only removes the option — rows keep their value and still group. That

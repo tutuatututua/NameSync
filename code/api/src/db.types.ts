@@ -84,7 +84,63 @@ export interface Friend {
    * friend.model.ts.
    */
   relationship_owner: string | null;
+  /**
+   * WHICH PERSON THIS ROW IS ABOUT — one uuid shared by every row that is the same person.
+   *
+   * Imports STACK: every row of every import is inserted under that import's own `upload_id`,
+   * because the external workflow selects what to match with `WHERE upload_id = :session_id` and
+   * cannot see rows filed under an earlier import. So the same person re-imported is several rows
+   * on purpose, and this is what folds them back to one at read time.
+   *
+   * Assigned at import by the same matching that used to decide whether to skip the insert
+   * (`FriendModel.mergeUpload`): same owner, and either spelling equal. Rows written by the
+   * Database console get their own uuid from the column DEFAULT, so a hand-added row is its own
+   * person rather than NULL — which would fold every such row into one.
+   *
+   * A SHARED TOKEN, not an `is_latest` flag, and the difference matters: the relation is
+   * transitive (a row carrying both spellings links an English-only row to a Thai-only one), so a
+   * boolean would have to be recomputed on every import, console edit and delete — and a delete
+   * would have to promote a survivor or the person disappears. Deleting a row here leaves the
+   * others' token untouched.
+   *
+   * READ RULE: a question about PEOPLE folds on this (or reads `friend_current`); a question
+   * about an IMPORT or a RUN does not — see `FriendCurrent` below.
+   */
+  person_key: string;
   status: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * One row per person — `friend`, folded on `person_key`. A database view; see
+ * docs/migrations/2026-08-04-stack-imports-and-person-key.sql.
+ *
+ * Read this wherever the question is about PEOPLE: how many friends are on file, who is in a
+ * roster, how many friends each source holds. Read the raw `friend` table wherever the question
+ * is about an IMPORT or a RUN — progress counting, an upload's own rows, the webhook payload,
+ * rollback. Folding those would break progress outright, since a run's denominator IS its copies.
+ *
+ * `friend_name_en` / `friend_name_th` are COALESCED across the person's rows (most recent
+ * non-null per language), not taken from the newest row whole. That is what replaces enrichment:
+ * a friend imported in English and later in Thai is two rows with one spelling each, and picking
+ * the newest row would lose the English name an `en` run still matches on.
+ *
+ * `id` is the person's FIRST row — stable, so it does not move when they are re-imported. It is
+ * what the matcher stamps as `comparison_result.friend_id` and what the roster orders by, and both
+ * would be needlessly unstable under a "latest row" id.
+ *
+ * `upload_id` and `status` are deliberately ABSENT. They describe one import's copy, so there is no
+ * honest value for them here — and leaving them out means a run-scoped query cannot accidentally be
+ * written against the fold. Progress counting reads the raw table; this is not the relation for it.
+ */
+export interface FriendCurrent {
+  person_key: string;
+  id: string;
+  source: string;
+  relationship_owner: string | null;
+  friend_name_en: string | null;
+  friend_name_th: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -113,7 +169,31 @@ export interface CompanyContact {
   company_name: string | null;
   person_name_th: string | null;
   person_name_en: string | null;
+  /**
+   * Which contact this row is about — the company-side twin of `Friend.person_key`, with the same
+   * stacking rationale. See that comment first.
+   *
+   * Scoped WITHIN a company: the same name at two employers is two contacts, which is a fact about
+   * the data rather than a duplicate. Linked on EITHER spelling, like the friend side and unlike
+   * the old dedup key, which was the plain tuple (company, th, en) — under that key the same
+   * person imported once with only the English column mapped and again with only the Thai column
+   * was two rows, and the Network page counted them as two people. A row carrying BOTH names now
+   * links the two.
+   */
+  person_key: string;
   status: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** One row per contact — `company_contact` folded on `person_key`. The company-side twin of
+ *  `FriendCurrent`; the same read rule applies. */
+export interface CompanyContactCurrent {
+  person_key: string;
+  id: string;
+  company_name: string | null;
+  person_name_en: string | null;
+  person_name_th: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -142,7 +222,31 @@ export interface Comparison {
    * Database console — or from one predating the column.
    */
   compare_by: string | null;
+  /**
+   * WHICH ROWS this run covered — the axis, and the one value it takes. See `FilterBy` in the
+   * contract, and docs/add-comparison-scope.sql for why they arrived together.
+   *
+   * A pair: both are set, or neither is. NULL is "nobody recorded a scope" — a run predating the
+   * columns, or one written around the app — and is deliberately NOT resolved to `upload` the way
+   * a NULL `compare_by` resolves to the default. A missing mode has a knowable answer; a missing
+   * scope does not, and guessing one would claim an import opened a run that may have been started
+   * from the compare dialog.
+   */
+  filter_by: string | null;
+  filter_value: string | null;
   expected_batches: number | null;
+  /**
+   * Who STARTED this run — defaulted from the signed-in account at every creation site.
+   *
+   * Null is meaningful rather than missing: a run predating this column (added 2026-08-04, see
+   * docs/add-comparison-created-by.sql) or written around the app has no actor on file. The Audit
+   * trail falls back to the uploader of the import that opened the run, and shows nothing when
+   * there is neither — it never guesses.
+   *
+   * NOT interchangeable with `upload.uploaded_by`, even though they are usually the same person:
+   * whoever imported a friends list need not be whoever later pressed Compare against it.
+   */
+  created_by: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -265,6 +369,10 @@ export interface DB {
   upload_source: UploadSource;
   friend: Friend;
   company_contact: CompanyContact;
+  // The read-time folds. Views, not tables — Kysely does not care, but a writer would: never
+  // insert, update or delete through these.
+  friend_current: FriendCurrent;
+  company_contact_current: CompanyContactCurrent;
   comparison: Comparison;
   comparison_result: ComparisonResult;
   saved_query: SavedQuery;

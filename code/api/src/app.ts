@@ -16,6 +16,7 @@ import { corsOrigins, isProduction, isTest, trustProxy } from "./config/env";
 import { AppError } from "./lib/errors";
 import { registerAuth } from "./plugins/auth";
 import { closeSqlConsolePool } from "./services/sql-console.service";
+import auditRoutes from "./routes/audit.route";
 import authRoutes from "./routes/auth.route";
 import dbRoutes from "./routes/db.route";
 import healthRoutes from "./routes/health.route";
@@ -113,6 +114,8 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(uploadSessionsRoutes, { prefix: "/api/upload-sessions" });
   // The import "type" pick-list — the starting + user-added values of `upload.source`.
   await app.register(uploadSourcesRoutes, { prefix: "/api/upload-sources" });
+  // The Audit trail — read-only aggregates over the runs and imports the other routes create.
+  await app.register(auditRoutes, { prefix: "/api/audit" });
   await app.register(dbRoutes, { prefix: "/api/db" });
   await app.register(wsRoutes);
 

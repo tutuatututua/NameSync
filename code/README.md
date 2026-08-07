@@ -19,8 +19,11 @@ manual "compare" step in the everyday flow):
 - **Overview** — per roster (a relationship owner, or everyone): how many **friends** they uploaded, how
   many of those **matched** vs **no match**, and how many **companies** they reach ("known"), plus
   the history of every comparison run (`GET /api/network/overview?uploader=`). Clicking a reached
-  company opens the Search tab, prefiltered to it. A secondary "Find connections" action covers the
-  ad-hoc case (`POST /api/comparisons/compare`), handing off to the run's own page.
+  company opens the Search tab, prefiltered to it. One query bar above the tiles does both kinds of
+  narrowing: text filters the company list, and an owner it matches is offered as a filter over the
+  whole tab (`GET /api/network/owners?q=`). Runs (`POST /api/comparisons/compare`) are started from
+  a company row, a company or owner page, or a past run under **Results** — never from the Uploads
+  table, which records imports rather than making runs. Each hands off to the run's own page.
 - **Search** — look a person up by name to see which company they're in, **who knows them**, and
   **which relationship owners reach that company** (`GET /api/network/search?q=`). Rename a contact inline
   when someone leaves or a name changes (`PATCH /api/comparisons/company-data/:uuid`); the rename is

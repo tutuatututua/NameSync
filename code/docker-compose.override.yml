@@ -1,26 +1,26 @@
-# LAN access for the compose stack, WITH login. Added 2026-07-20, auth restored 2026-08-04.
+# LAN access for the compose stack. Added 2026-07-20; auth restored and this file rewritten
+# 2026-08-04.
 #
 # Docker Compose picks this up automatically alongside docker-compose.yml.
 #
-# This file used to set AUTH_DISABLED="1", which made every request resolve to a
-# hardcoded local admin (api/src/plugins/auth.ts) and meant anyone who could reach
-# http://<this-host>:3000 on the LAN had full admin access to the live database with
-# no login at all. That is gone: the API requires a real session again.
+# History worth keeping, because both were ways into the live database with no Center check:
+#   - This file used to set AUTH_DISABLED="1", so every request resolved to a hardcoded local
+#     admin. Anyone who could reach http://<this-host>:3000 on the LAN was that admin.
+#   - Even after that went, the API still exposed /api/auth/login and /api/auth/otp/login,
+#     which minted a session from a password stored in app_user. Those routes are now deleted;
+#     Center is the only way in.
 #
 # WHY NODE_ENV IS STILL `development` — do NOT delete this file to "finish the job".
-# Two things break if the api container runs as production:
-#   1. config/env.ts exits at boot unless CENTER_PLAYME_URL or SMTP_HOST is set, and
-#      docker-compose.yml passes NEITHER to the container. The stack would not start.
-#   2. AUTH_COOKIE_SECURE defaults to true in production, so the session cookie is
-#      dropped over plain http:// — login would appear to succeed and sign nobody in.
-#      Setting AUTH_COOKIE_SECURE=false is refused in production by design.
-# Development mode also keeps Network Intel's own email-OTP sign-in usable with no mail
-# server: lib/mailer.ts logs the code to the api container's log instead of sending it
-# (`docker compose logs -f api`). Production refuses to do that, correctly.
+# AUTH_COOKIE_SECURE defaults to true in production, so the session cookie would be dropped
+# over plain http:// — login would appear to succeed and sign nobody in. Setting
+# AUTH_COOKIE_SECURE=false is refused in production by design. Until this is served over TLS
+# with a real hostname, development is the honest setting.
 #
-# So this is the LAN/plain-http profile, not an auth bypass. Making it production is a
-# deployment task (real hostname, TLS, and CENTER_PLAYME_URL or SMTP_* plumbed through
-# docker-compose.yml), not a line to delete here.
+# (The other old reason is gone: production used to exit at boot for want of a sign-in path,
+# and docker-compose.yml now passes CENTER_PLAYME_URL.)
+#
+# So this is the LAN/plain-http profile, not an auth bypass. Moving to production is a
+# deployment task — TLS, a real hostname — not a line to delete here.
 #
 # DB_SKIP_MIGRATE="1" is deliberately NOT overridden here — it stays inherited from
 # docker-compose.yml. Leaving production mode must not become a route to letting the app
@@ -37,27 +37,3 @@ services:
       # container. (Set here rather than inherited from code/.env because that file's copy
       # has already gone stale once — it still says .111.)
       CORS_ORIGIN: "http://localhost:3000,http://192.168.8.103:3000"
-      # With no SMTP the sign-in code is only ever printed to the container log — and a
-      # `docker compose up --build` throws that log away, taking the code someone is waiting
-      # on with it. They then see nothing but "that code is incorrect", with no hint that it
-      # never reached them. /data is the api-data volume, which outlives the container, so the
-      # code stays readable across a rebuild:
-      #     docker compose exec api tail -n 5 /data/otp-codes.log
-      # Dev-only by construction (api/src/lib/mailer.ts returns before this in production).
-      # Delete this line once real SMTP is configured — then codes go by email and nothing
-      # needs to write a live credential to disk.
-      OTP_DEV_SINK: /data/otp-codes.log
-
-  frontend:
-    build:
-      args:
-        # Center is now configured (CENTER_PLAYME_URL reaches the api container), so the
-        # login form forwards credentials to Center rather than checking Network Intel's own
-        # password. Center owns the password and any second factor; this app still owns WHO
-        # is allowed in — a Center account with no `app_user` row is refused.
-        #
-        # Set to `local` to go back to Network Intel's own sign-in (password + a one-time
-        # code it emails, or writes to OTP_DEV_SINK when there is no SMTP). Note the two
-        # paths use DIFFERENT passwords: an account's local password is never consulted on
-        # the Center path, and vice versa.
-        NEXT_PUBLIC_AUTH_MODE: center

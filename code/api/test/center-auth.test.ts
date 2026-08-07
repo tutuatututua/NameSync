@@ -3,6 +3,7 @@ import type { FastifyInstance } from "fastify";
 import { DBModel } from "@extensions/sqldb";
 import { buildApp } from "../src/app";
 import { UserModel } from "../src/models";
+import { resetThrottle } from "../src/services/auth.service";
 
 /**
  * Center sign-in (POST /api/auth/center/login).
@@ -89,6 +90,9 @@ afterAll(async () => {
 
 beforeEach(() => {
   sendcodeCalls = 0;
+  // The Center path is throttled now (5 failures per email+IP per 15 min). It is in-memory and
+  // per-process, so without this the wrong-password tests would poison whatever ran after them.
+  resetThrottle();
   vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request, init?: RequestInit) =>
     centerStub(String(input), init)
   ));
@@ -153,5 +157,40 @@ describe("Center sign-in", () => {
     const res = await post({ email: HAPPY, password: "nope" });
     expect(res.statusCode).toBe(401);
     expect(res.json().message).toMatch(/incorrect/i);
+  });
+
+  it("throttles repeated failures, and stops calling Center once it does", async () => {
+    // This matters more than an ordinary rate limit. Center runs its OWN lockout (roughly five
+    // tries, then fifteen minutes), so an unthrottled proxy would let anyone lock a real user
+    // out of CENTER — not merely out of this app — by hammering this endpoint.
+    const attempt = () => post({ email: HAPPY, password: "nope" });
+
+    for (let i = 0; i < 5; i++) expect((await attempt()).statusCode).toBe(401);
+
+    const callsBefore = (global.fetch as unknown as { mock: { calls: unknown[] } }).mock.calls.length;
+    const blocked = await attempt();
+    expect(blocked.statusCode).toBe(429);
+    expect(blocked.json().message).toMatch(/too many/i);
+
+    // The refusal happens BEFORE Center is dialled — which is the whole point. If it fired
+    // afterwards it would have already spent one of the user's real Center attempts.
+    expect((global.fetch as unknown as { mock: { calls: unknown[] } }).mock.calls.length).toBe(callsBefore);
+  });
+
+  it("does not count Center being unreachable against the user's allowance", async () => {
+    // A 503 is not the caller's fault. Burning their five tries on our outage would lock
+    // someone out of an app that was never rejecting them in the first place.
+    vi.stubGlobal("fetch", vi.fn(async () => json({ error: "upstream boom" }, 500)));
+    for (let i = 0; i < 6; i++) {
+      const res = await post({ email: HAPPY, password: GOOD_PASSWORD });
+      expect(res.statusCode, res.body).not.toBe(429);
+    }
+  });
+
+  it("clears the throttle once a sign-in succeeds", async () => {
+    for (let i = 0; i < 4; i++) expect((await post({ email: HAPPY, password: "nope" })).statusCode).toBe(401);
+    expect((await post({ email: HAPPY, password: GOOD_PASSWORD })).statusCode).toBe(200);
+    // The slate is clean: four more failures do not tip it over from the earlier four.
+    for (let i = 0; i < 4; i++) expect((await post({ email: HAPPY, password: "nope" })).statusCode).toBe(401);
   });
 });

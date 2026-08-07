@@ -57,6 +57,11 @@ export function MatchedHint({
  */
 export function companyReachTitle(connections: number, confirmed: number): string {
   const leads = Math.max(0, connections - confirmed);
+  // Nobody at all — a real answer since the company list stopped being only the reached companies,
+  // and one the graded sentences below cannot express: "0 people reach this company, all on
+  // whole-name matches" is what `leads === 0` would otherwise produce.
+  if (connections === 0)
+    return "Nobody in this roster reaches this company yet — the contacts are on file, the connection is not.";
   const who = connections === 1 ? "1 person reaches" : `${connections} people reach`;
   if (leads === 0) return `${who} this company, all on whole-name matches.`;
   if (confirmed === 0)
@@ -87,8 +92,16 @@ export function rosterMatchTitle(matched: number, confirmed: number): string {
  * fix, where a dozen surname hits rendered as a dozen placements. Green as soon as any of the reach
  * is real, because the row is then worth opening; the lead count rides alongside rather than
  * downgrading the whole row.
+ *
+ * NEUTRAL at zero, and that case is why this takes the connection count at all. Amber means "there
+ * is something here and it is weaker than it looks" — a warning about evidence. A company nobody
+ * reaches has no evidence to warn about, and a page of amber badges on a database whose companies
+ * are mostly unreached would read as hundreds of problems rather than as work not yet done.
+ * `outline` states the absence quietly, which is what the company page and the Uploaders tab were
+ * already doing by hand at their own zeroes — they call through here now, so the three agree.
  */
-export function reachBadgeVariant(confirmed: number): "success" | "warning" {
+export function reachBadgeVariant(confirmed: number, connections = 1): "success" | "warning" | "outline" {
+  if (connections === 0) return "outline";
   return confirmed > 0 ? "success" : "warning";
 }
 

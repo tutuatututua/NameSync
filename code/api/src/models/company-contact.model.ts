@@ -1,8 +1,10 @@
+import { randomUUID } from "node:crypto";
 import { DBModel } from "@extensions/sqldb";
 import { sameFriendSql } from "./friend-identity";
 import { sql, type RawBuilder, type SqlBool } from "kysely";
 import { compareByAxes, type CompareBy, type PaginatedResult, type CompanyDataRow, type RunRow } from "@extensions/contract";
 import { isExternalMatcher } from "../config/env";
+import type { KnownOnFile, PriorImport } from "./upload.model";
 import { BadRequest } from "../lib/errors";
 import { cleanPersonName, tidyText } from "../services/name-cleaner.service";
 import {
@@ -16,7 +18,14 @@ import {
   tallyVerdicts,
   type StatusCounts,
 } from "./row-status";
-import { rowFilterWhere, toRunRow, type RawRunRow, type RunRowFilter, type RunRowSort } from "./run-rows";
+import {
+  rowFilterWhere,
+  rowSearchWhere,
+  toRunRow,
+  type RawRunRow,
+  type RunRowFilter,
+  type RunRowSort,
+} from "./run-rows";
 
 /**
  * "This contact has a match in the run" — an EXISTS over its matched `comparison_result` pairs.
@@ -90,11 +99,76 @@ const contactScorable = (compareBy: CompareBy): RawBuilder<SqlBool> => {
  * characters) and nothing more, so it keeps its case and every reader that compares it has to
  * fold case itself.
  *
- * Dedup key is company name + both person names, matched exactly. Cleaning is what makes the
- * key mean something: "Mr. Somchai Jaidee" and "SOMCHAI JAIDEE" are one contact, and before
- * cleaning they were two. Unlike `friend`, the uploader is not part of the key — a company
- * contact is the same contact no matter who imported them.
+ * TWO DIFFERENT QUESTIONS, and this file answers both — do not read either as the other:
+ *
+ *   · The DROP KEY (`dupKey`) — company name + both person names + THE UPLOADER, all folded and
+ *     matched exactly. It decides whether a row is written at all. Cleaning is what makes it mean
+ *     something: "Mr. Somchai Jaidee" and "SOMCHAI JAIDEE" fold to one row, and before cleaning
+ *     they were two.
+ *   · PERSON IDENTITY (`person_key`) — the looser fold, which decides how many CONTACTS the counts
+ *     report over whatever rows were written.
+ *
+ * The uploader IS part of the drop key, and this comment said the opposite until 2026-08-05. A
+ * contact is indeed the same person whoever imported them — that is `person_key`'s job and it is
+ * where the "one contact" claim belongs. But two colleagues each holding these contacts is two
+ * facts about the network, and collapsing them at write time would mean rolling back one import
+ * deleting rows the other had also claimed.
  */
+
+/**
+ * THE EXACT-DUPLICATE KEY — every column, plus who imported it.
+ *
+ * The company-side twin of the friend rule; `friend.model.ts` carries the reasoning for why this is
+ * a different question from `person_key` and why it is answered strictly.
+ *
+ * `company_name` is folded even though it is stored case-preserving. Every other reader compares it
+ * case-insensitively (`distinctCompanies`, `findByCompanies`, the identity probe), so treating
+ * "ACME CO" and "Acme Co" as two different rows here — and storing both — would put two copies of
+ * one contact in front of a reader who has been told all along that those are one company.
+ */
+const dupKey = (
+  by: string | null,
+  company: string | null,
+  en: string | null,
+  th: string | null
+): string =>
+  JSON.stringify([
+    by?.toLowerCase() ?? null,
+    company?.toLowerCase() ?? null,
+    en?.toLowerCase() ?? null,
+    th?.toLowerCase() ?? null,
+  ]);
+
+/** A prior row, as both readers of the duplicate rule select it. */
+interface PriorContactRow {
+  company_name: string | null;
+  person_name_en: string | null;
+  person_name_th: string | null;
+  uploaded_by: string | null;
+  upload_status: string | null;
+}
+
+/**
+ * WHICH ROWS OF THIS FILE WOULD BE DROPPED — one answer, two callers (the merge and the pre-check).
+ * See `friendDropMask`, which documents why this is one function and why the mask grows as it goes.
+ */
+export const contactDropMask = (
+  prior: PriorContactRow[],
+  records: CompanyContactRecord[],
+  uploadedBy: string | null
+): boolean[] => {
+  const onFile = new Set<string>();
+  for (const p of prior) {
+    if (p.upload_status === "rolled_back") continue;
+    onFile.add(dupKey(p.uploaded_by, p.company_name, p.person_name_en, p.person_name_th));
+  }
+  return records.map((r) => {
+    const k = dupKey(uploadedBy, r.company_name, r.person_name_en, r.person_name_th);
+    if (onFile.has(k)) return true;
+    onFile.add(k);
+    return false;
+  });
+};
 
 export interface CompanyContactRecord {
   /** Tidied, but not de-titled and not case-folded. */
@@ -105,18 +179,40 @@ export interface CompanyContactRecord {
   person_name_en: string | null;
 }
 
-// JSON keeps a missing field distinct from the literal string "null", and keeps the three
-// fields from running together (e.g. "ab"+"c" vs "a"+"bc"). All three are lower-cased: the
-// person names arrive lower-cased from the parser so folding them is a no-op on the normal path,
-// but the DB console table editor writes these columns too, bypassing the cleaner — and a
-// hand-typed mixed-case name that did not fold here would never dedupe against an imported one.
+// JSON keeps a missing field distinct from the literal string "null", and keeps the fields from
+// running together (e.g. "ab"+"c" vs "a"+"bc"). Everything is lower-cased: the person names arrive
+// lower-cased from the parser so folding them is a no-op on the normal path, but the DB console
+// table editor writes these columns too, bypassing the cleaner — and a hand-typed mixed-case name
+// that did not fold here would never match an imported one.
 const lower = (s: string | null) => (s === null ? null : s.toLowerCase());
-const contactKey = (r: { company_name: string | null; th: string | null; en: string | null }) =>
-  JSON.stringify([lower(r.company_name), lower(r.th), lower(r.en)]);
 
-/** The key for a record about to be inserted. */
-const recordKey = (r: CompanyContactRecord) =>
-  contactKey({ company_name: r.company_name, th: r.person_name_th, en: r.person_name_en });
+/** The two languages, as the columns they name. Iterated wherever both must be handled alike. */
+const LANGS = ["en", "th"] as const;
+const CONTACT_NAME_COL = { en: "person_name_en", th: "person_name_th" } as const;
+
+/**
+ * ONE (company, language, name) lookup key — the company-side twin of `friend`'s `spellKey`.
+ *
+ * ── WHY THIS REPLACED THE (company, th, en) TUPLE ──
+ *
+ * The old key matched all three columns at once, which meant the SAME PERSON imported once with
+ * only the English column mapped and again with only the Thai column produced two different keys
+ * and therefore two contact rows. Every count then saw two people at that company, and the Network
+ * page reported the inflated number without anything erroring. Remapping to the Thai column is
+ * exactly what somebody does when switching a run to Thai, so it was easy to hit and impossible
+ * to notice.
+ *
+ * Matching on EITHER spelling — the rule `friend` has always used — fixes it: a row carrying both
+ * names links the English-only rows to the Thai-only ones. Two rows that share NO common spelling
+ * still cannot be linked, because nothing in the data says they are the same person; a later
+ * bilingual row is what supplies that evidence, and `mergeUpload` merges the groups when it does.
+ *
+ * The company is IN the key, so the same name at two employers stays two contacts. That is a fact
+ * about the data, not a duplicate — people work in more than one place, and a run selects by
+ * company.
+ */
+const spellKey = (company: string | null, lang: "en" | "th", name: string) =>
+  JSON.stringify([lower(company), lang, name.toLowerCase()]);
 
 // `status` is only named when the external matcher is on — the column arrives with a
 // hand-applied migration, so until it is run it does not exist. See friend.model.ts.
@@ -134,69 +230,349 @@ const contactRowSelect = [
 
 export class CompanyContactModel extends DBModel {
   /**
-   * Insert an upload's parsed contacts, skipping rows that already exist (from an
-   * earlier upload by anyone, or twice within this file).
+   * Write an upload's parsed contacts — ALL of them — and give each the `person_key` of whoever it
+   * turns out to be. The company-side twin of `FriendModel.mergeUpload`; read that one's comment
+   * for why imports stack at all (the external workflow matches `WHERE upload_id = :session_id`
+   * and cannot see rows filed under an earlier import).
+   *
+   * Nothing is skipped, and the identity probe now matches on EITHER spelling rather than on the
+   * whole (company, th, en) tuple — see `spellKey` for the duplicate-contact bug that fixes.
    */
   static async mergeUpload(
     uploadId: string,
-    records: CompanyContactRecord[]
-  ): Promise<{ added: number; duplicates: number }> {
-    if (records.length === 0) return { added: 0, duplicates: 0 };
+    records: CompanyContactRecord[],
+    /** Who is performing this import — part of the duplicate key. See `FriendModel.mergeUpload`,
+     *  which documents the rule; a contact has no relationship owner, so the uploader is the only
+     *  thing besides the three data columns that can make a re-import a new fact. */
+    uploadedBy: string | null
+  ): Promise<{ added: number; duplicates: number; linked: number }> {
+    if (records.length === 0) return { added: 0, duplicates: 0, linked: 0 };
     const db = await this.getKyselyDB();
 
-    // Only rows for the companies named in this file can collide — no need to read
-    // the whole table. Compared lower-cased, like the key below: filtering exactly would
-    // never load the stored "Acme Co" rows for a file that spells it "ACME CO", and rows
-    // the dedup never sees are rows it cannot dedupe against.
+    // Only rows for the companies named in this file can match — no need to read the whole table.
+    // Compared lower-cased, like the key: filtering exactly would never load the stored "Acme Co"
+    // rows for a file that spells it "ACME CO", and rows the probe never sees are rows it cannot
+    // match against.
+    const companies = [...new Set(records.map((r) => r.company_name))];
+    const named = [...new Set(companies.filter((c): c is string => c !== null).map((c) => c.toLowerCase()))];
+    const hasUnnamed = companies.includes(null);
+
+    // LEFT JOIN for the uploader — see FriendModel.mergeUpload for why a row whose upload is gone
+    // must still fold into its person while matching nobody's duplicate key.
+    const prior = await db
+      .selectFrom("company_contact")
+      .leftJoin("upload", "upload.id", "company_contact.upload_id")
+      .select([
+        "company_contact.person_key",
+        "company_contact.company_name",
+        "company_contact.person_name_th",
+        "company_contact.person_name_en",
+        "upload.uploaded_by as uploaded_by",
+        "upload.status as upload_status",
+      ])
+      .where((eb) =>
+        eb.or([
+          ...(named.length > 0 ? [eb(sql<string>`lower(company_contact.company_name)`, "in", named)] : []),
+          ...(hasUnnamed ? [eb("company_contact.company_name", "is", null)] : []),
+        ])
+      )
+      .execute();
+
+    /** Which rows this file will NOT write — the same function the pre-check answered with. */
+    const drop = contactDropMask(prior, records, uploadedBy);
+
+    // Union-find over `person_key`, so a row that links two previously separate groups merges them
+    // once and every earlier reference resolves through it. Identical in shape and reasoning to the
+    // friend side — see FriendModel.mergeUpload.
+    const parent = new Map<string, string>();
+    const find = (k: string): string => {
+      const p = parent.get(k);
+      if (p === undefined || p === k) return k;
+      const root = find(p);
+      parent.set(k, root);
+      return root;
+    };
+    const union = (a: string, b: string): boolean => {
+      const ra = find(a);
+      const rb = find(b);
+      if (ra === rb) return false;
+      // Smallest wins, so the survivor does not depend on row order.
+      const [winner, loser] = ra < rb ? [ra, rb] : [rb, ra];
+      parent.set(loser, winner);
+      return true;
+    };
+
+    /** Every stored spelling is a way in to its contact. Two entries per bilingual row, one value. */
+    const keyBySpelling = new Map<string, string>();
+    const note = (key: string, company: string | null, lang: "en" | "th", name: string | null) => {
+      if (!name) return;
+      keyBySpelling.set(spellKey(company, lang, name), find(key));
+    };
+
+    for (const p of prior) {
+      const key = p.person_key as string;
+      note(key, p.company_name, "en", p.person_name_en);
+      note(key, p.company_name, "th", p.person_name_th);
+    }
+
+    const probe = (r: CompanyContactRecord): string[] => {
+      const hits = new Set<string>();
+      for (const lang of LANGS) {
+        const name = r[CONTACT_NAME_COL[lang]];
+        if (!name) continue;
+        const hit = keyBySpelling.get(spellKey(r.company_name, lang, name));
+        if (hit) hits.add(find(hit));
+      }
+      return [...hits];
+    };
+
+    /** The rows that will actually be written, with the contact each resolved to. */
+    const toInsert: { record: CompanyContactRecord; key: string }[] = [];
+    let duplicates = 0;
+    let linked = 0;
+
+    for (const [i, r] of records.entries()) {
+      // Already here, verbatim, from this person — dropped rather than written. See the friend side.
+      if (drop[i]) {
+        duplicates += 1;
+        continue;
+      }
+
+      const hits = probe(r);
+      let key: string;
+      if (hits.length === 0) {
+        key = randomUUID();
+      } else {
+        key = hits[0] as string;
+        // This row names both spellings of somebody previously filed under each separately. It is
+        // the evidence that links them — the repair path for contacts already split by the old key.
+        for (const other of hits.slice(1)) {
+          if (union(key, other)) linked += 1;
+        }
+        key = find(key);
+        // NOT a duplicate: same contact, different row. `duplicates` counts only what was dropped.
+      }
+      note(key, r.company_name, "en", r.person_name_en);
+      note(key, r.company_name, "th", r.person_name_th);
+      toInsert.push({ record: r, key });
+    }
+
+    // Every row was already here, verbatim, from this person — nothing to write. The caller turns
+    // that into a refusal rather than an empty import.
+    if (toInsert.length === 0) return { added: 0, duplicates, linked };
+
+    const losers = [...new Set(prior.map((p) => p.person_key as string))].filter((k) => find(k) !== k);
+    if (losers.length > 0) {
+      const moves = sql.join(losers.map((k) => sql`(${sql.val(k)}::uuid, ${sql.val(find(k))}::uuid)`));
+      await sql`
+        update company_contact as c
+           set person_key = v.to_key
+          from (values ${moves}) as v(from_key, to_key)
+         where c.person_key = v.from_key
+      `.execute(db);
+    }
+
+    await db
+      .insertInto("company_contact")
+      .values(
+        toInsert.map(({ record, key }) => ({
+          upload_id: uploadId,
+          company_name: record.company_name,
+          person_name_th: record.person_name_th,
+          person_name_en: record.person_name_en,
+          person_key: find(key),
+        }))
+      )
+      .execute();
+    return { added: toInsert.length, duplicates, linked };
+  }
+
+  /**
+   * WHICH ROWS OF THIS FILE WOULD BE DROPPED — the company side of `FriendModel.dropMask`.
+   */
+  static async dropMask(
+    records: CompanyContactRecord[],
+    uploadedBy: string | null
+  ): Promise<boolean[]> {
+    if (records.length === 0) return [];
+    const db = await this.getKyselyDB();
+
     const companies = [...new Set(records.map((r) => r.company_name))];
     const named = [...new Set(companies.filter((c): c is string => c !== null).map((c) => c.toLowerCase()))];
     const hasUnnamed = companies.includes(null);
 
     const prior = await db
       .selectFrom("company_contact")
-      .select(["company_name", "person_name_th", "person_name_en"])
+      .leftJoin("upload", "upload.id", "company_contact.upload_id")
+      .select([
+        "company_contact.company_name",
+        "company_contact.person_name_en",
+        "company_contact.person_name_th",
+        "upload.uploaded_by as uploaded_by",
+        "upload.status as upload_status",
+      ])
       .where((eb) =>
         eb.or([
-          ...(named.length > 0 ? [eb(sql<string>`lower(company_name)`, "in", named)] : []),
-          ...(hasUnnamed ? [eb("company_name", "is", null)] : []),
+          ...(named.length > 0 ? [eb(sql<string>`lower(company_contact.company_name)`, "in", named)] : []),
+          ...(hasUnnamed ? [eb("company_contact.company_name", "is", null)] : []),
         ])
       )
       .execute();
 
-    // Both sides keyed identically: stored names and incoming names have been through the same
-    // cleaner, so they are directly comparable with no fallback on either side.
-    const seen = new Set(
-      prior.map((p) => contactKey({ company_name: p.company_name, th: p.person_name_th, en: p.person_name_en }))
-    );
-
-    const fresh: CompanyContactRecord[] = [];
-    for (const r of records) {
-      const key = recordKey(r);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      fresh.push(r);
-    }
-
-    const duplicates = records.length - fresh.length;
-    if (fresh.length === 0) return { added: 0, duplicates };
-
-    await db
-      .insertInto("company_contact")
-      .values(
-        fresh.map((r) => ({
-          upload_id: uploadId,
-          company_name: r.company_name,
-          person_name_th: r.person_name_th,
-          person_name_en: r.person_name_en,
-        }))
-      )
-      .execute();
-    return { added: fresh.length, duplicates };
+    return contactDropMask(prior, records, uploadedBy);
   }
 
+  /**
+   * How many of these parsed records name somebody ALREADY ON FILE — the company-side twin of
+   * `FriendModel.countKnown`. See there for what the number is for and why it counts people
+   * rather than rows.
+   *
+   * Same probe as `mergeUpload`: same company, either spelling.
+   *
+   * `uploadedBy` narrows "on file" to "on file from this person" — the blocking half of the
+   * pre-check. See `FriendModel.countKnown`, which documents the rule; the only difference here is
+   * that a contact has no relationship owner to differ in, so the uploader is the ONLY thing that
+   * can make a re-import of the same contacts a new fact.
+   */
+  static async countKnown(
+    records: CompanyContactRecord[],
+    opts: { uploadedBy?: string | null } = {}
+  ): Promise<KnownOnFile> {
+    const none: KnownOnFile = { known: 0, priorImport: null };
+    if (records.length === 0) return none;
+    // Nobody named cannot have imported anything — see FriendModel.countKnown.
+    if ("uploadedBy" in opts && !opts.uploadedBy) return none;
+    const db = await this.getKyselyDB();
+
+    const companies = [...new Set(records.map((r) => r.company_name))];
+    const named = [...new Set(companies.filter((c): c is string => c !== null).map((c) => c.toLowerCase()))];
+    const hasUnnamed = companies.includes(null);
+
+    let priorQuery = db
+      .selectFrom("company_contact")
+      .innerJoin("upload", "upload.id", "company_contact.upload_id")
+      .select([
+        "company_contact.company_name",
+        "company_contact.person_name_th",
+        "company_contact.person_name_en",
+        "upload.id as upload_id",
+        "upload.name as upload_name",
+        "upload.uploaded_by as uploaded_by",
+        "upload.created_at as upload_created_at",
+      ])
+      .where("upload.status", "!=", "rolled_back")
+      .where((eb) =>
+        eb.or([
+          ...(named.length > 0 ? [eb(sql<string>`lower(company_contact.company_name)`, "in", named)] : []),
+          ...(hasUnnamed ? [eb("company_contact.company_name", "is", null)] : []),
+        ])
+      );
+
+    if (opts.uploadedBy) {
+      const who = opts.uploadedBy.toLowerCase();
+      priorQuery = priorQuery.where(sql<boolean>`lower(upload.uploaded_by) = ${sql.val(who)}`);
+    }
+
+    const prior = await priorQuery.execute();
+
+    const onFile = new Map<string, PriorImport>();
+    for (const p of prior) {
+      const from: PriorImport = {
+        id: String(p.upload_id),
+        name: p.upload_name,
+        uploaded_by: p.uploaded_by,
+        created_at: String(p.upload_created_at),
+      };
+      const note = (key: string): void => {
+        const held = onFile.get(key);
+        if (!held || held.created_at < from.created_at) onFile.set(key, from);
+      };
+      if (p.person_name_en) note(spellKey(p.company_name, "en", p.person_name_en));
+      if (p.person_name_th) note(spellKey(p.company_name, "th", p.person_name_th));
+    }
+
+    const seen = new Set<string>();
+    let known = 0;
+    let priorImport: PriorImport | null = null;
+    for (const r of records) {
+      const keys = LANGS.map((lang) => {
+        const name = r[CONTACT_NAME_COL[lang]];
+        return name ? spellKey(r.company_name, lang, name) : null;
+      }).filter((k): k is string => k !== null);
+      if (keys.length === 0) continue;
+      if (keys.some((k) => seen.has(k))) continue;
+      keys.forEach((k) => seen.add(k));
+      const from = keys.map((k) => onFile.get(k)).find((f): f is PriorImport => f !== undefined);
+      if (!from) continue;
+      known += 1;
+      if (!priorImport || priorImport.created_at < from.created_at) priorImport = from;
+    }
+    return { known, priorImport };
+  }
+
+  /**
+   * Has the contact side of a run moved since `since`? The company-side twin of
+   * `FriendModel.changedSince`, and half of the same answer — a run scores friends against
+   * contacts, so EITHER side moving makes the identical question a new one. Read that comment for
+   * why this is a refusal's escape hatch rather than a statistic.
+   *
+   * Narrowed exactly as `findByCompanies` narrows, and for the same reason the friend side is: a
+   * BANGKOK BANK run is not re-asked by a PTT import. Keep the two in step.
+   *
+   * An EMPTY company list is not "every company" here any more than it is there — it selects no
+   * contacts, so nothing about it can have changed.
+   */
+  static async changedSince(
+    since: string,
+    companyNames: string[] | null = null,
+    uploadId: string | null = null
+  ): Promise<boolean> {
+    if (companyNames !== null && companyNames.length === 0) return false;
+    const db = await this.getKyselyDB();
+    const named = companyNames === null ? null : [...new Set(companyNames.map((c) => c.toLowerCase()))];
+
+    let q = db
+      .selectFrom("company_contact_current")
+      .select("company_contact_current.person_key as person_key");
+
+    if (named !== null) q = q.where(sql<string>`lower(company_name)`, "in", named);
+    if (uploadId) {
+      q = q.where(({ exists, selectFrom }) =>
+        exists(
+          selectFrom("company_contact")
+            .select("company_contact.id")
+            .whereRef("company_contact.person_key", "=", "company_contact_current.person_key")
+            .where("company_contact.upload_id", "=", uploadId)
+        )
+      );
+    }
+
+    const row = await q
+      .where(({ exists, selectFrom }) =>
+        exists(
+          selectFrom("company_contact")
+            .select("company_contact.id")
+            .whereRef("company_contact.person_key", "=", "company_contact_current.person_key")
+            .where((eb) =>
+              eb.or([
+                eb("company_contact.created_at", ">", since as never),
+                eb("company_contact.updated_at", ">", since as never),
+              ])
+            )
+        )
+      )
+      .limit(1)
+      .executeTakeFirst();
+    return row !== undefined;
+  }
+
+  /** How many contacts are on file — PEOPLE, not rows. Reads the fold, like FriendModel.stats. */
   static async stats(): Promise<{ total: number }> {
     const db = await this.getKyselyDB();
-    const row = await db.selectFrom("company_contact").select(db.fn.count("id").as("count")).executeTakeFirst();
+    const row = await db
+      .selectFrom("company_contact_current")
+      .select(db.fn.count("person_key").as("count"))
+      .executeTakeFirst();
     return { total: Number(row?.count) || 0 };
   }
 
@@ -227,8 +603,22 @@ export class CompanyContactModel extends DBModel {
    * "every company" and "no companies" are different runs, the boundary folds empty to null so only
    * one of them can ever reach here, and a type that could not tell them apart is one that would
    * eventually answer the second question with the first.
+   *
+   * ── `uploadId` IS THE OTHER WAY TO NARROW, AND IT COMPOSES ──
+   *
+   * The contact side of a `filter_by='file'` run: re-compare the contacts one company import
+   * brought in. It intersects with the company list rather than replacing it, so "that file, but
+   * only its BlueBrick rows" is expressible — and, more importantly, a caller cannot accidentally
+   * widen a run by naming both.
+   *
+   * Membership is asked of the RAW rows while the row scored is still the fold's — the same split
+   * `FriendModel.findAllForMatching` makes, and for the same reason: "the people that file brought"
+   * held against everything since learned about them, not a replay of the file's own cells.
    */
-  static async findByCompanies(companyNames: string[] | null): Promise<
+  static async findByCompanies(
+    companyNames: string[] | null,
+    uploadId: string | null = null
+  ): Promise<
     {
       id: string;
       company_name: string | null;
@@ -239,13 +629,28 @@ export class CompanyContactModel extends DBModel {
     if (companyNames !== null && companyNames.length === 0) return [];
     const db = await this.getKyselyDB();
     const named = companyNames === null ? null : [...new Set(companyNames.map((c) => c.toLowerCase()))];
+    // ONE ROW PER CONTACT, not per import. Since imports stack, scoring the raw table would put a
+    // re-imported contact into the candidate set several times — and because the matcher keeps the
+    // FIRST of several equally-good candidates, that is not merely wasteful: it makes which copy
+    // wins depend on insertion order. The names are the fold's, so a contact whose English spelling
+    // came from one file and Thai from another is scored on both.
     let q = db
-      .selectFrom("company_contact")
+      .selectFrom("company_contact_current")
       // The id rides along so the matcher can stamp `comparison_result.company_contact_id` —
       // identity, which is immune to the name collisions the text columns cannot avoid. It is for
       // counting and joining only; the names beside it stay the frozen record of what was compared.
       .select(["id", "company_name", "person_name_en", "person_name_th"]);
     if (named !== null) q = q.where(sql<string>`lower(company_name)`, "in", named);
+    if (uploadId) {
+      q = q.where(({ exists, selectFrom }) =>
+        exists(
+          selectFrom("company_contact")
+            .select("company_contact.id")
+            .whereRef("company_contact.person_key", "=", "company_contact_current.person_key")
+            .where("company_contact.upload_id", "=", uploadId)
+        )
+      );
+    }
     return q.orderBy("company_name", "asc").orderBy("id", "asc").execute();
   }
 
@@ -312,7 +717,10 @@ export class CompanyContactModel extends DBModel {
     sort: RunRowSort,
     compareBy: CompareBy,
     /** The reader's chosen bar, or null for the workflow's own verdicts. See `regradeVerdict`. */
-    threshold: number | null = null
+    threshold: number | null = null,
+    /** The search box's text, or null — matched against the contact's two spellings and their
+     *  employer, which are this table's own columns. See `rowSearchWhere`. */
+    q: string | null = null
   ): Promise<PaginatedResult<RunRow>> {
     const db = await this.getKyselyDB();
     const offset = (page - 1) * limit;
@@ -325,12 +733,22 @@ export class CompanyContactModel extends DBModel {
     const verdict = regradeVerdictSql(stored, bestSimilarity, threshold);
     const scorable = contactScorable(compareBy);
     const where = rowFilterWhere(runRowBucketSql(verdict, scorable), filter);
+    const search = rowSearchWhere(
+      [
+        "company_contact.person_name_en",
+        "company_contact.person_name_th",
+        "company_contact.company_name",
+      ],
+      q
+    );
 
     let rows = db.selectFrom("company_contact").where("company_contact.upload_id", "=", uploadId);
     if (where) rows = rows.where(where);
+    if (search) rows = rows.where(search);
 
     let count = db.selectFrom("company_contact").where("company_contact.upload_id", "=", uploadId);
     if (where) count = count.where(where);
+    if (search) count = count.where(search);
 
     const selected = rows
       .innerJoin("upload", "upload.id", "company_contact.upload_id")
@@ -501,18 +919,55 @@ export class CompanyContactModel extends DBModel {
    * rest of the company. `min()` picks the survivor — arbitrary, but stable across calls, which
    * is what stops the picker's options reshuffling between renders.
    */
-  static async distinctCompanies(): Promise<string[]> {
+  static async distinctCompanies(
+    q: string | null = null,
+    limit: number | null = null
+  ): Promise<{ companies: string[]; total: number }> {
     const db = await this.getKyselyDB();
-    const rows = await db
-      .selectFrom("company_contact")
-      .select(sql<string>`min(company_name)`.as("company_name"))
-      .where("company_name", "is not", null)
-      .groupBy(sql`lower(company_name)`)
-      .orderBy(sql`min(company_name) asc`)
-      .execute();
-    return rows.map((r) => r.company_name);
+
+    // Escaped for LIKE metacharacters — "A&P (100%)" is a company name, not a pattern.
+    const like = q ? `%${q.toLowerCase().replace(/([\\%_])/g, "\\$1")}%` : null;
+    const filtered = (qb: any) => {
+      let out = qb.where("company_name", "is not", null);
+      if (like) out = out.where(sql`lower(company_name)`, "like", like);
+      return out;
+    };
+
+    const [rows, countRow] = await Promise.all([
+      (() => {
+        let qb: any = filtered(db.selectFrom("company_contact"))
+          .select(sql<string>`min(company_name)`.as("company_name"))
+          .groupBy(sql`lower(company_name)`)
+          .orderBy(sql`min(company_name) asc`);
+        if (limit !== null) qb = qb.limit(limit);
+        return qb.execute();
+      })(),
+      // The DISTINCT count, which is what "all companies" means — never the contact count. See
+      // `CompaniesDataSchema.total`.
+      db
+        .selectFrom(
+          filtered(db.selectFrom("company_contact"))
+            .select(sql`lower(company_name)`.as("key"))
+            .groupBy(sql`lower(company_name)`)
+            .as("companies")
+        )
+        .select(sql<string>`count(*)`.as("total"))
+        .executeTakeFirst(),
+    ]);
+
+    return {
+      companies: (rows as any[]).map((r) => r.company_name),
+      total: Number((countRow as any)?.total) || 0,
+    };
   }
 
+  /**
+   * RAW ROWS, deliberately — the Data page, a table of what is stored with the import each row
+   * came from beside it. Since imports stack, a re-imported contact is genuinely several rows;
+   * hiding them here would make the grid disagree with the database it claims to show, and with
+   * rollback, which works on exactly these rows. `stats` above folds, because "how many contacts
+   * do we have" is a question about people and this is a question about rows.
+   */
   static async findAllPaginated(page: number, limit: number): Promise<PaginatedResult<CompanyDataRow>> {
     const db = await this.getKyselyDB();
     const offset = (page - 1) * limit;
@@ -531,17 +986,28 @@ export class CompanyContactModel extends DBModel {
     return { data: data as unknown as CompanyDataRow[], pagination: { page, limit, total, totalPages: Math.ceil(total / limit) } };
   }
 
-  /** Every row one import added — the payload forwarded to the ingestion webhook. */
-  static async findByUploadId(uploadId: string): Promise<CompanyDataRow[]> {
+  /**
+   * How many rows one import added — "is there anything here to hand over?", asked without
+   * materialising the answer.
+   *
+   * Replaces `findByUploadId`, which existed for exactly one caller: the ingestion webhook, which
+   * used to be sent a CSV of these rows. It no longer is — the workflow selects them itself out of
+   * the Postgres both systems share (docs/EXTERNAL-MATCHER.md §1) — so reading 100,000 rows into
+   * memory to build a file nobody parsed was the most expensive part of an import and bought
+   * nothing.
+   *
+   * The COUNT still matters, and only on the manual re-send path: an import whose rows were rolled
+   * back out from under it has nothing to work on, and telling the workflow to go and select zero
+   * rows would put an empty job through it. See `POST /:id/send-webhook`.
+   */
+  static async countByUploadId(uploadId: string): Promise<number> {
     const db = await this.getKyselyDB();
-    const rows = await db
+    const row = await db
       .selectFrom("company_contact")
-      .leftJoin("upload", "upload.id", "company_contact.upload_id")
-      .select(contactRowSelect as never)
-      .where("company_contact.upload_id", "=", uploadId)
-      .orderBy("company_contact.id", "asc")
-      .execute();
-    return rows as unknown as CompanyDataRow[];
+      .select(db.fn.count("id").as("count"))
+      .where("upload_id", "=", uploadId)
+      .executeTakeFirst();
+    return Number(row?.count) || 0;
   }
 
   static async findByUploadIdPaginated(uploadId: string, page: number, limit: number): Promise<PaginatedResult<CompanyDataRow>> {
@@ -567,9 +1033,13 @@ export class CompanyContactModel extends DBModel {
     return { data: data as unknown as CompanyDataRow[], pagination: { page, limit, total, totalPages: Math.ceil(total / limit) } };
   }
 
+  /** How many contacts are on file — PEOPLE, like `stats`. */
   static async count(): Promise<number> {
     const db = await this.getKyselyDB();
-    const row = await db.selectFrom("company_contact").select(db.fn.count("id").as("count")).executeTakeFirst();
+    const row = await db
+      .selectFrom("company_contact_current")
+      .select(db.fn.count("person_key").as("count"))
+      .executeTakeFirst();
     return Number(row?.count) || 0;
   }
 
@@ -586,10 +1056,28 @@ export class CompanyContactModel extends DBModel {
     return Number(result?.numDeletedRows ?? 0);
   }
 
+  /**
+   * Delete a contact — every row of them, not one copy.
+   *
+   * Same reasoning as `renameContact`: the caller holds an id that came out of the fold, so
+   * deleting that one row would leave the contact on screen, resurrected from the copies another
+   * import wrote. A delete that visibly does nothing is worse than no delete.
+   *
+   * NOT the same as rolling back an import, which deliberately removes only that import's own rows
+   * and lets the person survive through the others (see `deleteByUploadId`). "Undo this import" and
+   * "remove this person" are different acts and neither should be implemented as the other.
+   */
   static async deleteById(id: string): Promise<number> {
     if (!/^\d+$/.test(id)) return 0; // non-numeric bigint id: nothing to delete
     const db = await this.getKyselyDB();
-    const result = await db.deleteFrom("company_contact").where("id", "=", id).executeTakeFirst();
+    const result = await db
+      .deleteFrom("company_contact")
+      .where(
+        "person_key",
+        "=",
+        db.selectFrom("company_contact as c").select("c.person_key").where("c.id", "=", id)
+      )
+      .executeTakeFirst();
     return Number(result?.numDeletedRows ?? 0);
   }
 
@@ -638,8 +1126,30 @@ export class CompanyContactModel extends DBModel {
       throw new BadRequest("A contact needs a Thai or English name — it can't be blank");
     }
 
+    /**
+     * APPLIED TO THE PERSON, not to the row — every copy sharing this `person_key`.
+     *
+     * Imports stack, so a contact imported twice is several rows, and the pages that open this
+     * dialog (the company page and Search) read `company_contact_current`, which folds them and
+     * hands back ONE id. Updating just that row left every other copy carrying the old name: the
+     * Data page went on showing it, the external workflow went on matching on it, and the rename
+     * looked like it had half worked. Which copy the id happens to name is an implementation
+     * detail of the fold, and no correct behaviour can be built on it.
+     *
+     * The `person_key` itself is deliberately untouched. Renaming somebody does not make them a
+     * different person — that is the whole reason identity is a stored key rather than a function
+     * of the current spelling, and it is what keeps this edit from orphaning their history.
+     */
     if (Object.keys(set).length > 0) {
-      await db.updateTable("company_contact").set(set).where("id", "=", id).execute();
+      await db
+        .updateTable("company_contact")
+        .set(set)
+        .where(
+          "person_key",
+          "=",
+          db.selectFrom("company_contact").select("person_key").where("id", "=", id)
+        )
+        .execute();
     }
 
     const company =

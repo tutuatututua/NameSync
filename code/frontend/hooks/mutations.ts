@@ -2,7 +2,14 @@
 
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import type { CompareBy, CreateSavedQueryBody, DbRow, RenameContactBody, SourceType } from "@extensions/contract";
+import type {
+  CompareBy,
+  CreateSavedQueryBody,
+  DbRow,
+  RenameContactBody,
+  RequestedScope,
+  SourceType,
+} from "@extensions/contract";
 import { api, ApiError } from "@/lib/api/client";
 import { qk } from "./queryKeys";
 
@@ -127,20 +134,40 @@ export function useTriggerComparison() {
   });
 }
 
-/** Start one comparison against the selected companies (no file upload). */
+/**
+ * Start one comparison over rows already on file — no upload, no import.
+ *
+ * ── IT INVALIDATES THE RUN LIST NOW, AND IT HAS TO ──
+ *
+ * It used to invalidate nothing, which was correct while every caller navigated straight to the new
+ * run's page: the run list would be re-read on the way back. Scoped runs broke that assumption —
+ * they are started from a company row, a roster row and an import row, and the reader stays where
+ * they are — so without this, "Recent comparisons" would keep showing the list as it was before the
+ * run they just started.
+ *
+ * The comparisons key only: this writes `comparison` and (for an unscoped run) `comparison_result`,
+ * and a blanket `invalidateQueries()` would re-fetch every network tally behind a dialog that has
+ * just closed. The run's own page fetches itself.
+ */
 export function useCompareByCompany() {
+  const qc = useQueryClient();
   return useMutation({
     mutationFn: ({
       companyNames,
       compareBy,
       sources,
+      scope,
     }: {
       /** Which companies are in the run — null for every company on file. */
       companyNames: string[] | null;
       compareBy: CompareBy;
       /** Which friends are in the run — null for every source. */
       sources: string[] | null;
-    }) => api.comparisons.compareByCompany(companyNames, compareBy, sources),
+      /** WHICH ROWS — a company, a relationship owner or a past import. Omitted is the legacy
+       *  whole-table / company-list run. */
+      scope?: RequestedScope | null;
+    }) => api.comparisons.compareByCompany(companyNames, compareBy, sources, scope),
+    onSuccess: () => qc.invalidateQueries({ queryKey: qk.comparisonsAll() }),
     onError: (e) => toast.error(errMsg(e, "Failed to start the comparison")),
   });
 }
@@ -204,7 +231,7 @@ export function useRenameComparison() {
   return useMutation({
     mutationFn: ({ id, name }: { id: string; name: string }) => api.comparisons.rename(id, name),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: qk.comparisons() });
+      qc.invalidateQueries({ queryKey: qk.comparisonsAll() });
       toast.success("Renamed");
     },
     onError: (e) => toast.error(errMsg(e, "Failed to rename")),
@@ -228,24 +255,22 @@ export function useRenameContact() {
       qc.invalidateQueries({ queryKey: qk.networkSearchAll() });
       qc.invalidateQueries({ queryKey: qk.networkOverviewAll() });
       qc.invalidateQueries({ queryKey: qk.dbRowsAll() });
-      qc.invalidateQueries({ queryKey: qk.companies() });
+      // The `*All` prefix, so every cached SEARCH is dropped and not merely the empty one. A rename
+      // can move a company in or out of any query's results, and the picker now caches one entry
+      // per search text.
+      qc.invalidateQueries({ queryKey: qk.companiesAll() });
       toast.success("Contact updated");
     },
     onError: (e) => toast.error(errMsg(e, "Failed to update the contact")),
   });
 }
 
-export function useDeleteComparison() {
-  const qc = useQueryClient();
-  return useMutation({
-    mutationFn: (id: string) => api.comparisons.remove(id),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: qk.comparisons() });
-      toast.success("Comparison deleted");
-    },
-    onError: (e) => toast.error(errMsg(e, "Failed to delete")),
-  });
-}
+/*
+ * `useDeleteComparison` was removed on 2026-08-07 with the overflow menu it served. Runs are not
+ * deletable from the app any more — the server refuses `DELETE /api/comparisons/:id` for every
+ * account, and the reasoning is written where the refusal is (api/src/routes/comparisons.route.ts).
+ * Nothing here should grow a replacement without that endpoint changing first.
+ */
 
 /** Wipes a whole source. Reached from the Database console's Clear-all, on the tables an
  *  import feeds (`importSource` in the server's table registry). */

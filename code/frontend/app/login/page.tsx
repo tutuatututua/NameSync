@@ -17,23 +17,15 @@ import { ThemeToggle } from "@/components/theme-toggle";
  * It lives outside the (app) route group on purpose: that group's layout is the sidebar +
  * top bar, which is chrome for someone who is already in. This page has neither.
  *
- * The real sign-in is Center: the form posts email+password to the API, which forwards them
- * to Center and — on success — answers with an httpOnly Set-Cookie. No token is stored here,
- * because none is ever handed to the page. If Center wants a second factor, the API says so
- * and the form asks for the code, then submits again.
+ * Sign-in is Center, and only Center: the form posts email+password to the API, which forwards
+ * them to Center and — on success — answers with an httpOnly Set-Cookie. No token is stored
+ * here, because none is ever handed to the page. If Center wants a second factor, the API says
+ * so and the form asks for the code, then submits again.
  *
- * The local path (`NEXT_PUBLIC_AUTH_MODE=local`) now carries the same two-step: the password
- * is only the first factor, and Network Intel then emails a one-time code the form asks for — the
- * exact shape as Center's email 2FA, just minted by Network Intel itself. So both real sign-in
- * paths verify a second factor before a session is issued.
+ * There was a second path here until 2026-08-04 — `NEXT_PUBLIC_AUTH_MODE=local`, Network
+ * Intel's own password plus a code it emailed itself. It was deleted along with the API
+ * routes behind it: it was a way in that bypassed Center, held shut only by NODE_ENV.
  */
-
-/**
- * Which sign-in the form drives:
- *  - `center` (default) — forward to Center; Center owns the second factor.
- *  - `local`            — Network Intel's own login: password, then a one-time code it emails.
- */
-const AUTH_MODE = process.env.NEXT_PUBLIC_AUTH_MODE === "local" ? "local" : "center";
 
 export default function LoginPage() {
   return (
@@ -50,7 +42,7 @@ type Step = "credentials" | "2fa";
 function LoginForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const { user, loading, signInWithCenter, signInWithOtp } = useAuth();
+  const { user, loading, signInWithCenter } = useAuth();
 
   const [email, setEmail] = React.useState("");
   const [password, setPassword] = React.useState("");
@@ -87,20 +79,6 @@ function LoginForm() {
     setError(null);
     setSubmitting(true);
     try {
-      if (AUTH_MODE === "local") {
-        // Password is only the first factor now: on success the API has emailed a code and
-        // answered with a challenge, so move to the code step just like the Center path.
-        const outcome = await signInWithOtp({ email, password });
-        if (outcome.status === "signed-in") {
-          router.replace(next);
-          return;
-        }
-        setTwoFactor({ method: "email", ref: outcome.ref });
-        setStep("2fa");
-        setCode("");
-        setSubmitting(false);
-        return;
-      }
       const outcome = await signInWithCenter({ email, password });
       if (outcome.status === "signed-in") {
         router.replace(next);
@@ -128,16 +106,13 @@ function LoginForm() {
     setError(null);
     setSubmitting(true);
     try {
-      const outcome =
-        AUTH_MODE === "local"
-          ? await signInWithOtp({ email, password, code, ref: twoFactor.ref })
-          : await signInWithCenter({
-              email,
-              password,
-              code,
-              method: twoFactor.method,
-              ref: twoFactor.ref,
-            });
+      const outcome = await signInWithCenter({
+        email,
+        password,
+        code,
+        method: twoFactor.method,
+        ref: twoFactor.ref,
+      });
       if (outcome.status === "signed-in") {
         router.replace(next);
         return; // stay busy through the redirect.
@@ -237,11 +212,7 @@ function LoginForm() {
         </Button>
       </form>
 
-      <p className="mt-6 text-center text-xs text-muted-foreground">
-        {AUTH_MODE === "local"
-          ? "Enter your password — we'll email you a code to finish signing in."
-          : "Sign in with your Center account."}
-      </p>
+      <p className="mt-6 text-center text-xs text-muted-foreground">Sign in with your Center account.</p>
     </LoginShell>
   );
 }

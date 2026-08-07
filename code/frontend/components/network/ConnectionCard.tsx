@@ -12,6 +12,7 @@ import {
   type ConnectedUploader,
 } from "@extensions/contract";
 import { MarkedName } from "@/components/marked-name";
+import { Side } from "@/components/pair-side";
 import { Provenance } from "@/components/provenance";
 import { Score } from "@/components/score";
 import { formatSimilarity } from "@/lib/format";
@@ -21,6 +22,11 @@ import { cn } from "@/lib/utils";
 export type PairedContact = {
   person_name_en: string | null;
   person_name_th: string | null;
+  /** Where they work — named only in the contact label's tooltip, so a reader who cannot place
+   *  "contact" can see which of the two names is the one at the company. Optional because the
+   *  pairing reads correctly without it, and a caller holding no employer must not be forced to
+   *  invent one. */
+  company_name?: string | null;
 };
 
 /**
@@ -54,13 +60,12 @@ export type PairedContact = {
 export function ConnectionCard({
   uploader,
   contact,
-  threshold,
 }: {
   uploader: ConnectedUploader;
   contact: PairedContact;
-  /** The bar this page is being read at, for the owner link in the provenance strip below — the
-   *  roster it opens has to be the same answer as the card above it. */
-  threshold?: number | null;
+  /* A `threshold` prop stood here and went no further than the provenance strip below, which now
+     reads the bar off the URL itself — see `Provenance`. Passing it was the shape that let the run
+     page forget to, so there is nothing to pass. */
 }) {
   const mode = parseCompareBy(uploader.mode);
   const { language, type } = compareByAxes(mode);
@@ -167,11 +172,51 @@ export function ConnectionCard({
    *
    * Suppressed when it is identical to the scored name — a friend whose two columns hold the same
    * string would otherwise render `narong sinthu (narong sinthu)`, which is noise dressed as a
-   * disclosure. The contact side needs no equivalent: the group header directly above this card
-   * already prints both of the contact's spellings.
+   * disclosure.
    */
   const altSpelling =
     uploader.friendAlt && uploader.friendAlt !== uploader.friend ? uploader.friendAlt : null;
+
+  /**
+   * THE CONTACT'S OTHER SPELLING — the same disclosure, on the side that was missing it.
+   *
+   * This was deliberately left off, on the grounds that the group header directly above the card
+   * already prints both of the contact's spellings. Two things were wrong with that.
+   *
+   * The first is the asymmetry itself. An `en` run renders the friend as `orapin wongwanich (อรพิน
+   * วงศ์วานิช)` and the contact as `wilai vongvanij` — one side declaring a Thai spelling and the
+   * other silent — and the plain reading of that is "we hold no Thai name for this contact", which
+   * is false whenever the header two lines up is showing one. The reader who spotted it read it
+   * exactly that way.
+   *
+   * The second is that the header is not a substitute. It prints the contact's names as the record
+   * holds them TODAY, in reading order; the card prints the spelling THIS RUN SCORED, chosen by
+   * `recordedLanguage`. Those are different claims that happen to coincide most of the time, and
+   * asking the reader to pair them up by eye — across a group header, past a `Known by 2 friends`
+   * line, over another card — is asking them to do the one piece of work this card exists to do.
+   *
+   * Null when the pairing is already showing the fallback (`scored` empty, so `contactName` IS the
+   * other spelling): there is nothing left to disclose and the note below says why.
+   */
+  const contactAlt = scored && other && other !== scored ? other : null;
+
+  /**
+   * WHICH OF THESE TWO IS THE ONE AT THE COMPANY — said in a word, on the face of the card.
+   *
+   * Not a small point on a Thai roster: `orapin wongwanich → wilai vongvanij` is two lowercase
+   * transliterations with an arrow between them, and nothing in the strings, the order or the
+   * colour says which is the colleague's friend and which is the stranger you want introducing to.
+   * Read backwards, the card claims a relationship that does not exist — and it still carries a
+   * percentage while doing it.
+   *
+   * The employer goes in the tooltip rather than the label. It is the title of the page these
+   * cards are on, so printing `at BANGKOK BANK` on every one of them repeats the heading a dozen
+   * times a screen, and a long registered company name would set the label wider than the names it
+   * introduces.
+   */
+  const contactHint = contact.company_name
+    ? `The person on file at ${contact.company_name} — the contact this card is about.`
+    : "The person at the company — the contact this card is about.";
 
   /**
    * The caveats — rendered only when there is one, so an ordinary card is three lines and not four.
@@ -217,54 +262,84 @@ export function ConnectionCard({
         {/* THE PAIRING. Friend on the left, contact on the right, the arrow between them meaning
             "was compared against" — and both sides marked through `MarkedName`, so on a partial
             run the reader sees the two tokens that were actually held against each other rather
-            than two whole names with a percent between them. */}
+            than two whole names with a percent between them.
+
+            Each side wears its role in front of it, through the same `Side` the run table uses, so
+            "which of these two is the person at the company" has one answer and one wording
+            wherever a pairing is rendered. The label stays with its name when the row wraps, which
+            is the case it exists for: a wrapped pairing degrades into two labelled lines instead of
+            two anonymous ones. */}
         <div className="min-w-0 flex-1 space-y-1">
           <p className="flex flex-wrap items-baseline gap-x-2 gap-y-1 text-sm">
-            {uploader.friend ? (
-              <>
-                <MarkedName
-                  name={uploader.friend}
-                  type={type}
-                  lang={recordedLanguage === "th" ? "th" : undefined}
-                  alt={uploader.friendAlt}
-                  className="font-medium"
-                />
-                {/* The same person's other spelling, ON THE CARD rather than only in the title.
-                    A `th_name` run whose workflow ignored `compare_by` records Latin names, so the
-                    pairing above is honest and unrecognisable — `narong sinthu` where the reader
-                    knows `ณรงค์ สินธุ`. Muted, unmarked and parenthesised so it cannot be mistaken
-                    for the string that earned the score; `MarkedName` deliberately does not run
-                    over it, because no part of it was compared. */}
-                {altSpelling && (
-                  <span
-                    lang={recordedLanguage === "th" ? undefined : "th"}
-                    className="text-muted-foreground"
-                    title={`Also on file as ${altSpelling}. This spelling was not the one scored.`}
-                  >
-                    ({altSpelling})
-                  </span>
-                )}
-              </>
-            ) : (
-              // A run that recorded no name for its own side. The connection still stands — being
-              // in this list is what says so — but the pairing cannot be written, and naming the
-              // friend "unknown" is more honest than quietly showing the owner's name in the slot
-              // where a friend's name belongs.
-              <span className="italic text-muted-foreground" title="This run recorded no name for the friend it matched.">
-                friend name not recorded
-              </span>
-            )}
+            <Side
+              label="friend"
+              hint={`Someone ${uploader.name} knows — the name this run held against the contact. Ask them for the introduction.`}
+            >
+              {uploader.friend ? (
+                <span className="inline-flex min-w-0 flex-wrap items-baseline gap-x-1.5">
+                  <MarkedName
+                    name={uploader.friend}
+                    type={type}
+                    lang={recordedLanguage === "th" ? "th" : undefined}
+                    alt={uploader.friendAlt}
+                    className="font-medium"
+                  />
+                  {/* The same person's other spelling, ON THE CARD rather than only in the title.
+                      A `th_name` run whose workflow ignored `compare_by` records Latin names, so the
+                      pairing above is honest and unrecognisable — `narong sinthu` where the reader
+                      knows `ณรงค์ สินธุ`. Muted, unmarked and parenthesised so it cannot be mistaken
+                      for the string that earned the score; `MarkedName` deliberately does not run
+                      over it, because no part of it was compared. */}
+                  {altSpelling && (
+                    <span
+                      lang={recordedLanguage === "th" ? undefined : "th"}
+                      className="text-muted-foreground"
+                      title={`Also on file as ${altSpelling}. This spelling was not the one scored.`}
+                    >
+                      ({altSpelling})
+                    </span>
+                  )}
+                </span>
+              ) : (
+                // A run that recorded no name for its own side. The connection still stands — being
+                // in this list is what says so — but the pairing cannot be written, and naming the
+                // friend "unknown" is more honest than quietly showing the owner's name in the slot
+                // where a friend's name belongs.
+                <span className="italic text-muted-foreground" title="This run recorded no name for the friend it matched.">
+                  friend name not recorded
+                </span>
+              )}
+            </Side>
+
             <ArrowRight className="h-3.5 w-3.5 shrink-0 self-center text-muted-foreground" aria-label="was compared against" />
-            {contactName ? (
-              <MarkedName
-                name={contactName}
-                type={type}
-                lang={scored && recordedLanguage === "th" ? "th" : undefined}
-                className="font-medium"
-              />
-            ) : (
-              <span className="text-muted-foreground">this contact</span>
-            )}
+
+            <Side label="contact" hint={contactHint}>
+              {contactName ? (
+                <span className="inline-flex min-w-0 flex-wrap items-baseline gap-x-1.5">
+                  <MarkedName
+                    name={contactName}
+                    type={type}
+                    lang={scored && recordedLanguage === "th" ? "th" : undefined}
+                    className="font-medium"
+                  />
+                  {/* Rendered exactly like the friend's — same parentheses, same muted grey, same
+                      absence of the underline — because it is the same fact about the other half of
+                      the pairing: a spelling we hold for this person that this run did not score. A
+                      quieter treatment on this side would be the asymmetry all over again. */}
+                  {contactAlt && (
+                    <span
+                      lang={recordedLanguage === "th" ? undefined : "th"}
+                      className="text-muted-foreground"
+                      title={`Also on file as ${contactAlt}. This spelling was not the one scored.`}
+                    >
+                      ({contactAlt})
+                    </span>
+                  )}
+                </span>
+              ) : (
+                <span className="text-muted-foreground">this contact</span>
+              )}
+            </Side>
           </p>
 
           {/* The caveats, and ONLY when there are any — what the comparison was is stated once, in
@@ -315,7 +390,7 @@ export function ConnectionCard({
           run row shows, so "who owns this / who filed it" is one strip with one wording wherever a
           connection is rendered. The argument for always showing both names, and for never
           back-filling one from the other, moved into that component with the markup. */}
-      <Provenance owner={uploader.name} uploadedBy={uploader.uploadedBy} threshold={threshold} />
+      <Provenance owner={uploader.name} uploadedBy={uploader.uploadedBy} />
     </div>
   );
 }

@@ -1,4 +1,5 @@
 import { DBModel } from "@extensions/sqldb";
+import { sql, type SqlBool } from "kysely";
 import type { DbFilter, DbRow, PaginatedResult, TableQueryBody } from "@extensions/contract";
 import { BadRequest, NotFound } from "../lib/errors";
 import {
@@ -169,7 +170,19 @@ function applySearch(q: any, table: RegistryTable, term: string): any {
   // Every registry table has a text column; the guard only stops a future text-free table
   // from handing eb.or() an empty array, which it rejects.
   if (refs.length === 0) return q;
-  return q.where((eb: any) => eb.or(refs.map((ref: string) => eb(ref, "ilike", like))));
+  /**
+   * `::text` because "string" here is the REGISTRY's type, not Postgres's, and the two stopped
+   * agreeing when `person_key` (a real `uuid`) was listed. `uuid ILIKE text` has no operator, so
+   * the whole search 500s — not just on that column, on the table.
+   *
+   * Casting rather than filtering the column out, because searching it is genuinely useful: paste
+   * a person key in and get every row of that person, which is the question the column exists to
+   * answer. A no-op on the varchar columns, and it costs nothing that was not already lost — a
+   * leading-`%` LIKE could never use an index anyway.
+   */
+  return q.where((eb: any) =>
+    eb.or(refs.map((ref: string) => sql<SqlBool>`${sql.ref(ref)}::text ilike ${like}`))
+  );
 }
 
 export class TableEditorModel extends DBModel {

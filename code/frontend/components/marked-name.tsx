@@ -41,7 +41,20 @@ export function MarkedName({
   const span = type === "full" ? null : namePartSpan(name, type);
   const title = alt && alt !== name ? `${name} — also on file as ${alt}` : name;
 
-  if (!span || !span.before) {
+  /*
+   * Unmarked when the span covers the WHOLE name — a `full` run, or a single-token name where
+   * `namePartSpan` widens the match to everything. Underlining every character asserts nothing and
+   * reads as decoration.
+   *
+   * Both sides are tested, and the `after` half is the whole point. This was `!span.before` alone,
+   * on the reasoning that a span with nothing in front of it is a span covering the name — true for
+   * `surname`, whose excluded tokens are always the head, and false for every `name` run there has
+   * ever been: the given name is token 0, so `before` is unconditionally empty and the excluded
+   * tokens sit in `after`. The guard therefore swallowed the mark on EVERY given-name run in both
+   * the run table and `ConnectionCard`, which is how `given name · English 100%` came to sit beside
+   * an unmarked `panadda weerachai` with no sign that only `panadda` was ever compared.
+   */
+  if (!span || (!span.before && !span.after)) {
     return (
       <span lang={lang} className={className} title={title}>
         {name}

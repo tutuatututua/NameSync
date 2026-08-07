@@ -2,7 +2,12 @@ import type { TwoFactorChallenge } from "@extensions/contract";
 import { Forbidden, Unauthorized } from "../lib/errors";
 import { centerLogin, centerMe, centerSendEmailOtp, centerSendSmsOtp, type CenterCredentials } from "../lib/center";
 import { UserModel } from "../models";
-import { issueSession } from "./auth.service";
+import {
+  checkLoginThrottle,
+  clearLoginThrottle,
+  issueSession,
+  recordLoginFailure,
+} from "./auth.service";
 import type { LoginResult } from "./auth.service";
 
 /**
@@ -44,7 +49,24 @@ function toCredentials(input: CenterSignInInput): CenterCredentials {
 }
 
 export async function signInWithCenter(input: CenterSignInInput): Promise<CenterSignInResult> {
-  const result = await centerLogin(toCredentials(input));
+  const ip = input.meta?.ip;
+
+  // Rate-limit BEFORE calling Center, not after. Center enforces its own lockout — about five
+  // tries, then fifteen minutes — so an unthrottled proxy lets anyone burn a real user's Center
+  // attempts and lock them out of Center entirely, not just out of this app. Refusing here
+  // first is what stops this endpoint being a remote lockout button.
+  checkLoginThrottle(input.email, ip);
+
+  let result;
+  try {
+    result = await centerLogin(toCredentials(input));
+  } catch (err) {
+    // Count only what Center calls a credentials failure — a wrong password, or a wrong
+    // second-factor code. Center being unreachable (503) is not the caller's fault and must
+    // not consume their allowance.
+    if (err instanceof Unauthorized) recordLoginFailure(input.email, ip);
+    throw err;
+  }
 
   // Center wants a second factor. Relay the challenge; for an out-of-band code (email or sms),
   // also trigger the send so it's in the user's inbox / on their phone by the time they're
@@ -77,5 +99,7 @@ export async function signInWithCenter(input: CenterSignInInput): Promise<Center
     throw new Forbidden("This account has been disabled. Contact an administrator.");
   }
 
+  // Center accepted them AND they are authorised here — the slate is clean.
+  clearLoginThrottle(input.email, ip);
   return { kind: "session", session: await issueSession(user, input.meta) };
 }

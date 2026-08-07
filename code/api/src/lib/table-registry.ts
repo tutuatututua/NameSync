@@ -163,6 +163,15 @@ const TABLES: RegistryTable[] = [
       c("company_name", "string", { label: "Company" }),
       c("person_name_th", "string", { label: "Thai name" }),
       c("person_name_en", "string", { label: "English name" }),
+      // WHICH CONTACT this row is about — shared by every copy of them. Imports stack, so the same
+      // person imported twice is two rows here, and this is the only thing on the row that says so.
+      // Shown because a console session asking "why do I see this contact twice / why is the count
+      // 1 when there are 2 rows" is answered by exactly this column.
+      //
+      // READ-ONLY. Editing it re-decides who somebody IS — merging two people or splitting one —
+      // which silently moves every count, roster and connection that folds on it. The importer
+      // assigns it from the names, and that is the one place the rule lives.
+      c("person_key", "string", { label: "Person key", editable: false }),
       uploadedBy(),
       uploadName(),
       c("upload_id", "number", { label: "Upload ID", nullable: false, required: true }),
@@ -195,6 +204,12 @@ const TABLES: RegistryTable[] = [
       // right colleague is the one correction this table exists to make, and it moves the
       // row between rosters (the dedup key is (owner, name)) rather than merely relabelling it.
       c("relationship_owner", "string", { label: "Relationship owner" }),
+      // Which PERSON this row is about — see the company_contact twin. Read-only for the same
+      // reason, and note the interaction with the editable columns above it: changing a name or an
+      // owner here does NOT re-decide identity, so a friend re-filed under another colleague keeps
+      // the key they had. That is usually what you want (it is the same person, moved) and it is
+      // worth knowing it is what happens.
+      c("person_key", "string", { label: "Person key", editable: false }),
       uploadedBy(),
       c("source", "string", { label: "Type", nullable: false, required: true }),
       uploadName(),
@@ -250,6 +265,20 @@ const TABLES: RegistryTable[] = [
        * truth rather than a gap.
        */
       c("compare_by", "string", { label: "Compared by", editable: false, enumValues: [...COMPARE_BY_VALUES] }),
+      /**
+       * Who started the run. Read-only, and for a stronger reason than the two above.
+       *
+       * `sources` and `compare_by` are read-only because editing them would relabel what a finished
+       * run DID. This is a record of who DID it, and it is what the Audit trail attributes a run to
+       * — an editable field there is a record of an act that can be quietly reassigned to somebody
+       * else, from a console that logs nothing. Provenance is the one kind of column a data browser
+       * should not hand you a pencil for.
+       *
+       * NULL is legitimate and reads as "nobody on file": a run predating the column (2026-08-04),
+       * or one created through this console, which writes no actor. The trail then falls back to
+       * the uploader of the import that opened the run, and shows nothing if there is none.
+       */
+      c("created_by", "string", { label: "Started by", editable: false }),
       c("expected_batches", "number", { label: "Expected batches" }),
       createdAt(),
       updatedAt(),

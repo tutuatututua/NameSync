@@ -1,3 +1,4 @@
+export { AuditModel } from "./audit.model";
 export { UploadModel, type UploadCreate } from "./upload.model";
 export { FriendModel, type FriendRecord } from "./friend.model";
 export { CompanyContactModel, type CompanyContactRecord } from "./company-contact.model";
@@ -7,4 +8,3 @@ export { TableEditorModel } from "./table-editor.model";
 export { SavedQueryModel } from "./saved-query.model";
 export { UserModel } from "./user.model";
 export { AuthSessionModel, type ActiveSession } from "./auth-session.model";
-export { EmailOtpModel } from "./email-otp.model";

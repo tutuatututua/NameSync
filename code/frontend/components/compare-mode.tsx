@@ -20,6 +20,19 @@ import { cn } from "@/lib/utils";
 /**
  * How a run should compare — two controls over one stored value.
  *
+ * ── ONE CALLER, SINCE 2026-08-05 ──
+ *
+ * `NewComparisonDialog`. The import screen carried a second copy until the mode stopped being a
+ * per-import choice (every import is `en_full`), and what looked like the loss of a control was the
+ * removal of a workaround: people were re-uploading a file they had already imported so that the
+ * import path would open a run with a different mode on it, which wrote a second complete row set
+ * to change one column. The dialog can now be pointed at a company, a relationship owner or a past
+ * import directly, so the choice is available over data already on file and costs nothing to make.
+ *
+ * It stays a shared component rather than folding into its one caller: `CompareModeBadge` below is
+ * the read-only twin and has several, and keeping the picker beside the badge is what stops the
+ * control and the chip from drifting into describing the same value differently.
+ *
  * Two selects rather than one six-item list, because the axes are independent and a flat list of
  * "English · surname", "Thai · full name" … asks the reader to reconstruct the grid in their head
  * to find the cell they want. It is also the shape of the underlying value: `compare_by` is

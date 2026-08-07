@@ -37,15 +37,20 @@ interface Allowed {
  * `/api/network/` would also admit anything mounted under it later.
  */
 const REVIEWER_ALLOWED: Allowed[] = [
-  // Their own account. Signing out and changing your own password are writes, but they act
-  // on the reviewer themselves rather than on any data — refusing them would mean an account
-  // that cannot log out or rotate its own password.
+  // Their own account. Signing out is a write, but it acts on the reviewer themselves rather
+  // than on any data — refusing it would mean an account that cannot log out.
+  // (change-password is gone: Center owns the password now, so there is nothing to rotate here.)
   { method: "GET", path: /^\/api\/auth\/me$/ },
   { method: "POST", path: /^\/api\/auth\/logout$/ },
-  { method: "POST", path: /^\/api\/auth\/change-password$/ },
 
-  // The Network workspace — the whole point of the role. All five are reads.
-  { method: "GET", path: /^\/api\/network\/(overview|grading|uploaders|uploader|search)$/ },
+  // The Network workspace — the whole point of the role. All six are reads.
+  //
+  // `owners` joined the list in 2026-08-04, and it is an addition rather than a widening: it serves
+  // the roster filter that used to be populated from inside the `overview` payload this role could
+  // already read. Leaving it off would not have hidden anything — the same names arrive on the
+  // Uploaders tab a reviewer can open — it would only have left them with a filter that returned
+  // nothing.
+  { method: "GET", path: /^\/api\/network\/(overview|grading|owners|uploaders|uploader|search)$/ },
 
   // The run list on the Network page (RecentRuns), and viewing one run's stored results.
   // `[^/]+` is the run id; the suffix alternation is what keeps this from also matching
@@ -56,6 +61,13 @@ const REVIEWER_ALLOWED: Allowed[] = [
   // The import-type pick-list. Not a page of its own — RunRows reads it to label a row's
   // source, so a reviewer looking at a run needs it or the labels come out blank.
   { method: "GET", path: /^\/api\/upload-sources$/ },
+
+  // The Audit trail (`/audit`). Both reads, and both are aggregates: the summary is counts and
+  // vocabulary with nobody's name in it, and the trail names only who performed an import — which
+  // this role already reads off the run pages it can open. Neither writes, and neither takes an id
+  // that could widen the reviewer's reach into a page they cannot open, which is the test that kept
+  // /api/upload-sessions off this list.
+  { method: "GET", path: /^\/api\/audit\/(summary|activity)$/ },
 ];
 
 /** Strip the query string; the allowlist matches on path only. */

@@ -9,6 +9,37 @@ import type { Upload } from "../db.types";
  * 'social'; for social imports `source` names the platform ('facebook', …).
  */
 
+/**
+ * An import, as the pre-check names it back to the person about to repeat it.
+ *
+ * Four fields and no counts: the message it feeds says "you imported friends.csv on 4 August", and
+ * every number a reader might want next to that is on the Uploads page one click away. Defined here
+ * rather than in each model that produces one, so the friends side and the company side cannot
+ * disagree about what identifies an import.
+ */
+export interface PriorImport {
+  id: string;
+  /** The file it came from — the import screen sets `upload.name` to the filename. */
+  name: string | null;
+  uploaded_by: string | null;
+  created_at: string;
+}
+
+/**
+ * "How much of this file is already here, and who put it here?" — what `countKnown` answers on
+ * both sides of the import.
+ *
+ * One shape for two questions, because the pre-check asks them together and a caller holding a
+ * count with no provenance can only say "this is a duplicate", which is the version of the message
+ * that leaves the reader with nowhere to go.
+ */
+export interface KnownOnFile {
+  /** Distinct PEOPLE in the file who are already on file — never a row count. */
+  known: number;
+  /** The newest import that filed any of them, or null when none of them are here. */
+  priorImport: PriorImport | null;
+}
+
 export interface UploadCreate {
   name: string | null;
   kind: "company" | "social";

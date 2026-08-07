@@ -3,14 +3,16 @@
 import * as React from "react";
 import Link from "next/link";
 import { useParams, useSearchParams } from "next/navigation";
-import { Building2, Import, Pencil, SearchX, UserCheck, UserSearch, Users } from "lucide-react";
+import { Building2, Import, Pencil, Search, SearchX, UserCheck, UserSearch, Users } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { NameSearchRow } from "@extensions/contract";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { PageHeader, SectionHeader } from "@/components/page-header";
 import { EmptyState } from "@/components/empty-state";
+import { PAGE_SIZE, Pager } from "@/components/pagination";
 import { StatTile, compactCount } from "@/components/stat-tile";
 import { sameName } from "@/components/network/KnownByBadge";
 import { ConnectionCard } from "@/components/network/ConnectionCard";
@@ -21,10 +23,16 @@ import {
   reachBadgeVariant,
 } from "@/components/network/match-grade";
 import { RenameContactDialog, type EditableContact } from "@/components/network/RenameContactDialog";
+import { CompareScopeButton } from "@/components/network/CompareScopeButton";
+import { RecentRuns } from "@/components/network/RecentRuns";
+import { ThresholdNote } from "@/components/network/ThresholdNote";
 import { useNetworkSearch } from "@/hooks/queries";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { readThreshold, withThreshold } from "@/hooks/useThreshold";
 
-const PAGE_SIZE = 20;
+/** Below this many contacts the list is scannable by eye, and a search box is one more control to
+ *  rule out. Measured on the company's own size — see `CONTROLS_MIN` on the Network tab. */
+const SEARCH_MIN = 10;
 
 /**
  * One company — everyone on file there, and who in your network can reach them.
@@ -37,6 +45,14 @@ const PAGE_SIZE = 20;
  * It reads the same endpoint Search does, keyed by an EXACT company name (`company=`), so the
  * people, the company-wide connection count and the reaching uploaders are exactly what a search
  * for this company would show — one source of truth, two front doors.
+ *
+ * ── Two reads of that endpoint, and the split is what makes the search box safe ──
+ *
+ * The list is paged and searchable (`company=` + `q=`); the tiles and the "who can reach this
+ * company" block are read from a second, deliberately unfiltered call. The company-wide facts are
+ * computed per row by the endpoint and are identical on every one of them, so this page has always
+ * taken them off row one — and a search that returns nobody has no row one. Without the split,
+ * mistyping a name would empty the tiles and read as the company losing its connections.
  *
  * ── The connections are rows, not chips (and Search's are still chips) ──
  *
@@ -63,19 +79,68 @@ export default function CompanyPage() {
    */
   const threshold = readThreshold(useSearchParams().get("threshold"));
   const [page, setPage] = React.useState(1);
-  const { data, isLoading } = useNetworkSearch({
+  /**
+   * The search over this company's own people — server-side, because the list is twenty at a time.
+   *
+   * A company can hold four hundred contacts, which is twenty pages, and "is our director in
+   * here" is not a question you can page your way through. It goes to the same endpoint with `q`
+   * beside the exact `company`, so it searches the whole company rather than the page in hand.
+   */
+  const [query, setQuery] = React.useState("");
+  const q = useDebouncedValue(query.trim(), 300);
+  // A new search is a new list, and page 4 of the old one is nowhere in it.
+  React.useEffect(() => setPage(1), [q]);
+
+  /**
+   * THE COMPANY, not the search — one row, kept apart from the list on purpose.
+   *
+   * The tiles and the "who can reach this company" tiles are company-wide facts: the endpoint
+   * computes them per row, so they are identical on every contact and the page has always read
+   * them off row one. That stops working the moment a search can empty the list — the reader would
+   * type a name, miss, and watch "Connections 7 · Reachable by 3" become nothing at all, which
+   * reads as the company losing its connections rather than as a search finding nobody.
+   *
+   * So this query never carries `q` and never moves off page 1. `limit: 1` because one row answers
+   * all of it, and it is cached under a stable key, so searching and paging cost nothing here.
+   */
+  const facts = useNetworkSearch({
     company,
+    page: 1,
+    limit: 1,
+    threshold: threshold ?? undefined,
+  });
+  /**
+   * `isFetching` matters here more than on any other list in the app, and it was not read at all.
+   *
+   * This request is SLOW — three correlated subqueries per row, 1.5–3s against a real database — and
+   * the query keeps the previous page on screen while the next one lands (`keepPreviousData`). With
+   * nothing rendering that wait, pressing "3" changed nothing whatsoever for three seconds: same
+   * twenty people, same everything, and then the rows silently swapped. The only conclusion available
+   * to the reader is that the pager does not work.
+   */
+  const { data, isLoading, isFetching } = useNetworkSearch({
+    company,
+    q: q || undefined,
     page,
     limit: PAGE_SIZE,
     threshold: threshold ?? undefined,
   });
+  // The list is showing an answer to a question that is no longer the one being asked — a page turn
+  // or a keystroke. NOT `isFetching` alone: the first load is the skeleton's job, and dimming a
+  // skeleton says nothing.
+  const stale = isFetching && !isLoading;
   const [editing, setEditing] = React.useState<EditableContact | null>(null);
 
   const rows = data?.data ?? [];
-  const total = data?.pagination.total ?? 0;
+  /** Everyone on file here, whatever the search is currently showing. */
+  const total = facts.data?.pagination.total ?? 0;
+  /** How many of them match the search — the same number when nothing is being searched for. */
+  const shown = data?.pagination.total ?? 0;
   const totalPages = data?.pagination.totalPages ?? 0;
-  // Company-wide facts — same on every row (they're company-scoped subqueries), so read row one.
-  const first = rows[0];
+  const searching = q.length > 0;
+  // Company-wide facts — same on every row (they're company-scoped subqueries), so read row one of
+  // the unfiltered query above.
+  const first = facts.data?.data[0];
   const connections = first?.companyConnections ?? 0;
   const connectionsConfirmed = first?.companyConnectionsConfirmed ?? 0;
   const reachedBy = first?.companyUploaders ?? [];
@@ -93,21 +158,42 @@ export default function CompanyPage() {
         title={company}
         description="Everyone on file at this company, and who in your network can reach them."
         actions={
-          !isLoading && total > 0 ? (
-            <Badge
-              variant={connections === 0 ? "outline" : reachBadgeVariant(connectionsConfirmed)}
-              className="h-7 gap-1 px-2.5"
-              title={connections > 0 ? companyReachTitle(connections, connectionsConfirmed) : undefined}
-            >
-              <Users className="h-3.5 w-3.5" />
-              {connections} connection{connections === 1 ? "" : "s"}
-              <ReachLeads connections={connections} confirmed={connectionsConfirmed} />
-            </Badge>
+          !facts.isLoading && total > 0 ? (
+            <div className="flex items-center gap-2">
+              <Badge
+                variant={reachBadgeVariant(connectionsConfirmed, connections)}
+                className="h-7 gap-1 px-2.5"
+                title={companyReachTitle(connections, connectionsConfirmed)}
+              >
+                <Users className="h-3.5 w-3.5" />
+                {connections} connection{connections === 1 ? "" : "s"}
+                <ReachLeads connections={connections} confirmed={connectionsConfirmed} />
+              </Badge>
+              {/*
+                Score this company's contacts against the friends on file — the answer to the
+                question this page raises and could not previously act on: "0 connections" here is
+                either a real finding or a company nobody has run a comparison over, and the two
+                were indistinguishable without leaving for the Network tab and re-picking a company
+                whose name is already the title of this page.
+
+                Beside the count rather than under the empty list, because it is worth pressing at
+                12 connections too — a different mode asks a different question of the same people.
+              */}
+              <CompareScopeButton scope={{ filterBy: "company", filterValue: company }} />
+            </div>
           ) : undefined
         }
       />
 
-      {isLoading ? (
+      {/* WHAT THIS PAGE IS BEING READ AT — the bar the tiles, the "known by" counts and every
+          connection below were fetched at, carried here on the link that opened the page. It was
+          invisible, which made a bar that arrived and a bar that was dropped look identical. See
+          `ThresholdNote`. */}
+      <ThresholdNote threshold={threshold} changeHref="/" className="-mt-4" />
+
+      {/* The COMPANY's load, not the list's — a keystroke in the search box must not replace the
+          page with skeletons. */}
+      {facts.isLoading ? (
         <CompanySkeleton />
       ) : total === 0 ? (
         <EmptyState
@@ -214,46 +300,98 @@ export default function CompanyPage() {
             <SectionHeader
               title="People at this company"
               description={`${total.toLocaleString()} on file — each connection shows which friend was matched against which name, whose relationship it is, and who uploaded it.`}
+              /* The box searches THIS COMPANY's people, server-side — see the `q` state above for
+                 why filtering the twenty rows in hand would be a different and much weaker claim.
+                 Offered only once the list is long enough to need it. */
+              actions={
+                total >= SEARCH_MIN ? (
+                  <div className="relative w-full sm:w-64">
+                    <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                    <Input
+                      value={query}
+                      onChange={(e) => setQuery(e.target.value)}
+                      placeholder="Search a person…"
+                      className="h-9 pl-9"
+                      aria-label={`Search people at ${company}`}
+                    />
+                  </div>
+                ) : undefined
+              }
             />
-            <div className="overflow-hidden rounded-lg border">
-              {rows.map((row) => (
-                <PersonRow
-                  key={row.id}
-                  row={row}
-                  threshold={threshold}
-                  onEdit={() => setEditing(toEditable(row))}
-                />
-              ))}
-            </div>
 
-            {totalPages > 1 && (
-              <div className="flex items-center justify-between gap-3 pt-1">
-                <p className="text-sm text-muted-foreground">
-                  Page {page} of {totalPages}
-                </p>
-                <div className="flex gap-2">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={page <= 1}
-                    onClick={() => setPage((p) => Math.max(1, p - 1))}
-                  >
-                    Previous
+            {/* Said only while a search is on, and stating BOTH numbers: "3 people" over a
+                filtered list reads as a company with three employees on file. */}
+            {searching && !isLoading && (
+              <p className="text-sm tabular-nums text-muted-foreground">
+                {shown.toLocaleString()} of {total.toLocaleString()} match “{q}”
+              </p>
+            )}
+
+            {isLoading ? (
+              <div className="space-y-2">
+                {[0, 1, 2].map((i) => (
+                  <Skeleton key={i} className="h-[64px] rounded-lg" />
+                ))}
+              </div>
+            ) : rows.length === 0 ? (
+              <EmptyState
+                icon={SearchX}
+                title={`No one here matches “${q}”`}
+                description="Try a shorter spelling, or clear the search to see everyone on file at this company."
+                action={
+                  <Button variant="outline" size="sm" onClick={() => setQuery("")}>
+                    Clear search
                   </Button>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={page >= totalPages}
-                    onClick={() => setPage((p) => p + 1)}
-                  >
-                    Next
-                  </Button>
-                </div>
+                }
+              />
+            ) : (
+              /* Dimmed while the next page is in flight — the same signal the Network tabs use, and
+                 the reason it is on the ROWS and not on the section: the header and the search box
+                 above are not being recomputed, and greying a box under the cursor reads as
+                 disabled. */
+              <div
+                className={cn(
+                  "overflow-hidden rounded-lg border transition-opacity",
+                  stale && "opacity-60"
+                )}
+              >
+                {rows.map((row) => (
+                  <PersonRow key={row.id} row={row} onEdit={() => setEditing(toEditable(row))} />
+                ))}
               </div>
             )}
+
+            {/* The summary counts what the SEARCH left (`shown`), which is what the list is
+                actually paging through — the company's own total is the tile above and the line
+                beside the search box, and repeating it here would label these pages with a number
+                they do not run to. */}
+            <Pager
+              page={page}
+              totalPages={totalPages}
+              onPageChange={setPage}
+              label="people at this company"
+              pending={stale}
+              summary={`Page ${page.toLocaleString()} of ${totalPages.toLocaleString()} · ${shown.toLocaleString()} ${
+                shown === 1 ? "person" : "people"
+              }`}
+              className="pt-1"
+            />
           </div>
         </>
       )}
+
+      {/*
+        WHAT HAS ALREADY BEEN ASKED ABOUT THIS COMPANY.
+        Beside the Compare button in the header rather than a tab away, because that is the moment
+        the answer matters: a run over these contacts in this mode may already exist, and opening
+        it costs nothing where running it again scores the same names a second time. Runs are
+        listed here and nowhere else — see `RecentRuns`.
+      */}
+      <RecentRuns
+        filter={{ axes: ["company"], value: company }}
+        title="Comparisons of this company"
+        emptyDescription={`No comparison has covered ${company} yet. Use Compare above to score these contacts against the friends on file.`}
+      />
 
       <RenameContactDialog
         contact={editing}
@@ -292,13 +430,12 @@ function toEditable(row: NameSearchRow): EditableContact {
  */
 function PersonRow({
   row,
-  threshold,
   onEdit,
 }: {
   row: NameSearchRow;
-  /** Passed down to each connection's owner link — the last link on this page that was still
-   *  dropping the bar, and the one a reader is most likely to click: the owner IS the next action. */
-  threshold: number | null;
+  /* The bar was drilled through here to reach each connection's owner link. It no longer is: the
+     provenance strip that draws that link reads the bar off the URL, so every surface carrying an
+     owner link carries the bar by construction rather than by remembering to. See `Provenance`. */
   onEdit: () => void;
 }) {
   const name = row.person_name_en || row.person_name_th || "(no name)";
@@ -345,7 +482,7 @@ function PersonRow({
             Known by {connections.length === 1 ? "1 friend" : `${connections.length} friends`}
           </p>
           {connections.map((u) => (
-            <ConnectionCard key={u.name} uploader={u} contact={row} threshold={threshold} />
+            <ConnectionCard key={u.name} uploader={u} contact={row} />
           ))}
         </div>
       )}

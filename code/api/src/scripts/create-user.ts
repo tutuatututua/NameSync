@@ -1,13 +1,17 @@
 import "dotenv/config";
 import { DBModel } from "@extensions/sqldb";
+import { createUser } from "../services/auth.service";
 import { UserModel } from "../models";
-import { hashPassword } from "../lib/password";
 
 /**
  * Create a user from the command line.
  *
- *   npm run create-user -- you@example.com 'a long passphrase' --name "Your Name" --admin
- *   npm run create-user -- them@example.com 'a long passphrase' --reviewer
+ *   npm run create-user -- you@example.com --name "Your Name" --admin
+ *   npm run create-user -- them@example.com --reviewer
+ *
+ * NO PASSWORD. Center holds the credential; a row here only says which Center identity is
+ * allowed in, and with what role. Creating an account does NOT create a Center account —
+ * the person must already be able to sign in to Center with this exact email.
  *
  * This exists because there is no public sign-up — Network Intel is an internal tool, and an
  * open /register would put the data behind nothing at all. So the first account has to be
@@ -24,7 +28,6 @@ import { hashPassword } from "../lib/password";
 
 interface Args {
   email: string;
-  password: string;
   name?: string;
   admin: boolean;
   reviewer: boolean;
@@ -48,8 +51,8 @@ function parseArgs(argv: string[]): Args | null {
     } else positional.push(arg);
   }
 
-  const [email, password] = positional;
-  if (!email || !password) return null;
+  const [email] = positional;
+  if (!email) return null;
   // Contradictory rather than additive: `reviewer` is a RESTRICTION, and an account holding
   // both would silently be a full-access account (hasFullAccess wins), which is the opposite
   // of what whoever typed --reviewer meant.
@@ -57,13 +60,16 @@ function parseArgs(argv: string[]): Args | null {
     console.error("--admin and --reviewer are mutually exclusive: a reviewer is read-only by definition.");
     return null;
   }
-  return { email, password, name, admin, reviewer };
+  return { email, name, admin, reviewer };
 }
 
 function usage(): never {
   console.error(
     [
-      "Usage: npm run create-user -- <email> <password> [--name \"Full Name\"] [--admin | --reviewer]",
+      "Usage: npm run create-user -- <email> [--name \"Full Name\"] [--admin | --reviewer]",
+      "",
+      "  No password: Center holds the credential. This only authorises a Center identity,",
+      "  so the email must be one that can already sign in to Center.",
       "",
       "  --admin      the whole app, plus creating further users via the API",
       "  --reviewer   the Network page, READ ONLY — no imports, no matcher runs, no edits",
@@ -78,13 +84,6 @@ function usage(): never {
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   if (!args) usage();
-
-  // Mirrors the API's own rule (contract/src/auth.ts). Enforced here too: a CLI that
-  // quietly accepts "hunter2" would make a liar of the rule the endpoint advertises.
-  if (args.password.length < 8) {
-    console.error("Password must be at least 8 characters.");
-    process.exit(1);
-  }
 
   const first = (await UserModel.countAll()) === 0;
   if (first && !args.admin) {
@@ -105,18 +104,15 @@ async function main(): Promise<void> {
   // account that can sign in and reach nothing at all.
   const roles = args.admin ? ["admin"] : args.reviewer ? ["reviewer"] : ["user"];
 
-  const user = await UserModel.create({
-    email: args.email,
-    passwordHash: await hashPassword(args.password),
-    name: args.name ?? null,
-    roles,
-  });
+  // Through the service, so the CLI and POST /api/auth/users create identical rows —
+  // including the unusable random password_hash that satisfies the NOT NULL column.
+  const user = await createUser({ email: args.email, name: args.name, roles });
 
-  console.log(`✓ Created user ${user.email} (id ${user.id}) with the ${roles[0]} role.`);
+  console.log(`✓ Created user ${user.email} (id ${user.sub}) with the ${roles[0]} role.`);
   if (args.reviewer) {
     console.log("  Read-only: the Network page and what it links to. No imports, runs or edits.");
   }
-  console.log("  Sign in at the frontend's /login.");
+  console.log("  They sign in at /login with their CENTER password — none is stored here.");
 }
 
 main()

@@ -1,6 +1,6 @@
 # The external matcher workflow
 
-How Network Intel hands an import to the workflow, and what the workflow must do with it.
+How Network Intel hands a run to the workflow, and what the workflow must do with it.
 
 This is a **contract between two systems that share one database**. Network Intel does not receive
 the results over HTTP — it reads them out of Postgres, by polling. So every promise below is
@@ -16,89 +16,155 @@ With the flag off (the default), Network Intel behaves exactly as it always has:
 **Compare** scores the names itself, in Postgres, and returns the run immediately. That path
 is untouched and still works — the flag chooses which matcher runs, and both remain.
 
-The `status` columns the workflow writes to are part of [`schema-redesign.sql`](schema-redesign.sql),
-so a database built from it is ready as-is. A database created from an *older* schema needs the
-drift migrations in [`migrations/`](migrations/) applied by hand — the app never issues DDL
-(`DB_SKIP_MIGRATE=1`), by design.
+The columns this document depends on are part of [`schema-redesign.sql`](schema-redesign.sql), so a
+database built from it is ready as-is. A database created from an *older* schema needs the drift
+files applied by hand — [`add-comparison-scope.sql`](add-comparison-scope.sql) is the one this
+release needs, and the app never issues DDL (`DB_SKIP_MIGRATE=1`), by design.
 
-> ### ⚠️ Coordinate first — `compare_sources` narrows a COMPANY import's friend pool, 2026-08-03
+> ### ⚠️ Coordinate first — `X-Value-Encoding: percent`, and Thai companies work at all, 2026-08-06
 >
-> Company imports gain a **`compare_sources`** CSV column and a matching **`X-Compare-Sources`**
-> header. It names which friends the contacts in this import should be matched against, by
-> `friend.source` — `facebook`, `linkedin`, `business card`, or a value the user added.
+> **Every company-scoped comparison on the live database was a 500, and none of them reached you.**
+> A header value is a ByteString — bytes 0–255, one per character — and `X-Filter-Value` carries a
+> company name. `ก` is U+0E01 = 3585, so `fetch` threw
+> `TypeError: Cannot convert argument to a ByteString ... value of 3585` while serialising the
+> headers, before anything left the process. All 1000 distinct company names on file are Thai. The
+> run was rolled back and the user saw "Internal Server Error"; you saw nothing, because nothing was
+> sent. Owner scopes escaped only because the one owner on file is spelled in ASCII.
 >
-> **Pipe-separated (`facebook|linkedin`). Absent header, or an empty cell, means EVERY source** —
-> which is what every run did before this existed, so a workflow that ignores it behaves exactly as
-> it does today for unscoped runs.
+> **The three headers carrying free text may now arrive percent-encoded**, and one new header says
+> when they have:
 >
-> **The failure mode is the `compare_by` one again: ignoring it does not error.** A run the user
-> scoped to LinkedIn comes back matched against every friend on file, the run's own page labels it
-> "LinkedIn", and its counts are quietly wider than the question asked. We cannot detect this — we
-> see your verdicts, not your candidate set.
+> | Header | |
+> |---|---|
+> | `X-Value-Encoding` | `percent` when `X-Filter-Value`, `X-Compare-Sources` and `X-Compare-Companies` are encoded. **Absent means they are not.** |
 >
-> Match `friend.source` **case-insensitively**. The values we send are already folded and sorted;
-> the column itself is free text and the Database console writes it too, so `Facebook` and
-> `facebook` are both on rows.
+> **What you must do — one branch, three headers:**
 >
-> **Social imports do NOT get this column, and that is not an oversight.** A friends import hands
-> you the exact rows to match, all of them carrying one `type` — there is no pool to narrow. Only
-> the company direction matches against a set it was not given.
+> ```
+> split the header on the literal "|", then URL-decode each part
+>   ... if X-Value-Encoding == "percent"
+> ```
 >
-> Additive and appended last, so reading it is safe today and a positional parser is unaffected.
+> Encoding is **all three or none**, decided per request, so you never have to ask which of them it
+> applied to. `X-Filter-Value` is a one-element list, so the same two lines read all three. The
+> other four headers are enum values and ids and are **never** encoded.
+>
+> **Requests with nothing to encode are byte-identical to before and carry no marker**, so the runs
+> working today keep working whether you implement this or not. It is the previously-broken ones —
+> every Thai company — that need it.
+>
+> **If you do not implement it, those runs stay at `processing`.** `%E0%B8%81...` matches no
+> `company_name`, you select nothing, and selecting nothing is not an error anywhere: the run sits
+> unfinished rather than coming back wrong. Loud, and by choice — but it does mean **a Thai company
+> comparison does not work until this ships on your side.**
+>
+> **A `|` inside a value now forces encoding too, on runs with no Thai in them at all.** `|` is the
+> list separator, so a company genuinely named `Gulf | Trading` was arriving as two companies that do
+> not exist. Encoded per element, the separator means one thing and the pipe survives.
+
+> ### 🛑 BREAKING — THE CSV IS GONE. The request is its headers, 2026-08-05
+>
+> **Stop parsing the request body. There isn't one.** Every request on this page — imports
+> included — is now a `POST` with `Content-Length: 0` and no `Content-Type`. What used to be a
+> `multipart/form-data` file part carrying up to 100,000 rows is seven headers, and a
+> 100,000-row import is byte-for-byte the same request as a two-row one.
+>
+> **For most integrations this is close to a no-op, and that is the point.** You already select
+> what to match with `WHERE upload_id = :session_id`. The file was a stale copy, built at cost, of a
+> table you were about to query anyway — and two of the bugs recorded further down this page are
+> that copy drifting from the table it copied. What you were ignoring has stopped being sent.
+>
+> **What you must change:**
+>
+> | Was | Is now |
+> |---|---|
+> | `X-Upload-ID`, `X-Session-ID` | **gone** — use `X-Filter-Value` (it is the upload id on an import) |
+> | `X-Compare-By` | **gone** — read `X-Compare-Type` and `X-Compare-Language`, as this page always asked |
+> | `X-Row-Count` | **gone** — count your own selection; there is no download to verify |
+> | any CSV column | **gone** — every one of them is a column of the row you are selecting anyway |
+>
+> **The one genuinely new obligation is on the friends side**: `X-Compare-Sources` is now sent on
+> BOTH webhooks. It used to be company-only, which meant an owner-scoped run narrowed to LinkedIn
+> went out unnarrowed and came back matched against every source, with the run's own page labelling
+> it "LinkedIn". `X-Compare-Companies` is the new mirror of it. Both are absent when nothing was
+> narrowed, so ignoring them behaves exactly as today for unnarrowed runs.
+>
+> **`comparison_result.upload_name` is the one write that changes.** It was filled from the CSV's
+> `upload_person_name` column. Read it off `friend.relationship_owner` on the row you selected — the
+> same fact, from the place it is authoritative. See the 2026-07-30 note in [§2b](#b-the-result-if-it-matched)
+> for what happened the last time this column was sourced from the wrong place.
+
+> ### ✅ No action needed — duplicate rows are dropped at import again, 2026-08-05
+>
+> **This reverses the "imports STACK" note of 2026-08-04, which is deleted rather than amended
+> because following it would now be wrong.** For one day Network Intel wrote every row of every
+> import, duplicates included, so that a re-imported person landed under the new `upload_id` where
+> your query could reach them.
+>
+> The reasoning was sound and the fix was not: it wrote a complete second copy of a 40,000-row file
+> to solve a query problem. The query problem is solved properly now — you are pointed at rows
+> rather than handed a copy of them — so the duplicate write has no job left to do.
+>
+> **What this means for you: nothing you can observe, except size.** A re-import of a file you
+> already hold selects fewer rows, or none. An import that would write nothing at all is refused
+> before it reaches you, so you will not be handed an empty job.
+>
+> A row is a duplicate only if it is identical **including the importer**: two colleagues who both
+> have the same contacts each keep their own copy, and a row carrying a spelling the stored row
+> lacks is not a duplicate and is written.
+
+> ### ✅ No action needed — imports are always `en_full`, 2026-08-05
+>
+> The import screen's "How to compare" picker is gone. Every import-driven run sends
+> `compare_type=full`, `compare_language=en` — always, on both directions.
+>
+> **Do not hard-code that.** The headers are still sent on every request and still vary, because a
+> comparison started from the Network page ([§1c](#c-the-run-scope)) picks its own mode and is now
+> the only source of `th_*` and of `*_name` / `*_surname` runs. A workflow that started ignoring
+> `compare_language` on the grounds that imports are always English would answer every one of those
+> with the wrong question, silently.
+
+> ### ⚠️ Coordinate first — `filter_by` / `filter_value` decide WHERE THE ROWS COME FROM, 2026-08-05
+>
+> Every request carries `X-Filter-By` and `X-Filter-Value`, and **they are the instruction**: they
+> name which rows you are being asked to score. See [§1c](#c-the-run-scope).
+>
+> A workflow that ignores them selects nothing, stamps nothing, and the run sits unfinished until
+> somebody looks. That is the failure mode we want — visible, not silent — but it means **no run of
+> any kind works until your side reads these keys.**
+>
+> **One new obligation: `UPDATE lakeshore.comparison SET status = 'completed' WHERE id = :comparison_id`
+> when you finish a run whose `filter_by` is NOT `upload`.** We cannot work it out. For an import we
+> count that import's unstamped rows and close the run when none are left ([the flow](#the-flow)); a
+> scoped run has no such row set, because deciding what it covers is exactly what was delegated to
+> you.
 
 > ### ⚠️ Coordinate first — `compare_by` decides what "match" means, 2026-07-27
 >
-> The CSV gains **`compare_type`**, **`compare_language`** and **`compare_by`** columns, and the
-> request gains the matching **`X-Compare-Type`**, **`X-Compare-Language`** and **`X-Compare-By`**
-> headers. They carry the run's comparison mode: which part of each name to compare, and which
-> language to compare it in. See [§1b](#b-the-comparison-mode).
->
-> **A workflow that ignores it does not fail — it answers a different question and reports the
+> **A workflow that ignores the mode does not fail — it answers a different question and reports the
 > answer as though it were the right one.** A run the user configured as "last name, Thai" comes
 > back full-name-matched, the results table labels it "Last name · Thai", and nothing anywhere
-> disagrees. That is the entire risk in this change, and it is invisible from our side: we cannot
-> see your matching, only your verdicts.
+> disagrees. That is invisible from our side: we see your verdicts, not your matching.
 >
-> Unlike the `is_complete` break below, **this one can and should be fixed on your side first.**
-> The columns are additive, appended after `comparison_id`, so reading them is safe today. The
-> order is: teach the workflow to read `compare_type` and `compare_language` (and to fail loudly on
-> a value it does not recognise), *then* the mode picker goes live.
->
-> **There is no longer a "compare both languages" mode.** `either` existed until 2026-07-27 and was
-> the default; it scored a name against both of a contact's spellings and kept the better, so a
-> mixed-script file matched in one pass. It is gone. **Every run now compares exactly one
-> language**, and the default is `en_full` — English, whole names. A friends list holding both
-> scripts takes two runs, one per language, and each reports the other language's names as
+> **There is no "compare both languages" mode.** `either` existed until 2026-07-27 and was the
+> default; it scored a name against both of a contact's spellings and kept the better. It is gone.
+> **Every run compares exactly one language**, and the default is `en_full`. A friends list holding
+> both scripts takes two runs, one per language, and each reports the other language's names as
 > unmatched rows that Network Intel renders as "Not compared".
->
-> The same release adds `uploader_name`, `type` and `relationship_owner`. Those are informational
-> and safe to ignore — but read the note on `upload_person_name` in [§1](#1-what-networkintel-sends)
-> before assuming you know which person it names.
 
 > ### ⚠️ Breaking change — `comparison_result.is_complete` is gone
 >
-> [`migrations/2026-07-17-single-clean-name-and-result-status.sql`](migrations/2026-07-17-single-clean-name-and-result-status.sql)
-> **drops the `is_complete` column** from `comparison_result` and adds `status` in its place.
-> Any workflow whose `INSERT` names `is_complete` starts failing with
-> `ERROR: column "is_complete" of relation "comparison_result" does not exist` **the moment that
-> migration lands** — not gradually, and not with a warning. There is no compatibility window,
-> because a dropped column has no reads left to serve.
->
-> **So the migration and the workflow must be coordinated: change the workflow's `INSERT` first**
-> (to the template in [§2b](#b-the-result-if-it-matched)), or take the workflow's writes down for
-> the duration and apply both together.
->
-> The same migration collapses the `_clean` name columns into one column per name — see
-> [§1](#1-what-networkintel-sends). A workflow reading `person_name_th_clean`, `fb_name_clean` or the
-> `timestamp` column out of the CSV stops finding them at the same moment.
+> The column was **dropped** from `comparison_result` and `status` added in its place. Any workflow
+> whose `INSERT` names `is_complete` fails with
+> `ERROR: column "is_complete" of relation "comparison_result" does not exist`. There is no
+> compatibility window, because a dropped column has no reads left to serve.
 >
 > This does **not** affect the `is_complete` field on the HTTP callback body, which is a different
 > thing that survives untouched — see [§4](#4-the-http-callback-path).
 
 **`COMPANY_WEBHOOK_URL` and `FACEBOOK_WEBHOOK_URL` are required with the flag on.** The
 webhook is the pipeline in this mode, so an import is refused up front (503, nothing stored)
-if its URL is missing. With the flag off the URLs are optional — an unconfigured one just
-means the import isn't forwarded anywhere.
+if its URL is missing.
 
 ---
 
@@ -110,11 +176,12 @@ user imports a file
         ▼
 Network Intel  ─── writes rows to friend / company_contact, each status='processing'
           ─── creates one `comparison` row (status='processing')  ← this is the run
-          ─── POSTs the rows to the webhook, carrying the comparison id
+          ─── POSTs seven headers and NO BODY, naming which rows the run covers
         │
         ▼
-workflow  ─── matches each row against the opposite table
-          ─── writes comparison_result rows  (the pair + the score)
+workflow  ─── SELECTS those rows out of Postgres itself
+          ─── matches each against the opposite table
+          ─── writes comparison_result rows  (the pair + the verdict)
           ─── stamps each source row  status = 'match' | 'unmatch'
         │
         ▼
@@ -124,155 +191,103 @@ Network Intel  ─── polls: "does this upload still have unfinished rows?"
           ─── the user, who has been watching the Compare page, sees the results
 ```
 
-A **Facebook** import is matched against every contact in `company_contact`.
-A **company** import is matched against every friend in `friend`.
-(Which is why an import can start a run on its own — the other side is already on file.)
+The last step is **imports only** (`filter_by=upload`). Every other run is closed by you — see
+[§1c](#c-the-run-scope).
+
+A **friends** selection is matched against every contact in `company_contact`.
+A **company** selection is matched against every friend in `friend`.
 
 ---
 
 ## 1. What Network Intel sends
 
-`POST` to `FACEBOOK_WEBHOOK_URL` (social imports) or `COMPANY_WEBHOOK_URL` (company imports),
-as `multipart/form-data` with a single `file` part — a CSV, exactly as today.
+`POST` to `FACEBOOK_WEBHOOK_URL` (the friends side) or `COMPANY_WEBHOOK_URL` (the company side),
+with **no body**. Everything is in the headers.
 
 **Headers**
 
-| Header | Meaning |
-|---|---|
-| `X-Upload-ID` | The **upload** id. Which import this is. |
-| `X-Session-ID` | Same value as `X-Upload-ID` — the legacy spelling, kept for workflows already reading it. |
-| `X-Comparison-ID` | The **run** id. **Write `comparison_result.comparison_id` with this.** |
-| `X-Row-Count` | How many data rows the CSV holds (excluding the header). |
-| `X-Compare-Type` | `full` \| `name` \| `surname` — **which part of the name to compare.** Always sent. |
-| `X-Compare-Language` | `en` \| `th` — **which language to compare in.** Always sent. |
-| `X-Compare-By` | The two joined, `'<language>_<type>'`. Traceability; branch on the two above. |
-| `X-Compare-Sources` | **Company imports only.** Which friends to match these contacts against, by `friend.source`, pipe-separated (`facebook\|linkedin`). **Absent means every source.** |
-
-`X-Comparison-ID` is the important one: it is the only way the results you write can be
-attached to the run the user is watching. `X-Row-Count` lets you size the job — and tell a
-truncated download from a small import — without parsing the file first.
-
-The three mode headers are always present, where `X-Comparison-ID` is omitted when there is no run.
-That asymmetry is deliberate: "there is no run" is a state you can act on, but "there is no mode" is
-not — you would have to guess, and the guess that looks harmless (whole names) is precisely the
-wrong answer to send back for a run the user configured as a surname match.
-
-**CSV columns — company import**
-
-```
-uuid,company_name,person_name_th,person_name_en,upload_person_name,status,session_id,comparison_id,uploader_name,type,compare_type,compare_language,compare_by,compare_sources
-```
-
-**CSV columns — social import**
-
-```
-uuid,fb_name,upload_person_name,status,session_id,comparison_id,relationship_owner,uploader_name,type,compare_type,compare_language,compare_by,friend_name_en,friend_name_th
-```
-
-The columns after `comparison_id` are new as of 2026-07-27, and `friend_name_en` / `friend_name_th`
-as of 2026-07-28. All are **appended**, never interleaved, so a positional parser keeps working and
-a header-keyed one gains keys it may ignore.
-
-**`fb_name` is not going away on the CSV, and this release does not change it.** A friend used to
-have one name; since 2026-07-28 they have a column per language, symmetric with the company side.
-`fb_name` still carries the single name a one-spelling friend has — and the English one when both
-exist — which is exactly what it always carried, so a workflow that ignores the two new columns
-reads this CSV as it does today.
-
-When you are ready, prefer them: branch on `compare_language` and score `friend_name_th` for `th`
-and `friend_name_en` for `en`, instead of scoring `fb_name` against whichever contact column the
-mode selected. That is the change that makes a mixed-script friends list matchable in one pass per
-language rather than by inference from the characters. Tell us when you have, and `fb_name` goes.
-
-> Note that the WRITE side moved ahead of this on 2026-08-03: the `comparison_result.friend_name`
-> column you `INSERT` into is gone, replaced by `friend_name_en` / `friend_name_th`. What you READ
-> here is unchanged. See [§2b](#b-the-result-if-it-matched).
-
-A row may have **one** of the two columns empty. That is normal and not an error — it means we hold
-only one spelling for that person. A row with BOTH empty cannot occur: it is what our import gate
-drops on.
-
-`uuid` is the row's primary key — `company_contact.id` or `friend.id`. It is what you write
-back against. `status` will read `processing` on every row, because that is what it is.
-
-**There is one column per name, and it is already cleaned.** Titles, suffixes and nicknames are
-stripped and the result is **lower-cased**, at import, before the row is stored — so
-`Mr. Somchai Jaidee` arrives as `somchai jaidee` and `นายสมชาย ใจดี` as `สมชาย ใจดี`. **Match on the
-column you are handed**: it is the only spelling Network Intel stores, and it is exactly what the
-internal matcher matches on. Middle names are **kept** (`Somchai J. Jaidee` → `somchai j. jaidee`).
-
-There are no `_clean` columns any more, and no `timestamp` column — both were dropped on
-2026-07-17. The `_clean` twins existed to sit beside a raw column that no longer exists; a
-workflow matching on the name it is given is now matching on the right thing by construction,
-rather than by remembering which of two columns was the good one.
-
-A name cell is **empty** when nothing survived cleaning (a "name" that was only a title, e.g.
-`Mr.`). There is no raw column to fall back to — an empty cell means there was no name here.
-
-`company_name` is the exception: it is **tidied only** (whitespace and invisible characters),
-**not** cleaned and **not** lower-cased. Its capitalisation is the file's own. Match it
-case-insensitively.
-
-The `comparison_id` column carries the same value as the `X-Comparison-ID` header. It is
-duplicated into every row on purpose: a row-wise tool (n8n and friends) can reach a CSV cell
-far more easily than a request header. `uploader_name`, `type`, `compare_type`,
-`compare_language` and `compare_by` are repeated per row for the same reason and are likewise
-constant across the file.
-
-### The four people-and-provenance columns
-
-Three of these are new and one changed what it points at without changing what it means. Read
-this before wiring any of them up.
-
-| Column | Per | What it is |
+| Header | Meaning | Sent |
 |---|---|---|
-| `upload_person_name` | row (social) / file (company) | **The relationship owner** — unchanged in meaning. Write it to `comparison_result.upload_name`, as you always have. |
-| `relationship_owner` | row | The same value under its honest name. Social imports only. |
-| `uploader_name` | file | Who *performed* the import. **New, and not the same person.** |
-| `type` | file | Where the data came from: `facebook`, `linkedin`, `business card`, or a value the user added. |
+| `X-Comparison-ID` | The **run** id. **Write `comparison_result.comparison_id` with this.** | always, except on an ingestion-only notice (see below) |
+| `X-Filter-By` | `upload` \| `company` \| `owner` \| `file` — **which rows.** | always |
+| `X-Filter-Value` | The one value that axis takes. | always |
+| `X-Compare-Type` | `full` \| `name` \| `surname` — **which part of the name to compare.** | always |
+| `X-Compare-Language` | `en` \| `th` — **which language to compare in.** | always |
+| `X-Compare-Sources` | Restrict `friend.source` to these, pipe-separated (`facebook\|linkedin`). | only when narrowed |
+| `X-Compare-Companies` | Restrict `company_contact.company_name` to these, pipe-separated. | only when narrowed |
+| `X-Value-Encoding` | `percent` — **the three free-text headers above are percent-encoded.** | only when needed |
 
-**`upload_person_name` still names the relationship owner.** Until 2026-07-27 it was sourced from
-`upload.uploaded_by`, back when that column meant "the owner for this import"; it is now sourced
-from `friend.relationship_owner`, which means the same thing per row. **If you write it to
-`comparison_result.upload_name` today, keep doing exactly that** — the value is the same fact,
-now correct on a file that carries several owners rather than collapsed to one.
+**Five that are always there, and two that mean "no restriction" by being absent.** That asymmetry
+is deliberate. A missing mode or a missing scope has no safe reading — you would have to guess, and
+the guess that looks harmless is precisely the wrong answer. A missing narrowing has exactly one
+reading, and it is what every run did before the header existed.
 
-**Do not switch that write to `uploader_name`.** It is a different person: an assistant importing
-on a salesperson's behalf is the case that split the two. Writing the importer there re-files every
-contact under whoever happened to press the button, and nothing errors.
+`X-Comparison-ID` is omitted in one case: `EXTERNAL_MATCHER` is off and the request is a pure
+ingestion notice, because Network Intel scored the names itself and there is no run to write into.
+Omitted rather than blank — "there is no run" is a state you can act on, where `X-Comparison-ID: ""`
+looks like a run whose id happens to be empty.
 
-`relationship_owner` is offered alongside the alias, not instead of it, so an existing workflow
-needs no change and a new one can read the name that says what it means.
+### The two narrowings
 
-> **This happened, and the fix is on our side (2026-07-30).** A workflow did write `uploader_name`
-> into `comparison_result.upload_name`. Because the product grouped every roster by that column,
-> one wrong string broke three things at once and logged nothing: chips named the importer, the
-> roster page behind them came back empty, and `count(distinct friend)` fell to zero — a company
-> page reading "Connections 0" beside "Reachable by 1".
->
-> **Network Intel no longer derives ownership from this column.** Rosters are keyed on
-> `friend.relationship_owner`, resolved through the friend row each result names — by `friend_id`
-> when you send one, otherwise by either name spelling. A result we cannot resolve to a friend row
-> now has **no owner**: it produces no roster entry and no "known by" chip, rather than a chip
-> naming somebody whose roster does not exist. The value you send still surfaces as plain text on
-> the run tables and the results payload, where it is read as "what the matcher claimed" rather than
-> as a fact about ownership.
->
-> The request above is unchanged: **please still write the owner there.** It is what makes the
-> resolution exact instead of a name lookup, and it is what the run tables show. But it is no longer
-> load-bearing, so getting it wrong now costs precision rather than correctness.
->
-> **The one thing worth adding, if you can:** send `friend_id`, straight from the `uuid` column of
-> the CSV you were handed. It is the friend row's primary key, it removes the name lookup entirely,
-> and it is immune to every spelling question on this page.
+One rule covers both: **apply it to the table it names.**
+
+That reads two different ways depending on which webhook you are on, and both fall out of the same
+sentence without a branch:
+
+- On the **company** webhook you select contacts, so `X-Compare-Companies` narrows your SELECTION
+  and `X-Compare-Sources` narrows the friends you match them against.
+- On the **friends** webhook you select friends, so `X-Compare-Sources` narrows your SELECTION and
+  `X-Compare-Companies` narrows the contacts you match them against.
+
+Match both **case-insensitively**. The values we send are already folded and sorted; the columns
+themselves are free text and the Database console writes them too, so `Facebook` and `facebook` are
+both on rows.
+
+**Pipe-separated, not comma-separated.** Both axes are free text a user can enter: a source may be
+`trade show, bangkok` and a company is routinely `Wire Demo, Inc.`, so a comma inside a value would
+leave you unpicking quoting from list syntax in one string.
+
+**The failure mode is the `compare_by` one.** Ignoring a narrowing does not error — the run comes
+back wider than the question asked, its page labels it with the narrowing anyway, and its counts are
+quietly wrong. We cannot detect it: we see your verdicts, not your candidate set.
+
+### Reading a free-text header
+
+`X-Filter-Value`, `X-Compare-Sources` and `X-Compare-Companies` are the three headers carrying words
+a user typed. All three are read the same way:
+
+```
+parts = header.split("|")
+if X-Value-Encoding == "percent":
+    parts = [url_decode(p) for p in parts]
+```
+
+`X-Filter-Value` is a **one-element list**, so those two lines cover it too and there is no second
+rule to remember. The other four headers are enum values and ids — never encoded, never split.
+
+**Why encoding exists at all: a header cannot hold Thai.** A header value is a ByteString, one byte
+per character, and `ก` is U+0E01 = 3585. Sending it raw is not a formatting compromise, it is a
+`TypeError` on our side before the request is built — which is precisely what happened to every
+company-scoped run on the live database until 2026-08-06.
+
+**Absent means the values are literal**, and a request with nothing to encode is byte-identical to
+one sent before this header existed. So the encoding path is only ever exercised by runs that could
+not previously be sent at all.
+
+**Decode before you fold or compare.** `lower('%E0%B8%81')` is not the company anyone named. If you
+skip the decode, you select zero rows and the run stays at `processing` — visibly unfinished, which
+is the failure this contract prefers, but unfinished all the same.
+
+**Encoding is per element, so the separator is always literal.** A value containing `|` arrives as
+`%7C` and a run whose values are otherwise plain ASCII is encoded for that reason alone — a company
+named `Gulf | Trading` is one company, and splitting first then decoding keeps it that way.
 
 ### b. The comparison mode
 
-Two independent axes. **Read `compare_type` and `compare_language`; ignore `compare_by`** — it is
-the two joined (`'<language>_<type>'`), sent so a support question about a run is answered by one
-cell, and splitting it yourself is exactly the parsing that goes wrong quietly.
+Two independent axes. `compare_by` as a single value is **gone from the wire** — it was the two
+joined, and this page always told you to read the two.
 
-| `compare_by` | `compare_type` | `compare_language` |
+| The run's stored `compare_by` | `X-Compare-Type` | `X-Compare-Language` |
 |---|---|---|
 | `en_full` | `full` | `en` |
 | `en_name` | `name` | `en` |
@@ -281,8 +296,8 @@ cell, and splitting it yourself is exactly the parsing that goes wrong quietly.
 | `th_name` | `name` | `th` |
 | `th_surname` | `surname` | `th` |
 
-**`compare_type` — how much of each name to score.** Names arrive whole and already cleaned; split
-on whitespace.
+**`compare_type` — how much of each name to score.** Names are stored whole and already cleaned;
+split on whitespace.
 
 - `full` — the whole string.
 - `name` — the first token (the given name).
@@ -292,144 +307,152 @@ on whitespace.
   apply the two-token reading to a two-token name — it would be the whole name, and `surname` would
   quietly become `full` for the commonest shape there is.
 
-**`compare_language` — which spelling of a company contact to score against.**
+**`compare_language` — which spelling to score on each side.**
 
-- `en` — score against `person_name_en` only.
-- `th` — score against `person_name_th` only.
+- `en` — `person_name_en` on the contact, `friend_name_en` on the friend.
+- `th` — `person_name_th` on the contact, `friend_name_th` on the friend.
 
-There is no "both" any more. `either` was the default until 2026-07-27 and scored against both
-columns, keeping the better; it is gone, so **every run compares exactly one language** and the
-default is `en_full`.
+Both tables have one column per language. A row may have **one** of the two empty; that is normal
+and means we hold only one spelling for that person. A row with BOTH empty cannot occur — it is what
+the import gate drops on.
 
-It selects the **contact's** column, not the friend's. A friend has one name (a social export
-carries a single `name` field), so there is no second spelling on that side to select between.
-A Latin-script friend scored against `person_name_th` will match nothing, and that is the
-expected outcome rather than an error — Network Intel renders those rows as *"Not compared"*,
-distinct from *"No match"*, and does so from its own reading of the text.
-
-The net effect, and how the UI describes it to the user: **`th` matches Thai names with Thai
-names, `en` matches English with English.** Network Intel excludes the other language's friends
-from the run rather than reporting them as unmatched, so those two statements describe the same
-behaviour — the column-level wording above is the precise instruction for your `INSERT`, and the
-language-level wording is what it amounts to. You are free to skip the mismatched rows outright
-rather than scoring them; just stamp them (`unmatch` is right) so the import can finish.
+A row with nothing in the run's language cannot be scored. **Stamp it `unmatch` anyway** — it is
+finished, and leaving it `processing` hangs the run forever. Network Intel renders those as
+*"Not compared"* rather than *"No match"*, working it out from the stored columns.
 
 **If you receive a `compare_type` or `compare_language` you do not recognise, fail the row loudly**
-(`status = 'fail'`) rather than falling back to whole-name matching. A failed row is visible in the UI and someone will act
-on it; a silently full-name-matched row is indistinguishable from a correct one.
+(`status = 'fail'`) rather than falling back to whole-name matching. A failed row is visible in the
+UI and someone will act on it; a silently full-name-matched row is indistinguishable from a correct
+one.
 
-### The request, in full
+### c. The run scope
 
-This is the whole of what arrives — a company import of two contacts who share an employer with
-a comma in its name, so the quoting rules are visible rather than described. The second contact
-was recorded in the file as `สุดา "Su" ใจดี` / `Suda "Su" Jaidee`; note what reaches you:
+**Two headers, and the pair that tells you what to DO rather than how to do it.**
 
-```http
-POST /company HTTP/1.1
-host: wf.promptxai.com
-x-upload-id: 22
-x-session-id: 22
-x-comparison-id: 12
-x-row-count: 2
-x-compare-type: full
-x-compare-language: en
-x-compare-by: en_full
-x-compare-sources: linkedin
-content-type: multipart/form-data; boundary=----formdata-undici-056721390935
+| `X-Filter-By` | `X-Filter-Value` is | You select | Who closes the run |
+|---|---|---|---|
+| `upload` | an `upload.id` | that import's rows | **us** |
+| `company` | a company name | contacts at that company | **you** |
+| `owner` | a `friend.relationship_owner` | that person's friends | **you** |
+| `file` | an `upload.id` | that import's rows | **you** |
 
-------formdata-undici-056721390935
-Content-Disposition: form-data; name="file"; filename="company-22.csv"
-Content-Type: text/csv
+```sql
+-- Which TABLE is the URL you were called on, always:
+--   FACEBOOK_WEBHOOK_URL → lakeshore.friend
+--   COMPANY_WEBHOOK_URL  → lakeshore.company_contact
 
-uuid,company_name,person_name_th,person_name_en,upload_person_name,status,session_id,comparison_id,uploader_name,type,compare_type,compare_language,compare_by,compare_sources
-325,"Wire Demo, Inc.",ปรีชา วงศ์,preecha wong,Nadhee,processing,22,12,Nadhee,,full,en,en_full,linkedin
-326,"Wire Demo, Inc.",สุดา ใจดี,suda jaidee,Nadhee,processing,22,12,Nadhee,,full,en,en_full,linkedin
-------formdata-undici-056721390935--
+-- filter_by = 'upload' or 'file'
+SELECT * FROM lakeshore.friend WHERE upload_id = :filter_value;
+-- filter_by = 'owner'
+SELECT * FROM lakeshore.friend WHERE lower(relationship_owner) = lower(:filter_value);
+-- filter_by = 'company'
+SELECT * FROM lakeshore.company_contact WHERE lower(company_name) = lower(:filter_value);
 ```
 
-`type` is empty here because a company import has no source type — the axis describes where a
-*friends* list came from. An empty cell is the normal case on this side, not a missing value.
+Match `filter_value` **case-insensitively** for `company` and `owner`: a company name keeps its
+file's capitalisation and an owner keeps the one a human typed, so both are stored unfolded. For
+`upload` and `file` it is an id — compare it exactly.
 
-**`type` and `compare_sources` are different facts and this row shows why they must not be
-conflated.** `type` is empty (these are contacts; they came from no roster) while `compare_sources`
-says `linkedin` — the user asked for these two contacts to be matched against their LinkedIn
-friends and nobody else. Match `friend.source` against that list, case-insensitively; had the cell
-been empty, every friend would be a candidate.
+**`upload` and `file` are the same query.** That is not an oversight and they are not being merged:
+they differ in the one thing you cannot derive, which is who marks the run `completed`. An import's
+rows are a set we wrote and can therefore count down to zero; a `file` re-run covers rows nobody is
+tracking, so we would be guessing between "still working" and "finished with nothing to say", and we
+do not guess.
 
-And a social import of two friends:
+**`file` names ONE IMPORT, not a source type.** "Every LinkedIn friend" is `X-Compare-Sources`,
+which is a different axis.
+
+**Which table a `file` scope means is decided by the import, not by you** — but you do not have to
+work it out: we send it to the webhook for the side it selects. A `file` scope arriving at
+`FACEBOOK_WEBHOOK_URL` selects `friend`; one arriving at `COMPANY_WEBHOOK_URL` selects
+`company_contact`. Same for `owner` (always friends) and `company` (always contacts).
+
+#### You must close every run that is not an import
+
+```sql
+UPDATE lakeshore.comparison SET status = 'completed', updated_at = now()
+ WHERE id = :comparison_id;
+```
+
+The run stays `processing` until you say otherwise, and the user sees a run that is still going.
+That is the visible failure this codebase prefers to a silent wrong answer.
+
+### The five things that reach you
+
+| Webhook | Started by | `X-Filter-By` | `X-Filter-Value` |
+|---|---|---|---|
+| friends | a friends import | `upload` | the new `upload.id` |
+| friends | "compare this owner" | `owner` | a `relationship_owner` |
+| company | a company import | `upload` | the new `upload.id` |
+| company | "compare this company" | `company` | a company name |
+| either | "compare this past import" | `file` | that `upload.id` |
+
+The last routes by what the import wrote: a friends import's `file` scope arrives on the friends
+webhook, a company import's on the company one.
+
+### The request, in full — an owner-scoped run
 
 ```http
 POST /facebook HTTP/1.1
 host: wf.promptxai.com
-x-upload-id: 23
-x-session-id: 23
-x-comparison-id: 13
-x-row-count: 2
+x-comparison-id: 41
+x-filter-by: owner
+x-filter-value: Mint
 x-compare-type: surname
 x-compare-language: th
-x-compare-by: th_surname
-content-type: multipart/form-data; boundary=----formdata-undici-012377751986
+x-compare-sources: linkedin
+content-length: 0
 
-------formdata-undici-012377751986
-Content-Disposition: form-data; name="file"; filename="facebook-23.csv"
-Content-Type: text/csv
-
-uuid,fb_name,upload_person_name,status,session_id,comparison_id,relationship_owner,uploader_name,type,compare_type,compare_language,compare_by
-1320,preecha wong,Mint,processing,23,13,Mint,Nadhee,facebook,surname,th,th_surname
-1321,สุดา ใจดี,Nadhee,processing,23,13,Nadhee,Nadhee,facebook,surname,th,th_surname
-------formdata-undici-012377751986--
 ```
 
-This one is worth reading closely — it is the shape the new columns exist for:
+That is the whole request. Select `friend` where `lower(relationship_owner) = lower('Mint')` and
+`lower(source) = 'linkedin'`, score every row against `company_contact` under `th_surname`, write
+your `comparison_result` rows against comparison 41, stamp each `friend.status`, then mark
+comparison 41 `completed`.
 
-- **The two rows have different owners, from one file.** Row 1320 is Mint's contact, row 1321 is
-  Nadhee's, and `uploader_name` says Nadhee uploaded both. That is the assistant case. Match each
-  row and write `comparison_result.upload_name` from `upload_person_name` / `relationship_owner`
-  **per row** — a workflow that reads the owner once from row 1 and applies it to the file will
-  file Mint's contacts under Nadhee.
-- **`compare_type` is `surname` and `compare_language` is `th`**, so score `fb_name`'s last token
-  against `person_name_th`'s last token — nothing against `person_name_en`.
-- **Row 1320 has no Thai text**, so under this mode there is nothing to compare it with. Score it
-  against nobody and stamp it `unmatch` (it is finished — leaving it `processing` hangs the
-  import forever). Network Intel will show it as *"Not compared"* rather than *"No match"*,
-  working that out from the text itself.
+### The request, in full — a company import
 
-Things worth reading twice:
+```http
+POST /company HTTP/1.1
+host: wf.promptxai.com
+x-comparison-id: 12
+x-filter-by: upload
+x-filter-value: 22
+x-compare-type: full
+x-compare-language: en
+content-length: 0
 
-- **It is a file part, not a request body.** One part, named `file`, `text/csv`, with a `.csv`
-  filename. Read it the way you would read an uploaded attachment. A raw `text/csv` body is what
-  this *used* to send, and Fastify answered every one of them with `415`.
-- **The boundary is generated per request.** Never hard-code it — parse the `content-type`.
-- **Quoting is RFC 4180.** A field is quoted only if it holds a comma, a double-quote or a
-  newline; an embedded double-quote is doubled (`""`). `"Wire Demo, Inc."` above is real output,
-  not an illustration. A naive `split(",")` tears that row in half — use a CSV parser.
-- **Quoting bites on `company_name` and the person columns (`upload_person_name`,
-  `relationship_owner`, `uploader_name`), not on the names.** Cleaning
-  removes commas and quotes from a person's name, so `person_name_*` and `fb_name` arrive bare;
-  `company_name` is tidied only, so it keeps whatever punctuation the file had. Parse properly
-  anyway — which fields need quoting is not a promise, it's an artifact of this month's data.
-- **The names are lower-cased; `company_name` is not.** `preecha wong` and `suda jaidee` above
-  are the stored spelling, not a display one. Compare company names case-insensitively.
-- **Nicknames are already gone.** Row 326 was `สุดา "Su" ใจดี` in the source file. You get
-  `สุดา ใจดี`. There is nowhere to read the original — this is the point, not a loss.
-- **UTF-8, unquoted Thai.** Thai text carries no comma or quote, so it arrives bare. It is still
-  UTF-8; decode accordingly.
-- **`status` is `processing` on every row**, always. It is the column you are being asked to
-  change, not one that tells you anything.
-- **The rows are the new ones AND the enriched ones** (amended 2026-07-28; it was new-only).
-  Duplicates were dropped at import, so a 500-row file that is 480 rows you already have arrives as
-  20 rows. Since friends gained a column per language, a 21st kind of row can appear: a friend
-  already on file who just gained the spelling they were missing. They carry matchable data no
-  previous run has ever seen, so they are sent alongside the new rows and their `status` is reset to
-  `processing` for you to stamp.
+```
 
-  A consequence worth knowing: **an import that adds no rows can now still send a request**, where
-  before "an import that adds nothing sends no request at all" was unconditional. An import that
-  changes nothing at all — no new rows, no filled spellings — still sends nothing and opens no run.
+Select `company_contact` where `upload_id = 22`, score each against every friend on file under
+`en_full`, write your rows against comparison 12, stamp each `company_contact.status`. **Do not**
+mark comparison 12 completed — we will, when none of upload 22's rows are unfinished.
 
-  You cannot tell an enriched row from a new one, and you do not need to: both are rows to match,
-  and `uuid` identifies each of them either way.
+### What you read off the rows
 
+Everything the CSV used to carry is a column of the row you just selected. `uuid` was
+`company_contact.id` on one side and `friend.id` on the other; it is now just `id` on the table you
+queried, and the cross-direction confusion that produced a live foreign-key failure is not
+expressible.
+
+Two that are worth naming, because they are the ones people get wrong:
+
+- **`friend.relationship_owner`** → `comparison_result.upload_name`. This is the person whose
+  relationship the friend is. It arrived as `upload_person_name` on the old CSV.
+- **`upload.uploaded_by`** is a DIFFERENT PERSON — whoever performed the import. An assistant
+  importing on a salesperson's behalf is the case that split them. Writing the importer into
+  `upload_name` re-files every contact under whoever pressed the button, and nothing errors.
+
+**The names are already cleaned and lower-cased.** Titles, suffixes and nicknames are stripped at
+import, before the row is stored — `Mr. Somchai Jaidee` is stored as `somchai jaidee` and
+`นายสมชาย ใจดี` as `สมชาย ใจดี`. Middle names are **kept**. Match on the stored column: it is the
+only spelling there is, and it is exactly what the internal matcher matches on.
+
+`company_name` is the exception: **tidied only** (whitespace and invisible characters), not cleaned
+and not lower-cased. Its capitalisation is the file's own. Match it case-insensitively.
+
+`status` reads `processing` on every row you select, because that is what it is. It is the column
+you are being asked to change, not one that tells you anything.
 ---
 
 ## 2. What the workflow must write
@@ -442,7 +465,7 @@ For **every row it is given** — including the ones that match nobody.
 UPDATE lakeshore.friend           -- or lakeshore.company_contact
    SET status = 'match',          -- or 'unmatch'
        updated_at = now()
- WHERE id = :uuid;
+ WHERE id = :id;                  -- the row's own id, from the row you selected
 ```
 
 | Value | Means | Reads as |
@@ -477,7 +500,7 @@ INSERT INTO lakeshore.comparison_result
   (comparison_id, friend_name_en, friend_name_th, person_name_en, person_name_th,
    batch_number, status, upload_name, company_name, extra)
 VALUES
-  (:comparison_id,      -- from X-Comparison-ID / the CSV column
+  (:comparison_id,      -- from X-Comparison-ID
    :friend_name_en,     -- the Facebook side of the pair, English spelling
    :friend_name_th,     -- the Facebook side of the pair, Thai spelling
    :person_name_en,     -- the company side
@@ -519,19 +542,50 @@ VALUES
 > The `is_complete` field on the **HTTP callback body** is untouched and still means what it
 > always meant. Same word, different layer. See [§4](#4-the-http-callback-path).
 
-One column name worth checking against your `INSERT`, since it does not match the CSV you were
-handed: `extra` (`jsonb`) is there for any non-standard fields you want to keep — it is unchanged,
-and NULL is a perfectly good value for it. The Facebook side of the pair used to be a third
-mismatch, `friend_name` against the CSV's `fb_name`; it is now the two `friend_name_*` columns
-below and there is no single-name column left to confuse.
+`extra` (`jsonb`) is there for any non-standard fields you want to keep — unchanged, and NULL is a
+perfectly good value for it.
 
 **Two optional columns, added 2026-07-28. Both nullable; an `INSERT` that omits them is still
 valid** — this is an appended ask, not a new requirement.
 
+> ### ⛔ THE TWO ID COLUMNS ARE NOT INTERCHANGEABLE — read this before filling either
+>
+> **This used to say "`friend_id` ← the CSV's `uuid`" with no qualification, and that was only true
+> on the friends side.** It caused at least one live failure and it was our defect, not yours. The
+> CSV is gone and with it the ambiguous `uuid`, but the rule it got wrong still has to be stated:
+>
+> | You were called on | You selected from | That row's `id` goes in | The OTHER id |
+> |---|---|---|---|
+> | `FACEBOOK_WEBHOOK_URL` | `friend` | `friend_id` | `company_contact_id` ← the contact you matched |
+> | `COMPANY_WEBHOOK_URL` | `company_contact` | `company_contact_id` | `friend_id` ← the friend you matched |
+>
+> Each id belongs in the column named after its own table. That is now the whole rule, and it is why
+> selecting the rows yourself is safer than being handed them: there is no single `uuid` field whose
+> meaning depends on which request you are answering.
+>
+> **Never put `comparison_id` or `filter_value` in either column.** They are ids of a `comparison`
+> and an `upload`, they are small integers from different sequences entirely, and nothing stops them
+> looking plausible next to a row id. The symptom is:
+>
+> ```
+> ERROR: insert or update on table "comparison_result" violates foreign key constraint
+>        "comparison_result_company_contact_id_fkey"
+> DETAIL: Key (company_contact_id)=(8) is not present in table "company_contact".
+> ```
+>
+> — where `8` was an `upload.id`. The FK is what caught it, and that is the constraint doing its
+> job: a wrong id here does not error at read time, it silently attributes a match to the wrong
+> person and mis-counts a roster.
+>
+> **If in doubt, send NULL for both.** They are optional and always have been; we resolve the friend
+> back by owner plus either name spelling when they are absent. A run that omits them is correct and
+> complete — filling them makes the resolution exact rather than resolved, which is worth having but
+> is never worth a guess.
+
 | Column | Write it with | Why it helps |
 |---|---|---|
-| `friend_id` | the CSV's `uuid` — it **is** `friend.id` | Exactness |
-| `company_contact_id` | the matched contact's `company_contact.id` | Exactness |
+| `friend_id` | the friend's `friend.id` | Exactness |
+| `company_contact_id` | the contact's `company_contact.id` | Exactness |
 
 `friend_name_en` / `friend_name_th` were on this list too. They are no longer optional-in-effect:
 since `friend_name` was dropped on 2026-08-03 they are the only place a friend's name can go.
@@ -548,6 +602,12 @@ it exact instead of resolved, and costs you one column you already have in hand.
 `friend_id` and `company_contact_id` are for **identity and counting only**. We never render a name
 by following one — the text columns beside them are the frozen record of what the run compared, and
 resolving a display name through an id is how a later rename would start rewriting history.
+
+**Both are real foreign keys** (`ON DELETE SET NULL`), so an id that names no row fails the `INSERT`
+outright rather than being stored. That is deliberate and it is not going to be relaxed: an id
+pointing at the wrong row cannot be detected afterwards — it produces a match attributed to
+somebody who was never compared, and a roster that reads as more completely placed than it is. A
+failed write is a bad row you can see; a stored wrong id is a bad answer nobody can.
 
 #### The `status` vocabulary
 
@@ -620,22 +680,25 @@ Two obligations come with that:
   import stays unfinished, visibly, until someone intervenes. That is the intended failure
   mode: a stuck import is a fact, and hiding it behind a timeout would turn a visible problem
   into a silent wrong answer.
-- **It does not ask you to clean the names.** It already cleaned them, at import, and the CSV
-  carries the cleaned, lower-cased result in the one name column there is. Match on what you
-  are given — it is what the internal matcher matches on, and no other spelling is stored.
-- **It does not keep an import you never received.** The import forwards its rows inside the
-  import request. If you reject the file or do not answer within 30 s, the whole import is unwound
-  before the request returns — its rows are deleted, the run it opened is deleted, and it leaves no
-  entry on the Uploads page. The caller gets a `502`, and it means *nothing was imported*.
+- **It does not ask you to clean the names.** It already cleaned them, at import, and the stored
+  column holds the cleaned, lower-cased result. Match on the column you select — it is what the
+  internal matcher matches on, and no other spelling is stored.
+- **It does not send you the rows.** It sends you a pointer to them. Everything you need is a
+  column of the row you select, so a request that told you *about* the data would only be a second
+  copy of it, generated at cost and stale the moment anything is edited between the two.
+- **It does not keep an import you never accepted.** The notification goes out inside the import
+  request. If you reject it or do not answer within 30 s, the whole import is unwound before that
+  request returns — its rows are deleted, the run it opened is deleted, and it leaves no entry on
+  the Uploads page. The caller gets a `502`, and it means *nothing was imported*.
 
   This is the one place where "loudly" was not enough. The rows were already in the cumulative
   tables by the time you were asked, so an import marked `failed` and left in place put friends and
   contacts into every later dedup, roster and count while permanently awaiting a verdict from a
-  workflow that was never handed anything to decide.
+  workflow that was never told to decide anything.
 
   Two consequences worth knowing:
     - There is no failed import to retry. `POST /api/comparisons/:id/send-webhook` still exists and
-      still re-sends an import's stored rows on demand, but reaching a failed send now means
+      still re-points you at an import's rows on demand, but reaching a failed send now means
       uploading the file again.
     - A request carrying **both** a company file and a friends file imports each separately. If the
       first handover succeeds and the second fails, only the second is unwound — the first is

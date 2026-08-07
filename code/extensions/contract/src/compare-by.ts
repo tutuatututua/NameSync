@@ -74,6 +74,15 @@ export const COMPARE_LANGUAGES = ['en', 'th'] as const;
 export type CompareLanguage = (typeof COMPARE_LANGUAGES)[number];
 
 /**
+ * The two axes as schemas, for payloads that report on ONE of them rather than on a whole mode.
+ *
+ * Built from the constants above rather than written out, so a seventh mode cannot add a language
+ * here without adding it there. `CompareBySchema` below stays the schema for a run's actual
+ * setting — these are for reading a run's mode apart, which only the audit breakdowns do.
+ */
+export const CompareLanguageSchema = z.enum(COMPARE_LANGUAGES);
+
+/**
  * How much of each name to score.
  *
  * `name` and `surname` rather than `first` and `last`: the workflow receives this verbatim as
@@ -83,6 +92,9 @@ export type CompareLanguage = (typeof COMPARE_LANGUAGES)[number];
  */
 export const COMPARE_TYPES = ['full', 'name', 'surname'] as const;
 export type CompareType = (typeof COMPARE_TYPES)[number];
+
+/** See `CompareLanguageSchema`. */
+export const CompareTypeSchema = z.enum(COMPARE_TYPES);
 
 /**
  * `'<language>_<type>'`. Six values — the full matrix, with nothing held back.

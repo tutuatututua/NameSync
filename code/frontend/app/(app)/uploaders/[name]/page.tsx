@@ -3,23 +3,28 @@
 import * as React from "react";
 import Link from "next/link";
 import { useParams, useSearchParams } from "next/navigation";
-import { Building2, Search, UserCheck, UserSearch, UserX } from "lucide-react";
-import {
-  matchReason,
-  matchStrength,
-  scoreQualifier,
-  type CompanyMatchGroup,
-  type MatchedPerson,
-  type NoMatchPerson,
-} from "@extensions/contract";
+import { Search, ServerCrash, UserX, X } from "lucide-react";
+import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
-import { PageHeader, SectionHeader } from "@/components/page-header";
+import { PageHeader } from "@/components/page-header";
 import { EmptyState } from "@/components/empty-state";
 import { StatTile, compactCount } from "@/components/stat-tile";
-import { MatchedHint } from "@/components/network/match-grade";
-import { formatSimilarity } from "@/lib/format";
-import { cn } from "@/lib/utils";
+import { MatchedHint, rosterMatchTitle } from "@/components/network/match-grade";
+import { CompareScopeButton } from "@/components/network/CompareScopeButton";
+import { RecentRuns } from "@/components/network/RecentRuns";
+import { ThresholdNote } from "@/components/network/ThresholdNote";
+import { MatchedSection } from "@/components/network/uploader/MatchedSection";
+import {
+  EveryoneConnected,
+  NoMatchSection,
+} from "@/components/network/uploader/NoMatchSection";
+import {
+  countFriends,
+  filterGroups,
+  hitsNoMatch,
+  SEARCH_AT,
+} from "@/components/network/uploader/roster";
 import { useNetworkUploader } from "@/hooks/queries";
 import { readThreshold, withThreshold } from "@/hooks/useThreshold";
 
@@ -29,13 +34,40 @@ import { readThreshold, withThreshold } from "@/hooks/useThreshold";
  *
  * This is the drill-down behind the Relationship owners tab and behind every "known by / reached
  * by" chip in the app: the counts were always visible, but the *names* were not, and the names are
- * the point —
- * "which of my friends still has no connection" is the list you act on. Matched friends carry the
- * company they landed at (a link straight to it); unmatched friends carry whatever a run recorded
- * while turning them down, and are split by whether one ever did — see `NoMatchSection`.
+ * the point — "which of my friends still has no connection" is the list you act on. Matched friends
+ * carry the person they reach and the company they reach them at (a link straight to it); unmatched
+ * friends carry whatever a run recorded while turning them down, and are split by whether one ever
+ * did — see `NoMatchSection`.
+ *
+ * ── WHAT IS IN THIS FILE, AND WHAT IS NOT (2026-08-06) ──
+ *
+ * This is the page's SHELL: which state the page is in (loading, failed, empty, populated), the
+ * counts across the whole roster, and the one search box that covers both halves. The two halves
+ * render themselves — `MatchedSection` and `NoMatchSection` — and everything either of them counts
+ * or narrows lives in `roster.ts`.
+ *
+ * The split is not tidiness. The arithmetic and the markup used to sit in one function, and they
+ * drifted into disagreement exactly where you would expect: a company header counting result rows
+ * over a list that folded them. What the page states and what the page draws now come from the same
+ * few functions, and those functions are the only thing that has to be right.
+ *
+ * ── One search box, over BOTH halves ──
+ *
+ * The filter used to sit inside "No match" and reach only that list, which made the obvious
+ * question — "did we place khun somchai or not?" — the one thing it could not answer: typing the
+ * name filtered the unplaced list and left the placed one untouched above it, so a hit and a miss
+ * looked identical until you read the whole page.
+ *
+ * It is now one box above both sections, and it filters CLIENT-side, unlike every other search in
+ * the app. That is not an inconsistency but the shape of the data: this page fetches one roster
+ * whole (the endpoint is scoped to a single owner and returns both lists complete, precisely
+ * because a roster is small), so there is no second page for a server search to reach. The rule
+ * this codebase actually holds is "never filter a page and call it the list" — here the page IS
+ * the list.
  */
 export default function UploaderPage() {
   const params = useParams<{ name: string }>();
+  // Next decodes the route param, so this is the owner's real (case-preserving) name.
   const name = decodeURIComponent(String(params.name));
   /**
    * The bar the Network page was tuned to, carried here on the link that opened this page.
@@ -46,12 +78,35 @@ export default function UploaderPage() {
    * the score which failed to clear it.
    */
   const threshold = readThreshold(useSearchParams().get("threshold"));
-  const { data, isLoading } = useNetworkUploader(name, threshold ?? undefined);
+  const { data, isLoading, isError, refetch } = useNetworkUploader(name, threshold ?? undefined);
 
-  const matched = data?.matchedByCompany ?? [];
-  const noMatch = data?.noMatchPeople ?? [];
-  const nothing = !isLoading && data && data.friends === 0;
+  // Memoized on the payload, not read inline: both feed the filters below, and `?? []` produces a
+  // fresh empty array every render — which would re-run the whole filter on every keystroke
+  // anywhere on the page.
+  const matched = React.useMemo(() => data?.matchedByCompany ?? [], [data]);
+  const noMatch = React.useMemo(() => data?.noMatchPeople ?? [], [data]);
   const importedBy = data?.importedBy ?? [];
+
+  const [query, setQuery] = React.useState("");
+  const needle = query.trim().toLowerCase();
+  const matchedShown = React.useMemo(() => filterGroups(matched, needle), [matched, needle]);
+  const noMatchShown = React.useMemo(
+    () => (needle ? noMatch.filter((p) => hitsNoMatch(p, needle)) : noMatch),
+    [noMatch, needle]
+  );
+  // On the ROSTER's size, not on either list's — the box has to survive a search that empties one
+  // half, or the only way out of a typo is the back button.
+  const showSearch = !isLoading && !isError && (data?.friends ?? 0) >= SEARCH_AT;
+
+  /**
+   * Matched friends the list below has nowhere to put — their run recorded no company.
+   *
+   * The server has always allowed this (`matched` counts a connection whether or not it named a
+   * company) and the page never said so, which left the Matched tile and the sections under it
+   * differing by a number with no explanation on screen. Computed from the UNFILTERED groups: it is
+   * a fact about the roster, not about the search.
+   */
+  const ungrouped = Math.max(0, (data?.matched ?? 0) - countFriends(matched));
 
   return (
     <div className="space-y-8">
@@ -68,17 +123,50 @@ export default function UploaderPage() {
                 an import on file to name, and only as a second line: it is provenance, not the
                 subject of the page. */}
             {importedBy.length > 0 && (
-              <span className="mt-1 block text-sm">
-                Imported by {importedBy.join(", ")}
-              </span>
+              <span className="mt-1 block text-sm">Imported by {importedBy.join(", ")}</span>
             )}
           </>
         }
+        /*
+          Compare THIS roster again — the action the "No match" list below exists to prompt.
+
+          That list is the page's finding and, until now, its dead end: the names on it have no
+          connection under the runs made so far, and the obvious next question ("would they match on
+          Thai names? on surnames?") could not be asked of just these people. It can now, and this is
+          where it belongs — beside the roster it is about, not on a workspace tab where the owner
+          would have to be re-selected from a picker.
+        */
+        actions={<CompareScopeButton scope={{ filterBy: "owner", filterValue: name }} />}
       />
+
+      {/* WHAT THIS ROSTER IS BEING READ AT. The bar arrives on the link that opened this page and
+          moves both lists below; until it was stated, arriving at a tuned workspace's roster and
+          arriving at an untuned one looked exactly alike. See `ThresholdNote`. */}
+      <ThresholdNote threshold={threshold} changeHref="/?tab=uploaders" className="-mt-4" />
 
       {isLoading ? (
         <UploaderSkeleton />
-      ) : nothing ? (
+      ) : isError ? (
+        /*
+          A FAILED REQUEST IS NOT AN EMPTY ROSTER.
+
+          Without this branch the page fell through to the populated case with `data` undefined,
+          which rendered every tile as 0 and both lists as their empty states — so a dropped
+          connection told the reader "No matches yet" and "Everyone's connected" in the same breath.
+          Two confident, opposite, false claims about somebody's data. The state deserves its own
+          branch and a way out of it.
+        */
+        <EmptyState
+          icon={ServerCrash}
+          title="Couldn't load this roster"
+          description="The request for this person's friends didn't come back. Nothing has changed — this page only reads."
+          action={
+            <Button variant="outline" size="sm" onClick={() => void refetch()}>
+              Try again
+            </Button>
+          }
+        />
+      ) : data && data.friends === 0 ? (
         <EmptyState
           icon={UserX}
           title="No friends on file for this relationship owner"
@@ -88,7 +176,10 @@ export default function UploaderPage() {
              "removed or misspelled" is alarming, and both were wrong. */
           description="Their roster may have been removed, the name may be spelled differently, or this person imported friends for somebody else and owns no relationships of their own."
           action={
-            <Link href={withThreshold("/?tab=uploaders", threshold)} className="text-sm font-medium text-primary hover:underline">
+            <Link
+              href={withThreshold("/?tab=uploaders", threshold)}
+              className="text-sm font-medium text-primary hover:underline"
+            >
               Back to relationship owners
             </Link>
           }
@@ -96,405 +187,164 @@ export default function UploaderPage() {
       ) : (
         <>
           <div className="grid gap-3 sm:grid-cols-3">
-            <StatTile label="Friends" value={compactCount(data?.friends ?? 0)} hint="on this owner's list" />
             <StatTile
-              label="Matched"
-              value={compactCount(data?.matched ?? 0)}
-              hint={
-                <MatchedHint
-                  matched={data?.matched ?? 0}
-                  confirmed={data?.confirmed ?? 0}
-                  fallback="friends with a connection"
-                />
-              }
-              emphasis
+              label="Friends"
+              value={compactCount(data?.friends ?? 0)}
+              hint="on this owner's list"
             />
-            <StatTile label="No match" value={compactCount(data?.noMatch ?? 0)} hint="friends with none" />
+            {/* The two graded tiles are the sections below them, so they say so and go there. The
+                rule this app holds everywhere is that the thing you press and the number on it
+                answer the same question — these were the two numbers on the page where that was
+                true and unexploited. */}
+            <TileLink
+              href="#matched"
+              label="Jump to the matched friends"
+              /* The same sentence the roster's badge on the Relationship owners tab carries, so
+                 the tile and the row that linked here explain the split identically. */
+              tooltip={
+                (data?.matched ?? 0) === 0
+                  ? "Friends with a connection"
+                  : rosterMatchTitle(data?.matched ?? 0, data?.confirmed ?? 0)
+              }
+            >
+              <StatTile
+                label="Matched"
+                value={compactCount(data?.matched ?? 0)}
+                hint={
+                  <MatchedHint
+                    matched={data?.matched ?? 0}
+                    confirmed={data?.confirmed ?? 0}
+                    fallback="friends with a connection"
+                  />
+                }
+                emphasis
+                className="h-full"
+              />
+            </TileLink>
+            <TileLink
+              href="#no-match"
+              label="Jump to the friends with no connection"
+              tooltip="Friends this owner uploaded that no run has placed with anybody yet."
+            >
+              <StatTile
+                label="No match"
+                value={compactCount(data?.noMatch ?? 0)}
+                hint="friends with none"
+                className="h-full"
+              />
+            </TileLink>
           </div>
 
-          <div className="space-y-4">
-            <SectionHeader
-              title="Matched"
-              description="Friends who connect to someone on file, grouped by company."
-            />
-            {matched.length === 0 ? (
-              <EmptyState
-                icon={UserCheck}
-                title="No matches yet"
-                description="None of this person's friends has turned up at a company on file."
-              />
-            ) : (
-              <div className="space-y-4">
-                {matched.map((group) => (
-                  <CompanyGroup key={group.company} group={group} threshold={threshold} />
-                ))}
+          {/* ONE box for the whole roster — see the file header. It sits above both sections
+              rather than inside either, because which section a name turns up in is the answer it
+              exists to give. */}
+          {showSearch && (
+            <div className="flex flex-wrap items-center gap-3">
+              <div className="relative w-full sm:max-w-md">
+                <Search
+                  className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground"
+                  aria-hidden
+                />
+                <Input
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  // Escape clears it, which is what every reader tries first and what the two empty
+                  // states below offer a button for — the same way out, from the keyboard.
+                  onKeyDown={(e) => e.key === "Escape" && setQuery("")}
+                  placeholder="Search this roster — a friend, a company, a near miss…"
+                  className="pl-9 pr-9"
+                  aria-label={`Search ${name}'s friends`}
+                />
+                {query && (
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    onClick={() => setQuery("")}
+                    aria-label="Clear search"
+                    className="absolute right-1 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                  >
+                    <X className="h-4 w-4" />
+                  </Button>
+                )}
               </div>
-            )}
-          </div>
+              {needle && (
+                <p
+                  aria-live="polite"
+                  className="text-sm tabular-nums text-muted-foreground"
+                >
+                  {countFriends(matchedShown).toLocaleString()} matched ·{" "}
+                  {noMatchShown.length.toLocaleString()} unmatched
+                </p>
+              )}
+            </div>
+          )}
+
+          <MatchedSection
+            groups={matched}
+            shown={matchedShown}
+            query={query}
+            threshold={threshold}
+            ungrouped={ungrouped}
+            onClearSearch={() => setQuery("")}
+          />
 
           {noMatch.length === 0 ? (
-            <div className="space-y-4">
-              <SectionHeader title="No match" />
-              <EmptyState
-                icon={UserCheck}
-                title="Everyone's connected"
-                description="Every friend this person uploaded reaches someone on file."
-              />
-            </div>
+            <EveryoneConnected />
           ) : (
-            <NoMatchSection people={noMatch} />
+            <NoMatchSection
+              people={noMatch}
+              shown={noMatchShown}
+              query={query}
+              onClearSearch={() => setQuery("")}
+            />
           )}
         </>
       )}
-    </div>
-  );
-}
-
-/** One company section: a header linking to the company page, then its matched people. */
-function CompanyGroup({ group, threshold }: { group: CompanyMatchGroup; threshold: number | null }) {
-  return (
-    <div className="overflow-hidden rounded-lg border">
-      <Link
-        href={withThreshold(`/companies/${encodeURIComponent(group.company)}`, threshold)}
-        className="flex items-center gap-2 border-b bg-muted/40 px-4 py-2.5 outline-none transition-colors hover:bg-muted/60 focus-visible:bg-muted/60"
-      >
-        <Building2 className="h-4 w-4 shrink-0 text-muted-foreground" />
-        <span className="min-w-0 flex-1 truncate font-medium">{group.company}</span>
-        {/* The split rides on the header rather than on a separate section, because the rows below
-            are sorted confirmed-first and the header is what tells you where the line falls. */}
-        <span className="shrink-0 text-sm text-muted-foreground">
-          {group.people.length} {group.people.length === 1 ? "person" : "people"}
-          {group.people.length > group.confirmed && (
-            <span className="text-confidence-medium">
-              {" "}
-              · {group.people.length - group.confirmed} lead
-              {group.people.length - group.confirmed === 1 ? "" : "s"}
-            </span>
-          )}
-        </span>
-      </Link>
-      {group.people.map((p, i) => (
-        <MatchedRow key={`${p.friend}-${i}`} person={p} />
-      ))}
-    </div>
-  );
-}
-
-/** One matched person — the English name leads (the actionable identity), with the Thai name and
- *  the uploaded friend name beneath it, and how close the match was on the right. Falls back to the
- *  uploaded name when the contact has no English spelling on file. */
-function MatchedRow({ person }: { person: MatchedPerson }) {
-  const primary = person.en || person.friend;
-  const score = formatSimilarity(person.similarity);
-  const confirmed = matchStrength(person.mode) === "confirmed";
-  const qualifier = scoreQualifier(person.mode);
-  const Icon = confirmed ? UserCheck : UserSearch;
-
-  return (
-    <div className="flex items-start gap-3 border-b p-4 transition-colors last:border-b-0 hover:bg-muted/40">
-      {/* The row's own grade, in the gutter where the eye already lands. Amber + a search glyph for
-          a lead: this row is a question, not a placement. */}
-      <div
-        className={cn(
-          "mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-md border",
-          confirmed
-            ? "border-confidence-high/25 bg-confidence-high/10 text-confidence-high"
-            : "border-confidence-medium/25 bg-confidence-medium/10 text-confidence-medium"
-        )}
-      >
-        <Icon className="h-4 w-4" />
-      </div>
-      <div className="min-w-0 flex-1 space-y-0.5">
-        <p className="truncate font-medium">{primary}</p>
-        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-sm text-muted-foreground">
-          {/* `lang` here and not inside the badges: `:lang(th)`'s taller line-height is fine on a
-              row line, where the leading is already generous, but would make a Thai chip taller
-              than the Latin chip beside it. */}
-          {person.th && (
-            <span lang="th" className="truncate">
-              {person.th}
-            </span>
-          )}
-          {/* The uploaded friend name — how they appear in this person's own contact list. */}
-          <span className="truncate">Uploaded as “{person.friend}”</span>
-        </div>
-      </div>
 
       {/*
-        How close the two names were, AND what "close" measured. This list is every pairing a run
-        called a match, and it used to read as one flat claim — "these are the same person" — for
-        both an exact whole name and a shared surname. The percent alone did not fix that: 94% reads
-        the same either way. The qualifier is the number's unit, so `surname 94%` and `full name 94%`
-        stop being the same sentence.
-
-        ON EVERY MODE, including `full`. The unit used to be omitted there, on the reasoning that a
-        bare percent already means the whole name — but this list interleaves runs of every mode, so
-        the unlabelled number was the one claim nobody could identify at a glance. See
-        `scoreQualifier`.
-
-        Rendered only when a run recorded one: a matcher that reports verdicts alone leaves nothing
-        to say here, and "—" in a list (unlike in a table column) is furniture, not information. The
-        qualifier goes with it — an unqualified absence is not a claim about anything.
+        WHAT HAS ALREADY BEEN ASKED ABOUT THIS ROSTER — the owner-side twin of the list on a
+        company page, and here for the same reason: the Compare button in this page's header is
+        what would start another one, so the runs that already exist belong beside it rather than
+        on a workspace list covering everybody. See `RecentRuns`.
       */}
-      {score && (
-        <span
-          title={matchReason(person.mode, score)}
-          className={cn(
-            "mt-0.5 shrink-0 text-sm tabular-nums",
-            confirmed ? "text-muted-foreground" : "text-confidence-medium"
-          )}
-        >
-          {qualifier} {score}
-        </span>
-      )}
-    </div>
-  );
-}
-
-/** Did any run ever score this friend against anybody? All four near-miss fields are null when
- *  none did — see `NoMatchPerson`. Any one of them present means a run looked and said no. */
-const wasScored = (p: NoMatchPerson): boolean =>
-  Boolean(p.en || p.th || p.company) || p.similarity !== null;
-
-/** How long the list has to get before finding one name in it stops being possible by eye. */
-const FILTER_AT = 12;
-
-/**
- * The unplaced half of a roster.
- *
- * This was one flat cloud of badges over every unmatched friend, alphabetical, and it collapsed two
- * different facts into one shape. "amporn chukfat, closest was somchai jaidee at 78% at BANGKOK
- * BANK" is a name to check by hand. "amporn chukfat" with nothing after it is not a weaker version
- * of that — it means no run has ever scored her, and the thing to fix is the *runs*, not her. Both
- * rendered as the same chip, so the second read as the first with fields missing, and a roster like
- * the one this page was built against — fifty friends, not one of them ever compared — read as fifty
- * near misses too faint to print.
- *
- * So they are two lists. Scored friends first, as rows, closest near miss at the top, because that
- * order is the to-do list: the 78% is worth an afternoon and the 22% is the matcher working. Then
- * the never-scored, as a plain alphabetical grid, because a bare name is all there is to say and
- * fifty bare names want columns rather than a ragged wrap. The heading over each states which claim
- * it is making, and the section's own description states what is actually below it rather than
- * promising a near miss the data may not contain.
- *
- * Sorting by closeness is NOT re-judging the matcher — no cutoff appears anywhere here, and nothing
- * in this section is grouped, tinted or promoted by score. `similarity` is "for sorting and display,
- * never the verdict" (`row-status.ts`), and a rank is the one use of it that adds no claim: every
- * friend below is unmatched, and stays unmatched, whatever they scored.
- */
-function NoMatchSection({ people }: { people: NoMatchPerson[] }) {
-  const [filter, setFilter] = React.useState("");
-
-  const [scored, unscored] = React.useMemo(() => {
-    const yes: NoMatchPerson[] = [];
-    const no: NoMatchPerson[] = [];
-    for (const p of people) (wasScored(p) ? yes : no).push(p);
-    // Closest first, then alphabetical. A named candidate a run recorded no score for sorts below
-    // every scored one (`-1`) rather than above them — it is the weakest evidence here, not the best.
-    yes.sort((a, b) => (b.similarity ?? -1) - (a.similarity ?? -1) || a.friend.localeCompare(b.friend));
-    // `no` keeps the server's roster order, which is already alphabetical — and alphabetical is the
-    // only honest order for it. There is nothing to rank these by; that is what makes them this list.
-    return [yes, no];
-  }, [people]);
-
-  // Filters the friend's name AND the near miss, so "BANGKOK BANK" finds everyone the matcher put
-  // near that company — the reason you would reach for the box on a scored list at all.
-  const needle = filter.trim().toLowerCase();
-  const hit = (p: NoMatchPerson) =>
-    !needle ||
-    [p.friend, p.en, p.th, p.company].some((v) => v?.toLowerCase().includes(needle));
-  const shownScored = needle ? scored.filter(hit) : scored;
-  const shownUnscored = needle ? unscored.filter(hit) : unscored;
-  const empty = shownScored.length === 0 && shownUnscored.length === 0;
-
-  return (
-    <div className="space-y-4">
-      <SectionHeader
-        title="No match"
-        description={describeNoMatch(scored.length, unscored.length)}
-        actions={
-          people.length > FILTER_AT && (
-            <div className="relative w-full sm:w-64">
-              <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                value={filter}
-                onChange={(e) => setFilter(e.target.value)}
-                placeholder="Filter these names…"
-                className="h-9 pl-9"
-                aria-label="Filter friends with no match"
-              />
-            </div>
-          )
-        }
+      <RecentRuns
+        filter={{ axes: ["owner"], value: name }}
+        title="Comparisons of this roster"
+        emptyDescription={`No comparison has covered ${name}'s friends yet. Use Compare above to score them against the contacts on file.`}
       />
-
-      {empty ? (
-        <EmptyState
-          icon={UserSearch}
-          title={`No unmatched friend matches “${filter.trim()}”`}
-          description="Try a shorter spelling, or clear the filter to see the whole list."
-        />
-      ) : (
-        <div className="space-y-4">
-          {shownScored.length > 0 && (
-            <div className="overflow-hidden rounded-lg border">
-              <GroupHeader
-                icon={UserSearch}
-                title="Considered and turned down"
-                detail={`${counted(shownScored.length, scored.length, needle)} · closest first`}
-              />
-              {shownScored.map((p, i) => (
-                <NearMissRow key={`${p.friend}-${i}`} person={p} />
-              ))}
-            </div>
-          )}
-
-          {shownUnscored.length > 0 && (
-            <div className="overflow-hidden rounded-lg border">
-              <GroupHeader
-                icon={UserX}
-                title="Not yet scored"
-                detail={`${counted(shownUnscored.length, unscored.length, needle)} · no run has compared them against anyone`}
-              />
-              {/* Columns, not a wrapping cloud: fifty names in four columns is thirteen lines you
-                  can run an eye down alphabetically, where the same fifty as chips is a paragraph
-                  whose line breaks fall wherever the names happen to end. */}
-              <ul className="grid gap-x-6 gap-y-1.5 p-4 text-sm sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-                {shownUnscored.map((p, i) => (
-                  <li key={`${p.friend}-${i}`} className="truncate" title={p.friend}>
-                    {p.friend}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
-        </div>
-      )}
     </div>
   );
 }
 
 /**
- * What the section says it contains — worded from what is actually in it.
+ * A tile that goes where its number does.
  *
- * The old description promised "each with the closest contact a run turned down for them"
- * unconditionally, and on a roster nothing has scored it printed that sentence over fifty bare
- * names. A reader can only conclude the near misses failed to load. The absence is not a rendering
- * gap, it is the finding, so each mix gets its own sentence and the all-unscored case says what to
- * do about it.
+ * An anchor and not a router push: the destination is on this page, so the browser's own
+ * `scroll-mt` handling is both correct and free, and the link is a real one — middle-clickable,
+ * copyable, and readable by a screen reader as a jump rather than as a button that does something
+ * unexplained.
  */
-function describeNoMatch(scored: number, unscored: number): string {
-  const lead = "Friends with no connection on file yet";
-  if (scored === 0)
-    return `${lead}. No run has scored any of them against anyone, so there is nothing to show but the names — run a comparison to place them.`;
-  if (unscored === 0)
-    return `${lead} — each with the closest contact a run considered and turned down.`;
-  return `${lead}. The ones a run scored come first, closest near miss at the top; the rest have never been compared.`;
-}
-
-/** `12 friends`, or `3 of 12 friends` once a filter is hiding some of them. */
-function counted(shown: number, total: number, needle: string): string {
-  const noun = total === 1 ? "friend" : "friends";
-  return needle && shown !== total ? `${shown} of ${total} ${noun}` : `${total} ${noun}`;
-}
-
-/** The bar over one of the two lists — the same shape as a company group's header, minus the link,
- *  because these headings name a claim rather than somewhere to go. */
-function GroupHeader({
-  icon: Icon,
-  title,
-  detail,
+function TileLink({
+  href,
+  label,
+  tooltip,
+  children,
 }: {
-  icon: typeof UserSearch;
-  title: string;
-  detail: string;
+  href: string;
+  label: string;
+  /** What the tile's hint is shorthand for, in a sentence. */
+  tooltip?: string;
+  children: React.ReactNode;
 }) {
   return (
-    <div className="flex items-center gap-2 border-b bg-muted/40 px-4 py-2.5">
-      <Icon className="h-4 w-4 shrink-0 text-muted-foreground" />
-      <span className="min-w-0 flex-1 truncate font-medium">{title}</span>
-      <span className="shrink-0 text-sm text-muted-foreground">{detail}</span>
-    </div>
-  );
-}
-
-/**
- * One unplaced friend, and the nearest thing to them on file.
- *
- * The name alone is a dead end: "amporn chukfat has no connection" is true and leaves you nothing to
- * do with it. The matcher did not give up in silence — it scored her against every contact in scope
- * and kept the closest one, with that contact's names, employer and score sitting unread on the
- * result row. Shown here the entry becomes checkable: a 78% near miss at a company you recognise is
- * a name to look at by hand, and a 22% one is the list working correctly.
- *
- * A row rather than the badge this used to be. The badge had to spend its width on the friend's name
- * and then truncate the near miss — the half that makes the entry checkable — and it could not put
- * the scores in a column, which is the one layout that lets fifty of them be compared at a glance.
- *
- * Everything after the friend's name is the CONTACT's — a friend list carries one name and no
- * employer, so there is nothing else it could be. Hence the friend at full strength on its own line
- * and the candidate dimmed beneath it, labelled "Closest": two facts of different kinds, in the
- * order "who you uploaded", "who we nearly matched them to". The gutter icon is deliberately muted
- * rather than amber — amber is a lead in this app, something to act on, and this row is the opposite
- * claim. The tooltip says all of it in words, because a company name beside a person is exactly the
- * shape of a claim we are not making.
- */
-function NearMissRow({ person }: { person: NoMatchPerson }) {
-  // Thai first: the matched list leads with English because that is the actionable identity, but
-  // here the pairing is being *checked* rather than acted on, and the Thai spelling is usually the
-  // one that settles whether the matcher was close. Both when both exist — the row has the width the
-  // badge did not, and dropping a spelling the reader might recognise to save it is a bad trade.
-  const names = [person.th, person.en].filter(Boolean) as string[];
-  const contact = names[0];
-  const score = formatSimilarity(person.similarity);
-  // What the near miss actually measured. Without it "closest was somchai jaidee at 61%" reads as a
-  // weak resemblance between two whole names, when under `en_surname` it means two SURNAMES scored
-  // 61% and the given names were never looked at — a different and much less interesting fact.
-  const qualifier = scoreQualifier(person.mode);
-  const title = `Closest contact considered — ${contact ?? "an unnamed contact"}${
-    person.company ? ` at ${person.company}` : ""
-  }${score ? `, a ${score} ${qualifier} match` : ""}. Not close enough to call a connection.`;
-
-  return (
-    <div className="flex items-start gap-3 border-b p-4 transition-colors last:border-b-0 hover:bg-muted/40">
-      <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-md border bg-muted/40 text-muted-foreground">
-        <UserSearch className="h-4 w-4" />
-      </div>
-      <div className="min-w-0 flex-1 space-y-0.5">
-        <p className="truncate font-medium">{person.friend}</p>
-        <div
-          className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-sm text-muted-foreground"
-          title={title}
-        >
-          <span className="truncate">
-            Closest:{" "}
-            {/* `lang` on the Thai spelling only, and only when it is the one on file: `:lang(th)`'s
-                taller line-height is fine on a row line, and wrong on the Latin span beside it. */}
-            {person.th && <span lang="th">{person.th}</span>}
-            {person.th && person.en && " · "}
-            {person.en}
-            {names.length === 0 && "an unnamed contact"}
-          </span>
-          {person.company && <span className="truncate">at {person.company}</span>}
-        </div>
-      </div>
-
-      {/*
-        How close the two names got, AND what "close" measured — the same pairing the matched rows
-        make, for the same reason: `surname 61%` and `full name 61%` are not the same sentence.
-        Muted, never amber: the number is why this row is worth your attention among the others here,
-        not evidence of a connection. Dropped entirely when no run recorded one, because an absent
-        score is not a low one.
-      */}
-      {score && (
-        <span
-          title={matchReason(person.mode, score)}
-          className="mt-0.5 shrink-0 text-sm tabular-nums text-muted-foreground"
-        >
-          {qualifier} {score}
-        </span>
-      )}
-    </div>
+    <a
+      href={href}
+      aria-label={label}
+      title={tooltip}
+      className="rounded-lg outline-none transition-shadow hover:shadow-sm focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+    >
+      {children}
+    </a>
   );
 }
 

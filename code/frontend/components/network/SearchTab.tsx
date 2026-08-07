@@ -3,21 +3,19 @@
 import * as React from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { Building2, Pencil, Search, UserCheck, UserSearch, Users } from "lucide-react";
+import { Building2, Pencil, Search } from "lucide-react";
 import type { NameSearchRow } from "@extensions/contract";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/empty-state";
 import { SectionHeader } from "@/components/page-header";
+import { PAGE_SIZE, Pager } from "@/components/pagination";
 import { KnownByBadge } from "@/components/network/KnownByBadge";
 import { RenameContactDialog, type EditableContact } from "@/components/network/RenameContactDialog";
 import { useNetworkSearch } from "@/hooks/queries";
 import { withThreshold } from "@/hooks/useThreshold";
 import { cn } from "@/lib/utils";
-
-const PAGE_SIZE = 20;
 
 /** Hold a value still for `delay`ms after the last change — one request per pause, not per keystroke. */
 function useDebouncedValue<T>(value: T, delay: number): T {
@@ -30,18 +28,21 @@ function useDebouncedValue<T>(value: T, delay: number): T {
 }
 
 /**
- * Search (Feature 2) — find a person, see which company they're in and whether the network
- * reaches it. Each result carries two facts from stored results: how many people reach that whole
- * company, and whether this exact contact is themselves someone's connection. The pencil edits the
- * contact's name (Feature 3).
+ * Search (Feature 2) — find a person, see which company they're in, and see WHO KNOWS THEM. The
+ * pencil edits the contact's name (Feature 3).
+ *
+ * ONE QUESTION PER ROW. A result used to carry two: who knows this contact, and who reaches their
+ * company through anyone at all. The second was the same answer on every row of a company (it is a
+ * company-scoped subquery) rendered per contact, in the same chips as the first — see the note in
+ * `ResultRow` for why it moved to the company page, which is where the reader is already asking it.
  *
  * A company name deep-links here from the Overview (`?tab=search&q=<company>`), which is why the
  * box seeds from the URL — searching a company name lists its people.
  *
- * The workspace bar (`threshold`) grades the two connection facts and NOT the result set: who is on
- * file at a company is a fact about `company_contact`, so tightening the bar empties the chips
- * beside a contact rather than removing the contact. "Nobody you know is here" and "nobody is here"
- * are different answers and this page has to keep being able to say the first one.
+ * The workspace bar (`threshold`) grades the connections and NOT the result set: who is on file at
+ * a company is a fact about `company_contact`, so tightening the bar empties the chips beside a
+ * contact rather than removing the contact. "Nobody you know is here" and "nobody is here" are
+ * different answers and this page has to keep being able to say the first one.
  */
 export function SearchTab({ threshold = null }: { threshold?: number | null }) {
   const urlQ = useSearchParams().get("q") ?? "";
@@ -127,31 +128,19 @@ export function SearchTab({ threshold = null }: { threshold?: number | null }) {
             ))}
           </div>
 
-          {totalPages > 1 && (
-            <div className="flex items-center justify-between gap-3 pt-1">
-              <p className="text-sm text-muted-foreground">
-                Page {page} of {totalPages}
-              </p>
-              <div className="flex gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={page <= 1 || isFetching}
-                  onClick={() => setPage((p) => Math.max(1, p - 1))}
-                >
-                  Previous
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={page >= totalPages || isFetching}
-                  onClick={() => setPage((p) => p + 1)}
-                >
-                  Next
-                </Button>
-              </div>
-            </div>
-          )}
+          {/* The result count is already stated above the list, so the summary here is the plain
+              one — two "812 results" a screen apart would read as two different numbers. */}
+          <Pager
+            page={page}
+            totalPages={totalPages}
+            onPageChange={setPage}
+            label="search results"
+            // `pending`, not `disabled`: the old control greyed itself out on every page turn, which
+            // is the one moment a reader may want to press again. The rows already dim; this says
+            // what the dim means.
+            pending={isFetching}
+            className="pt-1"
+          />
         </div>
       )}
 
@@ -194,8 +183,9 @@ function ResultRow({
       <div className="min-w-0 flex-1 space-y-1">
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
           <p className="truncate font-medium">{name}</p>
-          {/* Who in the network actually knows THIS person — by name, each a link to their roster,
-              each with how close the match that connects them was. */}
+          {/* Who in the network actually knows THIS person: the owner to ask, WHICH of their
+              friends the matcher paired with the name above, what it compared, and how close it
+              came. Each chip links to that owner's roster. */}
           {row.connectedUploaders.map((u) => (
             <Link key={u.name} href={withThreshold(`/uploaders/${encodeURIComponent(u.name)}`, threshold)}>
               <KnownByBadge uploader={u} />
@@ -217,34 +207,22 @@ function ResultRow({
           )}
           {secondary && <span className="truncate">· {secondary}</span>}
         </div>
-        {/* Who reaches this COMPANY at all (via anyone there) — "who can get me in". */}
-        {row.companyUploaders.length > 0 && (
-          <div className="flex flex-wrap items-center gap-1.5 text-sm text-muted-foreground">
-            <Users className="h-3.5 w-3.5 shrink-0" />
-            <span>Reached by</span>
-            {/* The same grading as KnownByBadge, minus the score — company reach is not one
-                pairing, so there is no single number for it, but strength still folds. An owner
-                whose only way in is a shared surname must not look like one whose friend IS
-                somebody here. `outline` stays the confirmed look so a clean result set is
-                unchanged; only the leads pick up amber. */}
-            {row.companyUploaders.map((u) => (
-              <Link key={u.name} href={withThreshold(`/uploaders/${encodeURIComponent(u.name)}`, threshold)}>
-                <Badge
-                  variant={u.confirmed ? "outline" : "warning"}
-                  title={
-                    u.confirmed
-                      ? "Connects to someone at this company on a whole-name match."
-                      : "Only reaches this company on a partial-name match — check before asking for an introduction."
-                  }
-                  className="cursor-pointer"
-                >
-                  {u.confirmed ? <UserCheck className="h-3 w-3" /> : <UserSearch className="h-3 w-3" />}
-                  {u.name}
-                </Badge>
-              </Link>
-            ))}
-          </div>
-        )}
+        {/*
+          NO "Reached by" LINE — who reaches the COMPANY lives on the company page (2026-08-07).
+
+          `row.companyUploaders` is a company-scoped subquery, so it is the SAME list on every row
+          of a company: three BANGKOK BANK contacts on one screen printed the same five names three
+          times, and eight CENTRAL RETAIL contacts printed another five eight times. Repetition is
+          the smaller half of the problem. It sat directly beneath the chips above, which are the
+          one thing on the row that IS per-contact, in the same chip vocabulary — so the row's most
+          eye-catching element was its least informative one, and a reader scanning for "who knows
+          this person" had to learn by inspection which of two chip rows answered that.
+
+          It is not lost: the company name on the line above links to the company page, which reads
+          the identical array off the identical endpoint and states it ONCE, in the header, where a
+          fact about the company belongs. Search answers "who knows this person"; the page it links
+          to answers "who can get me in". One question per surface.
+        */}
       </div>
 
       <Button

@@ -67,6 +67,10 @@ beforeEach(async () => {
   await truncateAll();
   mock.state.company.length = 0;
   mock.state.facebook.length = 0;
+  // Reset defensively. A test can arm this and then not reach the webhook at all — the import
+  // pre-check refuses some imports before the handover — and a leaked `failNext` fails whichever
+  // unrelated test runs next, which is a very expensive half-hour to spend.
+  mock.state.failNext = false;
 });
 
 const db = async () => (await DBModel.getPool()).connect();
@@ -162,15 +166,15 @@ describe("external matcher — an import starts a run", () => {
     const { comparisonId } = await importAndForward(["Somchai"]);
 
     const hit = mock.state.facebook[0];
-    // Both channels carry it: the header for anything that reads headers, and a column for a
-    // row-wise tool that only ever sees the CSV.
+    // ONE channel. It used to ride in a header AND in a column on every row, because a row-wise
+    // tool reaches a CSV cell more easily than a header — an argument that only had force while
+    // the workflow was iterating rows we sent it. There are no rows in the request now, so there
+    // is one request-wide fact and one place to read it.
     expect(hit.headers["x-comparison-id"]).toBe(comparisonId);
-    expect(hit.body).toContain("comparison_id");
-    expect(hit.body).toContain(comparisonId);
-    // Which import this is, and how big — without parsing the file first.
-    expect(hit.headers["x-upload-id"]).toBeTruthy();
-    expect(hit.headers["x-upload-id"]).toBe(hit.headers["x-session-id"]);
-    expect(hit.headers["x-row-count"]).toBe("1");
+    expect(hit.body).toBe("");
+    // Which rows, by the id they are filed under.
+    expect(hit.headers["x-filter-by"]).toBe("upload");
+    expect(hit.headers["x-filter-value"]).toBeTruthy();
   });
 
   it("reports partial progress while the workflow is still working", async () => {
@@ -361,54 +365,100 @@ describe("external matcher — an import starts a run", () => {
     expect((await progress(comparisonId)).status).toBe("completed");
   });
 
-  it("starts no run for an import that added nothing", async () => {
-    // Re-importing a file you have already imported adds no rows: every one of them is a duplicate.
-    // There is nothing for the workflow to match, so there is no run — and this is the bug that
-    // taught us so. It used to open one anyway, before the merge had told it there was no work, and
-    // the result was a comparison that could never finish: the progress endpoint drew a full bar
-    // (an upload with no rows is vacuously done) while refusing to complete it (it waited for at
-    // least one row to be stamped). "Running · 0 of 0 rows · 100%", forever.
-    const first = await importCompany(app, { csv: CO_CSV, owner: "Alex" });
-    expect(first.json().data.comparisonId).toBeTruthy();
-    expect(first.json().data.companyAdded).toBe(2);
+  it("opens a SECOND run when a DIFFERENT uploader imports the same file", async () => {
+    /**
+     * Imports stack, and a repeat is real work when it records something new.
+     *
+     * This used to be told with two different comparison modes — import, compare English full
+     * names; re-import the same file, compare Thai given names — because the mode lived on the
+     * import screen. It does not any more (2026-08-05): an import is always `en_full`, and asking a
+     * different question is a run started from the Network page over rows already on file, with
+     * nothing re-uploaded.
+     *
+     * So the surviving reason to import the same people twice is that somebody ELSE holds them,
+     * which is the fact the product exists to know. The mechanics under test are unchanged and are
+     * the ones that used to break: the second import writes a complete row set of its own, opens
+     * its own run, and hands its own rows to the workflow — rather than adding nothing, opening no
+     * run, and leaving the user looking at the first import's results.
+     */
+    const first = (await importCompany(app, { csv: CO_CSV, owner: "Alex", uploader: "Alex" })).json().data;
+    expect(first.comparisonId).toBeTruthy();
+    expect(first.companyAdded).toBe(2);
 
-    const again = await importCompany(app, { csv: CO_CSV, owner: "Alex" });
-    const data = again.json().data;
-
-    expect(data.companyAdded).toBe(0);
-    expect(data.companyDuplicates).toBe(2);
-    // No run. Nothing new came in, so there is nothing to compare and nowhere to send the browser.
-    expect(data.comparisonId).toBeNull();
-    expect(data.status).toBe("completed");
-
-    // And no history row either: the import changed nothing, so it is a told outcome (the
-    // response above carries the duplicate count), not a record on the Uploads page.
-    const uploads = (await app.inject({ method: "GET", url: "/api/upload-sessions" })).json().data;
-    expect(uploads.find((u: { id: string }) => u.id === data.sessionId)).toBeUndefined();
-    expect(uploads).toHaveLength(1); // the first, real import
-
-    // Only the first import's run exists.
-    const runs = (await app.inject({ method: "GET", url: "/api/comparisons" })).json().data;
-    expect(runs).toHaveLength(1);
-  });
-
-  it("sends nothing to the webhook when there is nothing to send", async () => {
-    await importCompany(app, { csv: CO_CSV, owner: "Alex" });
     mock.state.company.length = 0;
 
-    const again = await importCompany(app, { csv: CO_CSV, owner: "Alex" });
-    const { sessionId } = again.json().data;
+    const again = (await importCompany(app, { csv: CO_CSV, owner: "Alex", uploader: "Mint" })).json().data;
+
+    // Every row written, and none dropped: the uploader is part of the drop key, so Mint holding
+    // these contacts is a row Alex's copy does not already carry. That is the fact the product
+    // exists to know — two people who can both reach the same person.
+    expect(again.companyAdded).toBe(2);
+    expect(again.companyDuplicates).toBe(0);
+
+    // A run of its own — a different one — and the browser is sent to it.
+    expect(again.comparisonId).toBeTruthy();
+    expect(again.comparisonId).not.toBe(first.comparisonId);
+    expect(again.status).toBe("processing");
+
+    // The workflow was pointed at this import's rows under THIS run. `X-Filter-Value` is how it
+    // finds the rows at all, and it is the upload id — not the run's.
+    expect(mock.state.company).toHaveLength(1);
+    expect(mock.state.company[0].headers["x-compare-type"]).toBe("full");
+    expect(mock.state.company[0].headers["x-compare-language"]).toBe("en");
+    expect(mock.state.company[0].headers["x-comparison-id"]).toBe(String(again.comparisonId));
+    expect(mock.state.company[0].headers["x-filter-by"]).toBe("upload");
+    expect(mock.state.company[0].headers["x-filter-value"]).toBe(String(again.sessionId));
+
+    // Two imports and two runs on file, each scoped to the import that opened it. The Past runs
+    // list showing both is what lets the two findings be told apart at all.
+    const uploads = (await app.inject({ method: "GET", url: "/api/upload-sessions" })).json().data;
+    expect(uploads).toHaveLength(2);
+
+    const runs = (await app.inject({ method: "GET", url: "/api/comparisons" })).json().data;
+    expect(runs).toHaveLength(2);
+    expect(runs.every((r: { compareBy: string }) => r.compareBy === "en_full")).toBe(true);
+    expect(runs.every((r: { filterBy: string }) => r.filterBy === "upload")).toBe(true);
+    expect(runs.map((r: { filterValue: string }) => r.filterValue).sort()).toEqual(
+      [String(first.sessionId), String(again.sessionId)].sort()
+    );
+
+    // And still two contacts, not four: stacking is about rows, identity is about people.
+    const stats = (await app.inject({ method: "GET", url: "/api/comparisons/data-stats" })).json().data;
+    expect(stats.company.total).toBe(2);
+  });
+
+  it("re-sends a re-import's own rows, under its own run", async () => {
+    await importCompany(app, { csv: CO_CSV, owner: "Alex", uploader: "Alex" });
+    mock.state.company.length = 0;
+
+    // A different UPLOADER, which is what a real second import of the same contacts looks like:
+    // the same file from the same person would drop every row and be refused (see
+    // import-precheck.test.ts). This test is about what happens AFTER a second import exists.
+    const again = await importCompany(app, { csv: CO_CSV, owner: "Alex", uploader: "Mint" });
+    expect(again.statusCode, again.body).toBe(200);
+    const { sessionId, comparisonId } = again.json().data;
+    mock.state.company.length = 0;
 
     const sent = await app.inject({
       method: "POST",
       url: `/api/comparisons/${sessionId}/send-webhook`,
     });
 
-    // An import whose every row was a duplicate kept no upload record at all, so there is no
-    // import to forward: the send 404s and the workflow is never handed an empty task.
-    // (The UI never makes this call — it only forwards an import that added rows.)
-    expect(sent.statusCode).toBe(404);
-    expect(mock.state.company).toHaveLength(0);
+    /**
+     * This used to 404. An import whose every row was a duplicate kept no upload record at all,
+     * so there was nothing to forward and the manual retry had no import to point at.
+     *
+     * A re-import is an ordinary import now — its own upload, its own rows, its own run — so the
+     * retry works on it exactly as it does on any other. That matters beyond tidiness: the retry
+     * is what recovers an import whose handover failed, and before this a re-import was the one
+     * kind that could never be recovered.
+     */
+    expect(sent.statusCode).toBe(200);
+    expect(mock.state.company).toHaveLength(1);
+    expect(mock.state.company[0].headers["x-filter-value"]).toBe(String(sessionId));
+    // The run it belongs to, read back off the import rather than defaulted — a retry must answer
+    // the question the run is labelled with.
+    expect(mock.state.company[0].headers["x-comparison-id"]).toBe(String(comparisonId));
   });
 
   it("discards the whole import when the workflow never receives the file", async () => {
@@ -419,7 +469,7 @@ describe("external matcher — an import starts a run", () => {
     // never handed anything to decide.
     mock.state.failNext = true;
     const res = await importFacebook(app, { friends: friendRows(["Somchai"]), owner: "Alex" });
-    expect(res.statusCode).toBe(502);
+    if (res.statusCode !== 502) throw new Error('GOT ' + res.statusCode + ' ' + res.body);
     // The message answers "what happened to my file", which is the question the cause alone left
     // open — and the one the old behaviour answered badly.
     expect(res.json().message).toContain("nothing was imported");
@@ -439,22 +489,34 @@ describe("external matcher — an import starts a run", () => {
     ).toHaveLength(0);
   });
 
-  it("leaves an earlier import's friend untouched when a failed import had enriched it", async () => {
-    // The half a cascade cannot reach: an enriched friend belongs to the import that CREATED it,
-    // so deleting the failed import's own rows leaves this one holding a spelling that no
-    // successful import ever put there — and stuck at 'processing', which holds the earlier
-    // import's run open forever.
+  it("leaves an earlier import's rows untouched when a later import's handover fails", async () => {
+    /**
+     * What this test used to be about is gone, and its replacement is simpler.
+     *
+     * It guarded the half a cascade could not reach: an import could ENRICH a friend belonging to
+     * an earlier import (filling a missing spelling), so discarding the failed import had to put
+     * that back — otherwise an earlier import's row kept a spelling no successful import ever wrote
+     * and sat at 'processing', holding that import's run open forever.
+     *
+     * Imports stack now. A later import writes its OWN rows and touches nobody else's, so
+     * discarding it is complete by construction and `revertEnrichment` no longer exists. What is
+     * still worth pinning is the outcome: the earlier import's row, and its verdict, survive.
+     */
     const { comparisonId } = await importAndForward(["Somchai"]);
     await workflowStamps(comparisonId, [{ name: "Somchai", matched: false }]);
     expect((await progress(comparisonId)).status).toBe("completed");
 
-    // A bilingual file naming the same friend: matches on the English spelling, fills the Thai one.
+    // A bilingual file naming the same friend. `force`, because this is deliberately a re-import of
+    // somebody already on file and the pre-check would otherwise refuse it before the handover —
+    // which is the very thing this test needs to fail.
     mock.state.failNext = true;
     const res = await importFacebook(app, {
-      friendsCsv: `en_name,th_name\nSomchai,สมชาย\n`,
+      friendsCsv: `en_name,th_name
+Somchai,สมชาย
+`,
       owner: "Alex",
     });
-    expect(res.statusCode).toBeGreaterThanOrEqual(400);
+    expect(res.statusCode, res.body).toBe(502);
 
     const conn = await db();
     const row = await sql<{
@@ -463,16 +525,14 @@ describe("external matcher — an import starts a run", () => {
       status: string;
     }>`SELECT friend_name_en, friend_name_th, status FROM lakeshore.friend`.execute(conn);
 
-    // One row, as it was before the failed import touched it: no Thai spelling, verdict intact.
+    // One row — the earlier import's, exactly as it was. The failed import's own row is gone with
+    // it, and nothing of it was left behind on this one.
     expect(row.rows).toHaveLength(1);
     expect(row.rows[0]).toMatchObject({
       friend_name_en: stored("Somchai"),
       friend_name_th: null,
       status: "unmatch",
     });
-
-    // And the earlier run is still finished, not reopened by a row it never sent.
-    expect((await progress(comparisonId)).status).toBe("completed");
   });
 
   it("re-sends a stored import's rows through POST /:id/send-webhook", async () => {
@@ -557,6 +617,37 @@ describe("external matcher — watching the rows", () => {
 
     // Untouched. Still pending while the other two are done — the whole point of the view.
     expect(byName[stored("Malee")]).toMatchObject({ status: "processing", matchedName: null });
+  });
+
+  /**
+   * The table's search box — server-side, because the list is paged.
+   *
+   * The claim under test is that the PAGE and the COUNT beside it are built from one predicate.
+   * A search applied to the rows and forgotten by the count prints "3 rows" under a list of one,
+   * which is the failure the shared `rowSearchWhere` exists to make impossible.
+   */
+  it("narrows the rows to the search text, and the count with them", async () => {
+    const { comparisonId } = await importAndForward(["Somchai", "Anong", "Malee"]);
+
+    const hit = await rows(comparisonId, "?page=1&limit=25&q=som");
+    expect(hit.pagination.total).toBe(1);
+    expect(hit.data.map((r: { name: string }) => r.name)).toEqual([stored("Somchai")]);
+
+    // The owner is on the row and is therefore searchable: "whose friends are these" is the one
+    // thing a reader can see on every row and would think to type.
+    expect((await rows(comparisonId, "?page=1&limit=25&q=alex")).pagination.total).toBe(3);
+
+    // A miss empties the page rather than quietly returning the unfiltered list.
+    expect((await rows(comparisonId, "?page=1&limit=25&q=zzz")).pagination.total).toBe(0);
+
+    // It COMPOSES with the outcome filter — "the matches called somchai" — rather than replacing
+    // it. Both are narrowings of the same list and neither is allowed to win.
+    await workflowStamps(comparisonId, [
+      { name: "Somchai", matched: true },
+      { name: "Anong", matched: false },
+    ]);
+    expect((await rows(comparisonId, "?page=1&limit=25&filter=matched&q=som")).pagination.total).toBe(1);
+    expect((await rows(comparisonId, "?page=1&limit=25&filter=matched&q=anong")).pagination.total).toBe(0);
   });
 
   it("names the company a matched friend was matched *into*", async () => {
@@ -1000,11 +1091,15 @@ describe("external matcher — watching the rows", () => {
  * exercises a different query entirely and would not catch a mistake here.
  */
 describe("compare_by on an import-driven run", () => {
-  it("sends the mode as a header and a column, and stamps it on the run", async () => {
+  it("sends en_full whatever the caller asked for, and names the scope beside it", async () => {
     const form = (await import("form-data")).default;
     const f = new form();
     f.append("name", "Friends");
     f.append("uploadPersonName", "Alex");
+    // A CALLER THAT PREDATES THE CHANGE. `compareBy` is no longer a field on this endpoint, and
+    // this is the assertion that it is IGNORED rather than honoured or refused: a scripted importer
+    // still sending the old field must get the run the server would have made anyway — not a 400
+    // over a value that no longer decides anything, and not a Thai run nobody can ask for here.
     f.append("compareBy", "th_surname");
     f.append("facebookFile", Buffer.from("name\nSomchai Jaidee\n", "utf8"), {
       filename: "friends.csv",
@@ -1016,33 +1111,43 @@ describe("compare_by on an import-driven run", () => {
       payload: f,
       headers: f.getHeaders(),
     });
-    const { comparisonId } = res.json().data;
+    expect(res.statusCode, res.body).toBe(200);
+    const { comparisonId, sessionId } = res.json().data;
 
     const hit = mock.state.facebook[0];
-    expect(hit.headers["x-compare-type"]).toBe("surname");
-    expect(hit.headers["x-compare-language"]).toBe("th");
-    expect(hit.headers["x-compare-by"]).toBe("th_surname");
-    // The axes as their own per-row columns, so a row-wise workflow branches on a cell that says
-    // `surname` rather than substring-splitting `th_surname`.
-    expect(hit.body).toContain("surname,th,th_surname");
+    // The two axes, separately — so a workflow branching on "did they ask for surnames?" reads a
+    // value that says `surname` rather than substring-splitting `th_surname`. The combined
+    // `X-Compare-By` is retired: the doc's instruction was always to read these two and ignore it.
+    expect(hit.headers["x-compare-type"]).toBe("full");
+    expect(hit.headers["x-compare-language"]).toBe("en");
+    expect(hit.headers["x-compare-by"]).toBeUndefined();
+
+    // And the SCOPE: an import names the rows it just wrote, filed under this upload.
+    expect(hit.headers["x-filter-by"]).toBe("upload");
+    expect(hit.headers["x-filter-value"]).toBe(String(sessionId));
+    expect(hit.body).toBe("");
 
     const progress = (
       await app.inject({ method: "GET", url: `/api/comparisons/${comparisonId}/progress` })
     ).json().data;
-    expect(progress.compareBy).toBe("th_surname");
+    expect(progress.compareBy).toBe("en_full");
   });
 
-  it("buckets a row the mode could not score as `unscored`, and filters to it", async () => {
+  it("buckets a row the run could not score as `unscored`, and filters to it", async () => {
     const { comparisonId } = await (async () => {
       const form = (await import("form-data")).default;
       const f = new form();
       f.append("name", "Friends");
       f.append("uploadPersonName", "Alex");
-      f.append("compareBy", "th_full");
-      // One Thai-script friend, one Latin. Under a Thai run the Latin one had nothing to be held
-      // up against — the workflow may still stamp it, but our reading of the text is what decides
-      // whether the row is reported as a finding or as a question never asked.
-      f.append("facebookFile", Buffer.from("name\nสมชาย ใจดี\nPreecha Wong\n", "utf8"), {
+      // One Latin friend, one Thai-script. An import's run is `en_full`, so the Thai-only one has
+      // nothing to be held up against — the workflow may still stamp it, but whether the row reads
+      // as a finding or as a question never asked is decided from the columns we hold.
+      //
+      // The direction reversed on 2026-08-05 and the SQL under test did not: this used to be a Thai
+      // run with the Latin row unscorable, which was only expressible while an import could pick a
+      // mode. It is the same expression either way (`runRowBucketSql` over the run's own language),
+      // which is exactly why the case still has to be covered on this path.
+      f.append("facebookFile", Buffer.from("name\nPreecha Wong\nสมชาย ใจดี\n", "utf8"), {
         filename: "friends.csv",
         contentType: "text/csv",
       });
@@ -1076,10 +1181,10 @@ describe("compare_by on an import-driven run", () => {
       })
     ).json();
     expect(rows.pagination.total).toBe(1);
-    expect(rows.data[0].name).toBe("preecha wong");
+    expect(rows.data[0].nameAlt).toBe("สมชาย ใจดี");
     expect(rows.data[0].scored).toBe(false);
 
-    // …and the Thai row is a plain unmatch, scored and found nobody.
+    // …and the English row is a plain unmatch, scored and found nobody.
     const un = (
       await app.inject({
         method: "GET",
@@ -1095,8 +1200,11 @@ describe("compare_by on an import-driven run", () => {
     const f = new form();
     f.append("name", "Friends");
     f.append("uploadPersonName", "Alex");
-    f.append("compareBy", "th_full");
-    f.append("facebookFile", Buffer.from("name\nPreecha Wong\n", "utf8"), {
+    // Two rows, one per script. The THAI-ONLY one is what this test is about — the row an `en_full`
+    // run holds no English name for, and therefore the row we would otherwise call unscorable. The
+    // Latin one is here only so the file has something the run could score: an import whose every
+    // row is unscorable is refused outright, which would take this case with it.
+    f.append("facebookFile", Buffer.from("name\nPreecha Wong\nสมชาย ใจดี\n", "utf8"), {
       filename: "friends.csv",
       contentType: "text/csv",
     });
@@ -1108,15 +1216,15 @@ describe("compare_by on an import-driven run", () => {
     });
     const { comparisonId } = res.json().data;
 
-    // A workflow that ignored compare_by and matched the row anyway. Our inference says it could
-    // not have been scored; the verdict says it was. The verdict wins.
+    // A workflow that ignored compare_by and matched the rows anyway. Our columns say the Thai-only
+    // one could not have been scored; the verdict says it was. The verdict wins.
     const conn = await db();
     await sql`UPDATE lakeshore.friend SET status = 'match'`.execute(conn);
 
     const progress = (
       await app.inject({ method: "GET", url: `/api/comparisons/${comparisonId}/progress` })
     ).json().data;
-    expect(progress.matched).toBe(1);
+    expect(progress.matched).toBe(2);
     expect(progress.unscored).toBe(0);
   });
 

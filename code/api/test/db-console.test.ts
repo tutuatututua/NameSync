@@ -4,7 +4,7 @@ import { DBModel } from "@extensions/sqldb";
 import { buildApp } from "../src/app";
 import { UserModel } from "../src/models";
 import { hashPassword } from "../src/lib/password";
-import { resetThrottle } from "../src/services/auth.service";
+import { issueSession, resetThrottle } from "../src/services/auth.service";
 import { truncateAll } from "./helpers";
 
 let app: FastifyInstance;
@@ -508,17 +508,19 @@ describe("session auth", () => {
   let secured: FastifyInstance;
   let userId: string;
 
-  /** Sign in and return the session token, read off the Set-Cookie the API sets. */
-  async function signIn(password = PASSWORD): Promise<string> {
-    const res = await secured.inject({
-      method: "POST",
-      url: "/api/auth/login",
-      payload: { email: EMAIL, password },
-    });
-    expect(res.statusCode, res.body).toBe(200);
-    const token = sessionCookie(res.headers["set-cookie"]);
-    expect(token).toBeTruthy();
-    return token!;
+  /**
+   * A live session for EMAIL, minted directly.
+   *
+   * It used to POST /api/auth/login. That route is gone — Center is the only way in — and
+   * these tests are about the session GUARD, not about how a session is obtained. Going
+   * through `issueSession` keeps them testing the thing they are named for, without dragging
+   * a Center stub into a file about the database console. Center's own login mechanics are
+   * covered in test/center-auth.test.ts.
+   */
+  async function signIn(): Promise<string> {
+    const user = await UserModel.findByEmail(EMAIL);
+    const { token } = await issueSession(user!);
+    return token;
   }
 
   /** The API never puts the token in the body — only in an httpOnly cookie. */
@@ -572,23 +574,6 @@ describe("session auth", () => {
     expect(res.json().message).toMatch(/signed in/i);
   });
 
-  it("signs in, sets an httpOnly cookie, and keeps the token out of the body", async () => {
-    const res = await secured.inject({
-      method: "POST",
-      url: "/api/auth/login",
-      payload: { email: EMAIL, password: PASSWORD },
-    });
-
-    expect(res.statusCode, res.body).toBe(200);
-    expect(res.json().data.user.email).toBe(EMAIL);
-    // The token must never be readable by script — that is the whole reason it isn't a JWT
-    // in localStorage any more.
-    expect(res.body).not.toContain("networkintel_session");
-    const header = ([] as string[]).concat(res.headers["set-cookie"] as string).join(";");
-    expect(header).toMatch(/HttpOnly/i);
-    expect(header).toMatch(/SameSite=Lax/i);
-  });
-
   it("200s a protected route with a valid session", async () => {
     const res = await get("/api/db/tables", await signIn());
     expect(res.statusCode, res.body).toBe(200);
@@ -623,24 +608,6 @@ describe("session auth", () => {
     expect(res.json().data.user).toMatchObject({ id: userId, email: EMAIL, roles: ["admin"] });
   });
 
-  it("401s a wrong password, and says nothing about whether the account exists", async () => {
-    const wrong = await secured.inject({
-      method: "POST",
-      url: "/api/auth/login",
-      payload: { email: EMAIL, password: "not-the-right-password" },
-    });
-    const unknown = await secured.inject({
-      method: "POST",
-      url: "/api/auth/login",
-      payload: { email: "nobody@example.com", password: "not-the-right-password" },
-    });
-
-    expect(wrong.statusCode).toBe(401);
-    expect(unknown.statusCode).toBe(401);
-    // Identical messages: otherwise this endpoint tells an attacker which emails have accounts.
-    expect(wrong.json().message).toBe(unknown.json().message);
-  });
-
   it("revokes the session on sign-out — the thing a JWT could never do", async () => {
     const token = await signIn();
     expect((await get("/api/db/tables", token)).statusCode).toBe(200);
@@ -659,30 +626,48 @@ describe("session auth", () => {
     expect((await get("/api/db/tables", "not-a-real-session-token")).statusCode).toBe(401);
   });
 
-  it("throttles repeated failed sign-ins", async () => {
-    const attempt = () =>
-      secured.inject({ method: "POST", url: "/api/auth/login", payload: { email: EMAIL, password: "wrong" } });
-
-    // 5 allowed, the 6th is refused.
-    for (let i = 0; i < 5; i++) expect((await attempt()).statusCode).toBe(401);
-    const res = await attempt();
-    expect(res.statusCode).toBe(429);
-    expect(res.json().message).toMatch(/too many/i);
-  });
-
   it("leaves /api/health public so a load balancer can still probe it", async () => {
     const res = await secured.inject({ method: "GET", url: "/api/health" });
     expect(res.statusCode).toBe(200);
   });
 
-  it("leaves POST /api/auth/login public — it is where a session comes from", async () => {
+  it("leaves POST /api/auth/center/login public — it is where a session comes from", async () => {
+    // Reached the handler (which then fails to dial Center in this file, since nothing stubs
+    // it) rather than being turned away by the guard. Anything but 401-not-signed-in proves
+    // the allowlist let it through.
     const res = await secured.inject({
       method: "POST",
-      url: "/api/auth/login",
+      url: "/api/auth/center/login",
       payload: { email: EMAIL, password: "wrong" },
     });
-    // 401 (bad credentials), NOT "not signed in" — i.e. the guard let it through.
-    expect(res.statusCode).toBe(401);
-    expect(res.json().message).toMatch(/incorrect/i);
+    expect(res.json().message ?? "").not.toMatch(/not signed in/i);
+  });
+
+  it("no longer exposes the deleted local sign-in routes", async () => {
+    // The regression this guards: /login and /otp/login were public, both minted a full
+    // session from app_user.password_hash, and neither consulted Center. They must stay gone.
+    const deleted = ["/api/auth/login", "/api/auth/otp/login", "/api/auth/change-password"];
+
+    for (const url of deleted) {
+      // Signed out, the answer is 401 rather than 404 — the guard runs onRequest, before
+      // routing, and these paths are no longer on its public allowlist. What matters is not
+      // the code but that no session comes back: 401 and 404 are both "no way in from here".
+      const res = await secured.inject({ method: "POST", url, payload: { email: EMAIL, password: PASSWORD } });
+      expect(res.statusCode, `${url} -> ${res.body}`).not.toBe(200);
+      expect(sessionCookie(res.headers["set-cookie"]), `${url} handed out a session`).toBeFalsy();
+    }
+
+    // With a valid session the guard lets the request through to the router, so this is the
+    // one that proves the ROUTES are actually gone rather than merely guarded.
+    const token = await signIn();
+    for (const url of deleted) {
+      const res = await secured.inject({
+        method: "POST",
+        url,
+        headers: { authorization: `Bearer ${token}` },
+        payload: { email: EMAIL, password: PASSWORD },
+      });
+      expect(res.statusCode, `${url} -> ${res.body}`).toBe(404);
+    }
   });
 });

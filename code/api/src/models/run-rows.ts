@@ -43,6 +43,33 @@ export function rowFilterWhere(
   return sql<SqlBool>`${bucket} = ${sql.val(filter)}`;
 }
 
+/** `%` and `_` are LIKE wildcards — a search for a literal one must not widen the match. */
+const escapeLike = (s: string): string => s.replace(/[\\%_]/g, (m) => `\\${m}`);
+
+/**
+ * The WHERE for the run table's search box, or null for "nothing typed".
+ *
+ * Here rather than three times over, for the same reason `rowFilterWhere` is: the predicate has to
+ * be applied to BOTH the page query and the count beside it, in all three readers, and a search
+ * that reached one and not the other would print "42 rows" under a list of six.
+ *
+ * Each reader passes its own columns — the names that live on the table it reads. Case-insensitive
+ * substring, escaped, and OR-ed: someone typing into one box is asking "is this string anywhere on
+ * the row", not which field it might be in.
+ */
+export function rowSearchWhere(
+  columns: readonly string[],
+  q: string | null | undefined
+): Expression<SqlBool> | null {
+  const text = q?.trim();
+  if (!text) return null;
+  const like = `%${escapeLike(text)}%`;
+  return sql<SqlBool>`(${sql.join(
+    columns.map((c) => sql`${sql.ref(c)} ilike ${like}`),
+    sql` or `
+  )})`;
+}
+
 /** What the three queries select, before it is handed to the client. */
 export interface RawRunRow {
   id: string | number;

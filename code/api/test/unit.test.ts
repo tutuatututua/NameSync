@@ -274,9 +274,11 @@ describe("FileParserService", () => {
   // `routeFriendNames` answers by script. Detection may fill it; a person may not, because
   // "let the app guess" is a worse answer than the two rows either side of it that say outright.
   it("won't let the unlabelled name slot be mapped by hand", async () => {
-    const p = await tmp("f9.xlsx", xlsxBuffer(["contact"], [["Somchai"]]));
+    // A header no tier can resolve on its own: not an alias, and its values are ids rather than
+    // anything name-shaped, so the read-the-data guess declines it too.
+    const p = await tmp("f9.xlsx", xlsxBuffer(["ref"], [["A-1187"]]));
     const preview = await FileParserService.previewFacebookFile(p, "f9.xlsx");
-    const rows = await FileParserService.parseFacebookFile(p, { friend_name: "contact" });
+    const rows = await FileParserService.parseFacebookFile(p, { friend_name: "ref" });
     fs.unlinkSync(p);
 
     // The preview says so, and the parser holds to it even if a caller asks anyway.
@@ -285,19 +287,17 @@ describe("FileParserService", () => {
     expect(rows[0]).toEqual({ friend_name_en: null, friend_name_th: null, relationship_owner: null });
 
     // The language columns are where an unrecognised name column is mapped, and they take it.
-    const p2 = await tmp("f10.xlsx", xlsxBuffer(["contact"], [["Somchai"]]));
-    const mapped = await FileParserService.parseFacebookFile(p2, { friend_name_en: "contact" });
+    const p2 = await tmp("f10.xlsx", xlsxBuffer(["ref"], [["A-1187"]]));
+    const mapped = await FileParserService.parseFacebookFile(p2, { friend_name_en: "ref" });
     fs.unlinkSync(p2);
-    expect(mapped[0].friend_name_en).toBe("somchai");
+    expect(mapped[0].friend_name_en).toBe("a-1187");
   });
 
-  it("takes a column the user mapped by hand, where nothing matched", async () => {
-    const p = await tmp("c5.xlsx", csvToXlsx("Organisation,ชื่อ-นามสกุล\nAcme,นายสมชาย ใจดี\n"));
-    // Untouched, this file maps nothing: neither header is on any alias list.
-    const before = await FileParserService.parseCompanyFile(p);
-    expect(before[0]).toEqual({ company_name: null, person_name_th: null, person_name_en: null });
+  it("takes the columns the user mapped by hand, over whatever detection made of them", async () => {
+    // Headers no alias list could have predicted, on both columns.
+    const p = await tmp("c5.xlsx", csvToXlsx("ref a,ref b\nAcme,นายสมชาย ใจดี\n"));
 
-    const overrides = { company_name: "Organisation", person_name_th: "ชื่อ-นามสกุล" };
+    const overrides = { company_name: "ref a", person_name_th: "ref b" };
     const rows = await FileParserService.parseCompanyFile(p, overrides);
     const preview = await FileParserService.previewCompanyFile(p, "c5.xlsx", overrides);
     fs.unlinkSync(p);
@@ -306,13 +306,208 @@ describe("FileParserService", () => {
     // still cleaned, the company name still tidied and case-preserving.
     expect(rows[0]).toEqual({ company_name: "Acme", person_name_th: "สมชาย ใจดี", person_name_en: null });
     // The preview agrees with the import, which is the whole point of the screen.
-    expect(preview.mapping.find((m) => m.target === "person_name_th")?.sourceColumn).toBe("ชื่อ-นามสกุล");
+    expect(preview.mapping.find((m) => m.target === "person_name_th")?.sourceColumn).toBe("ref b");
     expect(preview.sampleRows[0].person_name_th_clean).toBe("สมชาย ใจดี");
-    // A mapped column is no longer ignored, and no longer warned about...
-    expect(preview.ignoredColumns).not.toContain("ชื่อ-นามสกุล");
-    expect(preview.warnings.some((w) => w.includes("Thai name"))).toBe(false);
-    // ...while the one still nobody supplies is.
-    expect(preview.warnings.some((w) => w.includes("English name"))).toBe(true);
+    // A mapped column is no longer ignored, and the file no longer reads as unnamed.
+    expect(preview.ignoredColumns).not.toContain("ref b");
+    expect(preview.warnings.some((w) => w.includes("contact's name"))).toBe(false);
+    // A hand-mapped column is claimed BEFORE detection runs, so nothing else can take it — the
+    // guess in particular, which would otherwise have had "ref a" for the name.
+    expect(preview.mapping.find((m) => m.target === "person_name")?.sourceColumn).toBeNull();
+    expect(preview.mapping.find((m) => m.target === "company_name")?.sourceColumn).toBe("ref a");
+  });
+
+  // ── the four tiers, and the files that need each one ───────────────────────
+  // The bug these answer: a CSV or JSON whose columns aren't on any alias list arrived at the
+  // preview with nothing detected AND, on some shapes, nothing offerable either — so the column
+  // could be neither matched nor chosen. Each of these is a file a user actually brought.
+
+  it("steps over the preamble a LinkedIn export opens with, and joins the split name", async () => {
+    const p = await text(
+      "linkedin.csv",
+      'Notes:\n"When exporting your connection data, you may notice..."\n\n' +
+        "First Name,Last Name,URL,Company,Position\n" +
+        "Somchai,Jaidee,https://x,PTT,Engineer\nAnong,Suk,https://y,SCB,Analyst\n"
+    );
+    const preview = await FileParserService.previewFacebookFile(p, "linkedin.csv");
+    const rows = await FileParserService.parseFacebookFile(p);
+    fs.unlinkSync(p);
+
+    // Read from row 1, this file has ONE column called "Notes:" — every column it really has is
+    // invisible, so nothing can be detected and the picker has nothing to offer either.
+    expect(preview.sourceColumns).toEqual(["First Name", "Last Name", "URL", "Company", "Position"]);
+    // Half a name is not a name: the two halves are joined rather than picked between.
+    const name = preview.mapping.find((m) => m.target === "friend_name");
+    expect(name?.sourceColumn).toBe("First Name");
+    expect(name?.alsoColumn).toBe("Last Name");
+    expect(rows).toEqual([
+      { friend_name_en: "somchai jaidee", friend_name_th: null, relationship_owner: null },
+      { friend_name_en: "anong suk", friend_name_th: null, relationship_owner: null },
+    ]);
+    // Both halves are spoken for, so neither is offered as spare.
+    expect(preview.ignoredColumns).toEqual(["URL", "Company", "Position"]);
+  });
+
+  it("reads a nested JSON key as a column of its own", async () => {
+    const p = await text(
+      "nested.json",
+      JSON.stringify([
+        { id: 1, profile: { name: "Mr. Somchai Jaidee", known_by: "Alex" } },
+        { id: 2, profile: { name: "Anong", known_by: "Alex" } },
+      ])
+    );
+    const preview = await FileParserService.previewFacebookFile(p, "nested.json");
+    const rows = await FileParserService.parseFacebookFile(p);
+    fs.unlinkSync(p);
+
+    // The key was right there in the file; the reader was the only thing that couldn't see it.
+    // A dotted name says where the value came from, so nothing is invented.
+    expect(preview.sourceColumns).toEqual(["id", "profile.name", "profile.known_by"]);
+    expect(rows[0]).toEqual({
+      friend_name_en: "somchai jaidee",
+      friend_name_th: null,
+      relationship_owner: "Alex",
+    });
+  });
+
+  it("matches a header on its letters alone — punctuation is not vocabulary", async () => {
+    const p = await text("punct.csv", "Company (Name),Name (TH),Name-EN\nAcme,สมชาย,Somchai\n");
+    const rows = await FileParserService.parseCompanyFile(p);
+    fs.unlinkSync(p);
+    expect(rows[0]).toEqual({ company_name: "Acme", person_name_th: "สมชาย", person_name_en: "somchai" });
+  });
+
+  it("routes a name column that names no language by script, on both sides", async () => {
+    // "ชื่อ" and "Contact" say a person lives here and nothing about the alphabet. Filing them
+    // under the English column would put a Thai roster where a Thai run never looks.
+    const th = await text("neutral-th.csv", "บริษัท,ชื่อ\nปตท,นายสมชาย ใจดี\n");
+    expect((await FileParserService.parseCompanyFile(th))[0]).toEqual({
+      company_name: "ปตท",
+      person_name_th: "สมชาย ใจดี",
+      person_name_en: null,
+    });
+    fs.unlinkSync(th);
+
+    const en = await text("neutral-en.csv", "Contact,Known By\nMr. Somchai Jaidee,Alex\n");
+    expect((await FileParserService.parseFacebookFile(en))[0]).toEqual({
+      friend_name_en: "somchai jaidee",
+      friend_name_th: null,
+      relationship_owner: "Alex",
+    });
+    fs.unlinkSync(en);
+  });
+
+  it("reads the data when no header names a name column, and says that it guessed", async () => {
+    // Not a word any alias list has: the header is a code, and the only evidence is the cells.
+    const p = await text(
+      "unknown.csv",
+      "ref,f_002,phone\nA-1,สมชาย ใจดี,0812345678\nA-2,อนงค์ ดีใจ,0823456789\n"
+    );
+    const preview = await FileParserService.previewFacebookFile(p, "unknown.csv");
+    const rows = await FileParserService.parseFacebookFile(p);
+    fs.unlinkSync(p);
+
+    const name = preview.mapping.find((m) => m.target === "friend_name");
+    expect(name?.sourceColumn).toBe("f_002");
+    // Flagged, because a guess is a different kind of answer from an alias match and the screen
+    // has to say which one it is doing.
+    expect(name?.guessed).toBe(true);
+    expect(rows[0].friend_name_th).toBe("สมชาย ใจดี");
+    // An id column and a phone column are not names, and the guess has to be able to say so.
+    expect(preview.ignoredColumns).toEqual(["ref", "phone"]);
+  });
+
+  it("declines to guess rather than putting anything in a name column", async () => {
+    // Nothing here is name-shaped: ids and dates. A wrong guess imports junk under someone's
+    // roster, so the bar is high and this file simply has no name column.
+    const p = await text("ids.csv", "ref,seen\nA-1187,2026-01-02\nA-1188,2026-01-03\n");
+    const preview = await FileParserService.previewFacebookFile(p, "ids.csv");
+    fs.unlinkSync(p);
+    expect(preview.mapping.every((m) => m.sourceColumn === null)).toBe(true);
+    // ...and the screen says what to do about it, next to a picker offering both columns.
+    expect(preview.warnings.some((w) => w.includes("pick the column"))).toBe(true);
+  });
+
+  // ── the columns an import cannot do without ────────────────────────────────
+  // Two of them. A company file must name a company; and any file must name somebody in ENGLISH,
+  // because an import's run is `en_full` and compares one language only. The preview counts the
+  // second so the screen can bar the button before the upload; comparisons.route.ts refuses the
+  // same request for the same reason.
+
+  it("counts the rows an import's run could score, from the cells and not the headers", async () => {
+    // One column called `name`, no language in the header — routed by script. This file has no
+    // English *column* and no English names in it either, so its import would score nothing and is
+    // refused. Counted off the mapping rather than the cells, a file like this could not be told
+    // apart from one whose English column simply was not recognised.
+    const th = await text("th.csv", "name,owner\nสมชาย ใจดี,Alex\nอนงค์ ดีใจ,Alex\n");
+    expect((await FileParserService.previewFacebookFile(th, "th.csv")).scorableRows).toEqual({ en: 0 });
+    fs.unlinkSync(th);
+
+    // Mixed: each row lands in the column its script indicates, so only one of the two is scorable
+    // by the import's run. The other is stored in full and is reachable by a Thai comparison
+    // started from the Network page — the count is about the run, never about what is kept.
+    const mixed = await text("mixed.csv", "name,owner\nSomchai Jaidee,Alex\nอนงค์ ดีใจ,Alex\n");
+    expect((await FileParserService.previewFacebookFile(mixed, "mixed.csv")).scorableRows).toEqual({ en: 1 });
+    fs.unlinkSync(mixed);
+
+    // A bilingual row counts once: it has an English name, whatever else it has.
+    const both = await text("both.csv", "eng_name,thai_name,owner\nSomchai,สมชาย,Alex\n");
+    expect((await FileParserService.previewFacebookFile(both, "both.csv")).scorableRows).toEqual({ en: 1 });
+    fs.unlinkSync(both);
+
+    // A nameless row is not in the count: it will not be imported at all, so requiring a language
+    // of it would bar a file over a row that was never going to be part of the run.
+    const nameless = await text("nameless.csv", "name,owner\nSomchai,Alex\n,Alex\n");
+    expect((await FileParserService.previewFacebookFile(nameless, "nameless.csv")).scorableRows).toEqual({
+      en: 1,
+    });
+    fs.unlinkSync(nameless);
+  });
+
+  it("counts the contacts no run could reach — the ones naming no company", async () => {
+    // No company column at all: every importable row is unreachable, which is what bars the import.
+    const none = await text("nocompany.csv", "eng_name\nSomchai\nAnong\n");
+    const p = await FileParserService.previewCompanyFile(none, "nocompany.csv");
+    fs.unlinkSync(none);
+    expect(p.companylessRows).toBe(2);
+    expect(p.warnings.some((w) => w.includes("No column matched the company"))).toBe(true);
+    // One message about one missing column: the older mapping-only warning ("…or it will be empty
+    // on every row") is gone, and it was wrong besides — an empty company column stops the import.
+    expect(p.warnings.filter((w) => w.toLowerCase().includes("company"))).toHaveLength(1);
+
+    // Some rows blank: those import and are simply unreachable, and the preview says how many
+    // rather than refusing a file that is mostly fine.
+    const some = await text("somecompany.csv", "company_name,eng_name\nAcme,Somchai\n,Anong\n");
+    const partial = await FileParserService.previewCompanyFile(some, "somecompany.csv");
+    fs.unlinkSync(some);
+    expect(partial.companylessRows).toBe(1);
+    expect(partial.warnings.some((w) => w.includes("no run can reach"))).toBe(true);
+
+    // A nameless row is excluded from the count, exactly as it is from `scorableRows` — it is not
+    // imported, so its blank company is not a fault of the file.
+    const withNameless = await text("nameless-co.csv", "company_name,eng_name\nAcme,Somchai\n,\n");
+    const clean = await FileParserService.previewCompanyFile(withNameless, "nameless-co.csv");
+    fs.unlinkSync(withNameless);
+    expect(clean.companylessRows).toBe(0);
+
+    // A friends preview reports zero, never "not asked": a friend has no company, and that column
+    // belongs to the other side of the import.
+    const friends = await text("f-co.csv", "name,owner\nSomchai,Alex\n");
+    expect((await FileParserService.previewFacebookFile(friends, "f-co.csv")).companylessRows).toBe(0);
+    fs.unlinkSync(friends);
+  });
+
+  it("empties a column detection got wrong, which dropping the choice cannot do", async () => {
+    // "eng" is on the English-name alias list. On this file it is a department, and until `null`
+    // was a choice there was no way to say so: dropping the key just re-runs detection.
+    const p = await text("wrong.csv", "company,eng,who\nAcme,Engineering,Somchai\n");
+
+    const detected = await FileParserService.parseCompanyFile(p);
+    expect(detected[0].person_name_en).toBe("engineering");
+
+    const fixed = await FileParserService.parseCompanyFile(p, { person_name_en: null, person_name_th: "who" });
+    fs.unlinkSync(p);
+    expect(fixed[0]).toEqual({ company_name: "Acme", person_name_th: "somchai", person_name_en: null });
   });
 
   it("lets a hand-mapped column beat detection, and a header the file lacks change nothing", async () => {
@@ -408,10 +603,15 @@ describe("ColumnOverridesFieldSchema", () => {
   it("refuses what it can't read rather than importing under a guess", () => {
     expect(ColumnOverridesFieldSchema.safeParse("{ nope").success).toBe(false);
     expect(ColumnOverridesFieldSchema.safeParse(JSON.stringify(["thai_name"])).success).toBe(false);
-    // A target pointing at nothing is not a way to blank a column — clearing a choice drops the
-    // key, and every other spelling of "empty" is a bug in the caller.
+    // An empty STRING is still refused: it is a caller that meant to send a header and didn't.
     expect(ColumnOverridesFieldSchema.safeParse(JSON.stringify({ thai_name: "" })).success).toBe(false);
-    expect(ColumnOverridesFieldSchema.safeParse(JSON.stringify({ thai_name: null })).success).toBe(false);
+  });
+
+  // `null` is the word for "take nothing here", and it has to be a word of its own. Dropping the
+  // key means "resolve this target however you would have", which for a column detection got WRONG
+  // puts the wrong column straight back — the one answer that cannot help.
+  it("reads null as a choice: take nothing, whatever detection thinks", () => {
+    expect(ColumnOverridesFieldSchema.parse(JSON.stringify({ thai_name: null }))).toEqual({ thai_name: null });
   });
 });
 

@@ -102,36 +102,9 @@ const EnvSchema = z.object({
   // id in Center's model). Optional — sent when set. Comes from ticket 07 (client registration).
   CENTER_GROUP_IAM2_ID: z.string().optional(),
 
-  // ── Email-OTP sign-in + outbound email (SMTP) ───────────────────────────────
-  // A second, Network Intel-owned login path: password, then a one-time code emailed from here.
-  // See services/otp-auth.service.ts and lib/mailer.ts. The code is delivered over SMTP.
-  //
-  // With SMTP_HOST set, mail is actually sent. Unset in dev/test, the mailer instead LOGS
-  // the code to the server log so the flow is usable with no mail server — but a production
-  // deploy that means to use this path must configure real SMTP (checked at boot below).
-  SMTP_HOST: z.string().optional(),
-  SMTP_PORT: z.coerce.number().int().positive().max(65535).default(587),
-  // Implicit TLS on connect (true => port 465). Most providers use false + STARTTLS on 587.
-  SMTP_SECURE: z
-    .enum(['true', 'false'])
-    .transform((v) => v === 'true')
-    .optional(),
-  SMTP_USER: z.string().optional(),
-  SMTP_PASS: z.string().optional(),
-  // The From: address on OTP mail, e.g. "Network Intel <no-reply@example.com>". Falls back to
-  // SMTP_USER when unset. Required (as itself or SMTP_USER) once SMTP_HOST is set.
-  SMTP_FROM: z.string().optional(),
-
-  // A file to append unsent sign-in codes to when SMTP is NOT configured — on top of the log
-  // line, which dies with the container and so cannot be relied on across a rebuild. Point it
-  // somewhere persistent (e.g. /data/otp-codes.log, on the api-data volume). Dev only: the
-  // mailer refuses to reach this path in production. Unset = log only, as before.
-  OTP_DEV_SINK: z.string().optional(),
-
-  // How long an emailed code is good for, and how many wrong guesses it survives before it
-  // is burned. Short + few is the whole security of a 6-digit code.
-  OTP_TTL_MINUTES: z.coerce.number().int().positive().max(60).default(10),
-  OTP_MAX_ATTEMPTS: z.coerce.number().int().positive().max(20).default(5),
+  // SMTP_* / OTP_TTL_MINUTES / OTP_MAX_ATTEMPTS / OTP_DEV_SINK were removed on 2026-08-04
+  // along with the email-OTP login path they served. Center owns the second factor now and
+  // sends its own codes, so Network Intel has nothing left to email.
 
   // Optional read-only connection for the SQL console. Falls back to DATABASE_URL,
   // which is still safe (read-only transaction), but a role that physically cannot
@@ -178,18 +151,11 @@ function loadEnv(): Env {
   if (isProd && isAuthDisabled(env)) {
     missing.push('AUTH_DISABLED must not be set in production (it turns auth off entirely)');
   }
-  // A production deploy needs at least one real way in. The local password path is dev-only,
-  // so that leaves two: Center (CENTER_PLAYME_URL) and email-OTP (SMTP_HOST). Require at least
-  // one — a deploy with neither is locked out. Fail at boot, not at first login.
-  if (isProd && !env.CENTER_PLAYME_URL && !env.SMTP_HOST) {
-    missing.push(
-      'a production sign-in path: set CENTER_PLAYME_URL (Center) and/or SMTP_HOST (email-OTP) — with neither, no one can sign in'
-    );
-  }
-  // If email-OTP is configured, it must be able to actually send: an SMTP_HOST with no From
-  // address would accept the login and then fail to deliver the code. Fail at boot instead.
-  if (isProd && env.SMTP_HOST && !env.SMTP_FROM && !env.SMTP_USER) {
-    missing.push('SMTP_FROM (or SMTP_USER) is required when SMTP_HOST is set — it is the From: address on OTP mail');
+  // Center is the only way in, so a deploy without it is a deploy nobody can sign in to.
+  // Fail at boot rather than at the first login. (This used to accept SMTP_HOST as an
+  // alternative, when Network Intel ran its own email-OTP path; that path is gone.)
+  if (isProd && !env.CENTER_PLAYME_URL) {
+    missing.push('CENTER_PLAYME_URL — Center is the only sign-in path, so no one can sign in without it');
   }
   // A SameSite=None cookie without Secure is silently DROPPED by every current browser —
   // so this misconfiguration would present as "login succeeds, then nothing is signed in".
@@ -244,13 +210,6 @@ export const trustProxy: boolean | number | string[] = (() => {
 
 /** Is Center sign-in wired up? Always true in production (env refuses to boot otherwise). */
 export const isCenterConfigured = (): boolean => !!env.CENTER_PLAYME_URL;
-
-/**
- * Is email actually deliverable? True once SMTP_HOST is set. When false the mailer logs the
- * code instead of sending it (dev convenience) — production requires this to be true if the
- * OTP path is meant to be usable, since a code no one receives is not a login.
- */
-export const isSmtpConfigured = (): boolean => !!env.SMTP_HOST;
 
 /**
  * Is the external workflow the matcher?

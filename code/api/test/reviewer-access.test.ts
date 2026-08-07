@@ -3,8 +3,7 @@ import type { FastifyInstance } from "fastify";
 import { DBModel } from "@extensions/sqldb";
 import { buildApp } from "../src/app";
 import { UserModel } from "../src/models";
-import { hashPassword } from "../src/lib/password";
-import { login } from "../src/services/auth.service";
+import { createUser, issueSession } from "../src/services/auth.service";
 
 /**
  * The reviewer boundary, over real HTTP.
@@ -18,7 +17,6 @@ import { login } from "../src/services/auth.service";
  * answer and not the UI declining to draw a button.
  */
 
-const PASSWORD = "correct-horse-battery-staple";
 const REVIEWER = "reviewer@example.com";
 const FULL = "full-user@example.com";
 
@@ -40,21 +38,14 @@ beforeAll(async () => {
   app = await buildApp();
   process.env.AUTH_DISABLED = "1";
 
-  await UserModel.create({
-    email: REVIEWER,
-    passwordHash: await hashPassword(PASSWORD),
-    name: "Reviewer",
-    roles: ["reviewer"],
-  });
-  await UserModel.create({
-    email: FULL,
-    passwordHash: await hashPassword(PASSWORD),
-    name: "Full User",
-    roles: ["user"],
-  });
+  // No password: Center holds the credential, and these accounts exist only to be authorised.
+  // Sessions are minted directly — how a session is OBTAINED is center-auth.test.ts's job;
+  // this file is about what one may then reach.
+  await createUser({ email: REVIEWER, name: "Reviewer", roles: ["reviewer"] });
+  await createUser({ email: FULL, name: "Full User", roles: ["user"] });
 
-  reviewerToken = (await login(REVIEWER, PASSWORD)).token;
-  userToken = (await login(FULL, PASSWORD)).token;
+  reviewerToken = (await issueSession((await UserModel.findByEmail(REVIEWER))!)).token;
+  userToken = (await issueSession((await UserModel.findByEmail(FULL))!)).token;
 });
 
 afterAll(async () => {
@@ -127,7 +118,7 @@ describe("a full-access session, for contrast", () => {
       method: "POST",
       url: "/api/auth/users",
       headers: { authorization: `Bearer ${userToken}` },
-      payload: { email: "nope@example.com", password: "correct-horse-battery-staple" },
+      payload: { email: "nope@example.com" },
     });
     expect(res.statusCode).toBe(403);
     expect(res.json().message).toMatch(/admin/i);

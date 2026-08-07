@@ -77,6 +77,34 @@ export function withThreshold(href: string, threshold: number | null | undefined
 }
 
 /**
+ * The bar EXACTLY as this URL carries it — for a surface that does not read at one, only passes it
+ * on.
+ *
+ * Deliberately not `readThreshold`, and the difference is the whole reason this exists. That
+ * function answers "what should this page be read at", so an absent parameter is the workspace
+ * default (80%) — the right answer for a page whose numbers are graded. A run page's numbers are
+ * NOT graded: it shows what its matcher decided, at every bar. Asked through `readThreshold` it
+ * would invent an opinion it does not have and stamp `threshold=0.8`-worth of meaning onto every
+ * link leaving it.
+ *
+ * So: absent → `undefined`, "there is no bar here to carry", which `withThreshold` leaves the href
+ * untouched for. Present → carried verbatim, `off` included.
+ *
+ * This is what keeps a tuned workspace alive through a run. The bar rode into `/comparisons/:id` on
+ * no link and left on none, so a reader who set 60%, opened a result and clicked the relationship
+ * owner inside it landed on that roster at the default — the workspace's one promise ("the bar
+ * follows you into a company or a roster") broken by the one page that has no bar of its own.
+ */
+export function carriedThreshold(raw: string | null): number | null | undefined {
+  return raw === null ? undefined : readThreshold(raw);
+}
+
+/** `carriedThreshold` over the current URL — for the links a pass-through page draws. */
+export function useCarriedThreshold(): number | null | undefined {
+  return carriedThreshold(useSearchParams().get("threshold"));
+}
+
+/**
  * Read the bar, and (on the page that owns the control) move it.
  *
  * `setThreshold` uses `replace`, not `push`: dragging a slider is one act of looking, not twenty

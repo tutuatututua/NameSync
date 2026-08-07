@@ -7,29 +7,27 @@ import {
   AuthUserSchema,
   CenterLoginBodySchema,
   CenterLoginDataSchema,
-  ChangePasswordBodySchema,
   CreateUserBodySchema,
-  LoginBodySchema,
-  OtpLoginBodySchema,
-  OtpLoginDataSchema,
   type AuthUser,
 } from "@extensions/contract";
-import { isProduction } from "../config/env";
 import { Forbidden, Unauthorized } from "../lib/errors";
 import { ok } from "../lib/http";
 import { bearerToken, clearSessionCookie, SESSION_COOKIE, setSessionCookie } from "../lib/session";
 import { readCookie } from "../lib/cookies";
-import { changePassword, createUser, login, logout } from "../services/auth.service";
+import { createUser, logout } from "../services/auth.service";
 import { signInWithCenter } from "../services/center-auth.service";
-import { signInWithOtp } from "../services/otp-auth.service";
 import type { SessionUser } from "../lib/session";
 
 /**
  * /api/auth — the login flow.
  *
- * Only POST /login is public (the allowlist lives in plugins/auth.ts); everything else
+ * Only POST /center/login is public (the allowlist lives in plugins/auth.ts); everything else
  * here runs behind the same guard as the rest of the app. /me deliberately 401s when
  * signed out — that is the signal the frontend's AuthGuard waits for.
+ *
+ * Center is the sole identity source: it owns the password and the second factor, and this
+ * app owns who is allowed in and with what role. There is no local password path — see the
+ * note where the two deleted routes used to be.
  *
  * The session token never appears in a response body, only in a Set-Cookie. That is what
  * keeps it out of reach of script, and out of logs and browser history.
@@ -77,51 +75,21 @@ export default async function authRoutes(fastify: FastifyInstance): Promise<void
     }
   );
 
-  // ── Sign in with an emailed one-time code ─────────────────────────────────
-  // Network Intel's own two-factor path, usable in every environment. One endpoint, two steps:
-  // the first call carries email+password (a code is emailed, the reply is a challenge with a
-  // `ref` and no cookie); the second call adds `code`+`ref` and, on success, gets the session.
-  // See services/otp-auth.service.ts.
-  app.post(
-    "/otp/login",
-    { schema: { body: OtpLoginBodySchema, response: { 200: apiSuccess(OtpLoginDataSchema) } } },
-    async (req, reply) => {
-      const result = await signInWithOtp({
-        email: req.body.email,
-        password: req.body.password,
-        code: req.body.code,
-        ref: req.body.ref,
-        meta: { userAgent: req.headers["user-agent"], ip: ipOf(req) },
-        // In dev, with SMTP unset, the mailer writes the code here so the flow still works.
-        log: (msg) => req.log.info(msg),
-      });
-
-      if (result.kind === "twoFactor") return ok(result.challenge);
-
-      setSessionCookie(reply, result.session.token);
-      return ok({ user: toAuthUser(result.session.user) });
-    }
-  );
-
-  // ── Sign in with a local password (dev only) ──────────────────────────────
-  // Retained for local development against a database of your own accounts. Refused in
-  // production, where Center is the only identity source — so a prod deploy cannot be entered
-  // with a Network Intel-local password even if one somehow exists on a row.
-  app.post(
-    "/login",
-    { schema: { body: LoginBodySchema, response: { 200: apiSuccess(AuthSessionDataSchema) } } },
-    async (req, reply) => {
-      if (isProduction) {
-        throw new Forbidden("Password sign-in is disabled here. Sign in with Center.");
-      }
-      const { token, user } = await login(req.body.email, req.body.password, {
-        userAgent: req.headers["user-agent"],
-        ip: ipOf(req),
-      });
-      setSessionCookie(reply, token);
-      return ok({ user: toAuthUser(user) });
-    }
-  );
+  // Center is the ONLY way in. Two sign-in paths used to sit here beside it and were deleted
+  // on 2026-08-04:
+  //
+  //   POST /login      — a password checked against app_user.password_hash
+  //   POST /otp/login  — the same password, plus a one-time code Network Intel emailed itself
+  //
+  // Both were guarded only by NODE_ENV, and this deployment runs `development` on purpose
+  // (production won't boot without SMTP/Center, and forces a Secure cookie that plain http
+  // drops). So configuring Center did not close them: switching the login form to Center only
+  // changed which endpoint the FORM called, and a plain curl to /api/auth/login still returned
+  // an admin session — Center bypassed entirely, on a LAN-reachable host.
+  //
+  // Deleted rather than flagged off, because a second door that only a flag holds shut is the
+  // kind of thing that gets reopened for a demo and left that way. `password_hash` is now
+  // written (the column is NOT NULL) and never read.
 
   // ── Sign out ──────────────────────────────────────────────────────────────
   // Always 200, and always clears the cookie: a client trying to end a session it can no
@@ -140,19 +108,9 @@ export default async function authRoutes(fastify: FastifyInstance): Promise<void
     return ok({ user: toAuthUser(req.user) });
   });
 
-  // ── Change my password ────────────────────────────────────────────────────
-  // Revokes every session, this one included — so the reply also clears the cookie and the
-  // user signs in again. Anything less leaves the sessions they were trying to cut loose.
-  app.post(
-    "/change-password",
-    { schema: { body: ChangePasswordBodySchema, response: { 200: ApiMessageSchema } } },
-    async (req, reply) => {
-      if (!req.user) throw new Unauthorized("Not signed in");
-      await changePassword(req.user.sub, req.body.current_password, req.body.new_password);
-      clearSessionCookie(reply);
-      return { success: true as const, message: "Password changed — please sign in again" };
-    }
-  );
+  // POST /change-password went with them. It rotated app_user.password_hash, which nothing
+  // reads any more — so it would have offered to change a credential that cannot sign you in,
+  // and left the real one (the Center password) untouched. Passwords are changed in Center.
 
   // ── Create a user ─────────────────────────────────────────────────────────
   // Admins only. There is no public sign-up, by design: Network Intel is an internal tool, so
@@ -167,7 +125,6 @@ export default async function authRoutes(fastify: FastifyInstance): Promise<void
 
       const user = await createUser({
         email: req.body.email,
-        password: req.body.password,
         name: req.body.name,
         roles: req.body.roles,
       });

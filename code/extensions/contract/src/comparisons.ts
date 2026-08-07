@@ -1,8 +1,9 @@
 import { z } from 'zod';
 import { ModeSchema, PaginationQuerySchema } from './common';
 import { CompareBySchema } from './compare-by';
+import { FilterBySchema, RequestableFilterBySchema } from './run-scope';
 import { ThresholdSchema } from './threshold';
-import { ColumnOverridesFieldSchema, CompareSourcesFieldSchema } from './uploads';
+import { ColumnOverridesFieldSchema } from './uploads';
 import type { RowVerdict } from './row-status';
 
 /**
@@ -95,9 +96,11 @@ export type CreateComparisonBody = z.infer<typeof CreateComparisonBodySchema>;
  * fields arrive as a bag of strings and a missing one is indistinguishable from an empty one at
  * this layer. What each means:
  *
- *   · `uploadPersonName` — the RELATIONSHIP OWNER. Keeps its wire name for the same reason
- *     `X-Session-ID` keeps its: renaming it breaks callers to say something the docs already
- *     say. An OVERRIDE: sent, it files every row of the import under that one name, whatever
+ *   · `uploadPersonName` — the RELATIONSHIP OWNER. Keeps its wire name because renaming it breaks
+ *     every existing caller to say something the docs already say. (The webhook's `X-Session-ID`
+ *     was kept on the same reasoning and has since gone, but that was a header nobody had to send
+ *     — this is a field callers do.) An OVERRIDE: sent, it files every row under that one name,
+ *     whatever
  *     the file's own owner column (see `relationship_owner` in file-parser.service.ts) says.
  *     Omit it and each row keeps the owner its file gave it — which is why it is no longer
  *     unconditionally required on a friends import. It becomes required again the moment the
@@ -108,29 +111,46 @@ export type CreateComparisonBody = z.infer<typeof CreateComparisonBodySchema>;
  *   · `sourceType`       — where the FILE came from ('facebook' | 'linkedin' | 'business card'
  *     | a value the user added). Stored in `upload.source` / `friend.source`, permanently, on
  *     every row. A fact about the data, not about any run over it.
- *   · `compareSources`   — which friends the RUN this import starts should cover. Stored in
- *     `comparison.sources`, per run. COMPANY imports only: a friends import's run scores the rows
- *     it just brought in, and all of those carry the one `sourceType`, so there is no population
- *     to narrow. A company import's contacts are scored against the friends already on file, and
- *     those come from every roster — which is the choice this field exists to offer.
  *
- *     NOT the same field as `sourceType`, and the two must not be collapsed: one is provenance
- *     and permanent, the other is scope and per-run. Null/absent means every source.
- *   · `compareBy`        — how the run should compare. It lives on the IMPORT screen and not
- *     only on the ad-hoc dialog because the import is the path that actually reaches the
- *     external matcher: the dialog runs the internal matcher and sends no webhook, so a mode
- *     picked only there could never reach the workflow it was meant to configure.
+ *     THE LAST SURVIVING SOURCE FIELD ON THIS SCHEMA, and the one that was never a run setting.
+ *     `compareSources` sat beside it and is gone — see the note below.
  *   · `columnOverrides`  — the columns the user mapped by hand on the preview screen, when
  *     detection found none. Sent here as well as to the preview, and identical in both, because
  *     the preview is only believable if the import reads the file the same way.
+ */
+/**
+ * ── NO RUN SETTINGS HERE ANY MORE, AND SENDING ONE CHANGES NOTHING (2026-08-05) ──
+ *
+ * `compareBy` and `compareSources` both stood on this schema and both are gone. What is left is
+ * exclusively facts about the FILE — who is importing, whose relationships these are, where the
+ * data came from, how to read its columns — which is the whole of what an import screen can
+ * honestly ask about.
+ *
+ * Removed rather than pinned to a constant, and `z.object` strips what it does not name, so a
+ * caller still sending either is IGNORED rather than refused. That is the right shape for fields
+ * that used to be honoured: a 400 would break a scripted importer over a value that no longer
+ * decides anything, while ignoring it produces exactly the run the server would have made anyway.
+ * The two settings resolve to their documented defaults — `en_full`, and every source.
+ *
+ * ── THE CHOICES DID NOT DISAPPEAR, THEY MOVED ──
+ *
+ * `POST /comparisons/compare` takes a mode, a source list AND a scope (`filter_by` /
+ * `filter_value`), so "compare that file again by Thai surname" and "match these contacts against
+ * LinkedIn only" are both runs you ask for over rows already on file. That is what the import path
+ * was being used as a proxy for, badly: it wrote a duplicate row set in order to change one column
+ * on the run above it.
+ *
+ * The deeper reason they never belonged here is that they have different LIFETIMES. `sourceType`
+ * above is written onto every row and is permanent; these two belong to one comparison and are
+ * meant to be asked again with a different answer. Putting a re-askable question on the screen
+ * whose act is irreversible made re-asking it look like re-importing — which is exactly what people
+ * started doing.
  */
 export const ImportFieldsSchema = z.object({
   name: z.string().trim().optional(),
   uploadPersonName: z.string().trim().optional(),
   uploaderName: z.string().trim().optional(),
   sourceType: z.string().trim().max(100).optional(),
-  compareBy: CompareBySchema.optional(),
-  compareSources: CompareSourcesFieldSchema,
   columnOverrides: ColumnOverridesFieldSchema,
 });
 export type ImportFields = z.infer<typeof ImportFieldsSchema>;
@@ -535,6 +555,26 @@ export const RunRowsQuerySchema = PaginationQuerySchema.extend({
   filter: z.enum(['all', 'pending', 'matched', 'unmatched', 'failed', 'unscored']).default('all'),
   sort: z.enum(['row', 'status', 'similarity']).default('row'),
   /**
+   * Keep only the rows carrying this text, case-insensitively — the run table's search box.
+   *
+   * Server-side for exactly the reason `sort` is: a 320-row run is thirteen pages, and filtering
+   * the 25 on screen would search page one while the tabs above went on counting the run. It
+   * composes with `filter` rather than replacing it ("the matches whose name contains somchai").
+   *
+   * ── What it searches: the row's OWN columns, in every direction ──
+   *
+   * Each of the three readers matches the names that live on the table it reads, plus the fact
+   * beside them a reader would plausibly type: the friend's two spellings and their relationship
+   * owner on a friends import, the contact's two spellings and their employer on a company import,
+   * and on a compare run — whose rows ARE result rows — both sides of the pairing at once.
+   *
+   * It deliberately does NOT reach through the lateral into the matched counterpart on the import
+   * readers. The count beside the page has to be built from the same predicate as the page, the
+   * count query does not carry those laterals, and a search that quietly meant something different
+   * from the "N rows" printed under it is worse than one that searches a smaller thing honestly.
+   */
+  q: z.string().trim().min(1).optional(),
+  /**
    * Re-grade the rows at this bar instead of reading their stored verdicts — see `regradeVerdict`.
    *
    * It has to reach the filter as well as the badge, which is why it is a query param and not
@@ -615,6 +655,38 @@ export const ResultsDataSchema = z.object({
    * three companies" produce identically-shaped result sets that mean different things.
    */
   sources: z.array(z.string()).nullable(),
+  /**
+   * ── THE THREE FACTS THAT IDENTIFY A RUN, NOT JUST ITS ANSWER (2026-08-06) ──
+   *
+   * `compareBy`, `filterBy`/`filterValue` and `date` are on the LIST already
+   * (`ComparisonListItemSchema`) and were missing here, which left the one page that shows a run in
+   * full knowing less about it than the row that links to it. That was survivable while the run
+   * page was a dead end. It stopped being survivable when the page grew the two things a reader
+   * arrives wanting — "ask this again" and "what else have I asked about this subject" — because
+   * both are questions about the SCOPE, and a page that cannot name its own scope can answer
+   * neither.
+   *
+   * Same nullability rules as the list, for the same reasons: `compareBy` resolves a stored NULL to
+   * the default (a knowable fact), the scope pair does not (nobody recorded one). See
+   * `ComparisonListItemSchema`.
+   */
+  compareBy: CompareBySchema,
+  /** The run's name — auto-generated at creation, or whatever a rename wrote over it. The page
+   *  titles itself from this for the runs whose scope is an id rather than a word (an import's
+   *  name is its filename, where its `filterValue` is `upload.id`). See `runTitle`. */
+  name: z.string().nullable(),
+  /** WHICH ROWS the run covered — null on a run predating the columns. See `run-scope.ts`. */
+  filterBy: FilterBySchema.nullable(),
+  /** The scope's one value. Null with `filterBy`, always — the pair is read together. */
+  filterValue: z.string().nullable(),
+  /** WHICH SIDE the scope picked — friends or contacts. Carried here for the same reason the three
+   *  facts above are: "Compare again" lives on this page, and it is the field that decides whether
+   *  the dialog still has a friend-source question to ask. See `ComparisonListItemSchema`, which
+   *  documents the rule and why a client cannot derive it. */
+  scopeSelects: z.enum(['friends', 'companies']).nullable(),
+  /** When the run was opened. The run page prints it beside the finding, and the sibling list it
+   *  now draws orders on it. */
+  date: z.string(),
   results: z.array(ComparisonResultRowSchema),
 });
 export type ResultsData = z.infer<typeof ResultsDataSchema>;
@@ -622,19 +694,29 @@ export type ResultsData = z.infer<typeof ResultsDataSchema>;
 /**
  * GET /api/comparisons/duplicate — "has this exact run been done already?"
  *
- * ADVISORY, NOT A GATE. The answer drives a callout in the new-run dialog and nothing else: the
- * user can read it and run anyway, and the POST that follows does not consult it. That is
- * deliberate on both halves.
+ * A GATE SINCE 2026-08-06, where it used to be a note the user could read and run through anyway.
+ * `blocked` is the verdict, the dialog disables its button on it, and `POST /compare` reaches the
+ * same conclusion for itself and answers 409.
  *
- * Not a gate, because a re-run is frequently the correct thing to do and the server cannot tell
- * which time it is. The obvious case is friends imported since: same companies, same mode, same
- * sources, and a genuinely different answer waiting on the other side. Blocking it would mean
- * deleting a good run to be allowed to repeat it.
+ * ── WHAT MADE IT SAFE TO BLOCK: THE ANSWER IS NOT "HAVE YOU RUN THIS" ──
  *
- * Not a unique constraint either, for the same reason and one more: `comparison` has no unique
- * index on anything but its primary key, and adding one would make a duplicate a 500-shaped
- * failure at INSERT time — after the user has waited through a matcher run — instead of a sentence
- * they read before starting.
+ * A re-run is frequently the correct thing to do, and the case is always the same one: rows have
+ * landed since. Same companies, same mode, same sources — and a genuinely different answer waiting
+ * on the other side. A flat block would mean deleting a good run to be allowed to repeat it, which
+ * is why this stayed advisory for as long as it did.
+ *
+ * So the question asked here is the sharper one: has this exact run been asked AND has nothing it
+ * reads moved since? Only then is a repeat certain to reproduce the answer already on file, and
+ * only then does `blocked` come back true. Import a friend, or a contact at one of the named
+ * companies, and the same request is allowed again — no deletion, no re-picking, nothing to undo.
+ * `FriendModel.changedSince` / `CompanyContactModel.changedSince` are where the two halves of
+ * "moved" are defined, each narrowed to the rows the run actually reads.
+ *
+ * Not a unique constraint, and that is unchanged: `comparison` has no unique index on anything but
+ * its primary key, and adding one would make a duplicate a 500-shaped failure at INSERT time —
+ * after the user has waited through a matcher run — instead of a sentence they read before
+ * starting. A constraint also could not express "unless something changed", which is the whole
+ * rule.
  *
  * A match is exact on all three axes. Two runs differing in ANY of companies, mode or sources are
  * different questions and this reports nothing, which is precisely the "run again if compare type
@@ -645,6 +727,16 @@ export const DuplicateRunQuerySchema = z.object({
   company: z.union([z.string(), z.array(z.string())]).optional(),
   compare_by: CompareBySchema.optional(),
   source: z.union([z.string(), z.array(z.string())]).optional(),
+  /**
+   * The run's SCOPE — the fourth axis, and the one that stops every scoped run reporting the
+   * whole-table run beside it as a duplicate of itself. See `run-scope.ts`.
+   *
+   * Both or neither, like the body schema — but unenforced here, because a querystring is read by
+   * a control that rebuilds it on every keystroke and a 400 mid-typing is a worse answer than
+   * treating a half-scope as none. `findDuplicates` is handed a scope only when both arrive.
+   */
+  filter_by: RequestableFilterBySchema.optional(),
+  filter_value: z.string().trim().min(1).optional(),
 });
 export type DuplicateRunQuery = z.infer<typeof DuplicateRunQuerySchema>;
 
@@ -667,5 +759,20 @@ export const DuplicateRunDataSchema = z.object({
     })
     .nullable(),
   runCount: z.number(),
+  /**
+   * IS THIS RUN REFUSED RIGHT NOW? — the verdict, and the field the dialog's button reads.
+   *
+   * True only when `run` is set AND nothing that run reads has changed since it was started, so a
+   * repeat could only reproduce it. It is deliberately a SERVER-SIDE verdict rather than something
+   * the client infers from `run !== null`: the second half of the rule is a question about rows the
+   * browser cannot see, and a client that guessed it would disagree with the 409 the POST will
+   * answer with — the two have to be one decision or the dialog is lying in one direction or the
+   * other.
+   *
+   * `run` therefore survives with it: a duplicate that is NOT blocked is still worth saying out
+   * loud ("you ran this yesterday, and friends have landed since"), and that sentence needs the run
+   * to link to.
+   */
+  blocked: z.boolean(),
 });
 export type DuplicateRunData = z.infer<typeof DuplicateRunDataSchema>;

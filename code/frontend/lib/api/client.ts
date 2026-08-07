@@ -1,15 +1,13 @@
 import { API_BASE_URL } from "@/app/utils/config";
 import { notifyUnauthorized } from "@/lib/auth/session";
 import type {
+  AuditEvent,
+  AuditSummaryData,
   AuthSessionData,
   AuthUser,
   CenterLoginBody,
   CenterLoginData,
-  ChangePasswordBody,
   CreateUserBody,
-  LoginBody,
-  OtpLoginBody,
-  OtpLoginData,
   CreateSavedQueryBody,
   DbRow,
   DbTablesData,
@@ -30,6 +28,8 @@ import type {
   UploadPreview,
   TriggerCompareData,
   ComparisonListItem,
+  RunSubject,
+  RunScope,
   ComparisonProgress,
   RunRow,
   RunRowsQuery,
@@ -37,8 +37,10 @@ import type {
   DataStats,
   SourceType,
   CompaniesData,
+  CompanySort,
   CompareBy,
   CompareByCompanyBody,
+  RequestedScope,
   DuplicateRunData,
   CreateUploadSourceBody,
   UploadSource,
@@ -48,6 +50,7 @@ import type {
   NetworkGradingData,
   NetworkOverviewData,
   NameSearchRow,
+  OwnerOptionsData,
   UploadersData,
   UploaderDetailData,
   RenameContactBody,
@@ -77,6 +80,9 @@ export type RunRowsParams = {
   /** Server-side, because the list is paged: sorting 25 rows here would order the page, not the
    *  run, and then call it "best first". See RunRowsQuerySchema. */
   sort?: RunRowsQuery["sort"];
+  /** The search box's text. Server-side for the same reason `sort` is — filtering the 25 rows on
+   *  screen would search page one and print the run's count under it. */
+  q?: string;
   /**
    * Read the run at this bar instead of at its stored verdicts — see `regradeVerdict`.
    *
@@ -147,12 +153,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     // disabled. Tell the auth layer once, from the one place every request passes through,
     // rather than making every caller remember to handle it. The sign-in endpoints are the
     // exception: a 401 there is "wrong password", which the form shows inline.
-    if (
-      res.status === 401 &&
-      path !== "/auth/login" &&
-      path !== "/auth/center/login" &&
-      path !== "/auth/otp/login"
-    ) {
+    if (res.status === 401 && path !== "/auth/center/login") {
       notifyUnauthorized();
     }
 
@@ -169,18 +170,56 @@ const qs = (params: Record<string, string | number | undefined>) => {
   return s ? `?${s}` : "";
 };
 
+/**
+ * WHICH runs to list — see `ComparisonsQuerySchema`, which owns the rules and enforces them.
+ *
+ * Four surfaces, one shape:
+ *
+ * ```ts
+ * { axes: ['company'], value: 'BlueBrick' }              a company page
+ * { axes: ['owner'],   value: 'Alex' }                   a relationship owner's page
+ * { axes: ['upload', 'file'], value: '22' }              one import's runs
+ * { axes: ['upload', 'file'], includeUnscoped: true }    the workspace
+ * {}                                                     every run
+ * ```
+ *
+ * `value` needs at least one axis; `includeUnscoped` cannot be combined with a `value`, because a
+ * run with no scope has no value to match. Both are 400s rather than something this type prevents —
+ * the server has to be right about them regardless, and encoding it here as a union would cost
+ * every call site more than the mistake it saves.
+ */
+export interface RunListFilter {
+  /** The scope kinds to include. Plural because an import is covered by two of them. */
+  axes?: readonly RunScope["filterBy"][];
+  /** Pin those axes to one company, owner or upload id. Matched case-insensitively, since a
+   *  company keeps its file's capitalisation and an owner keeps the one a human typed. */
+  value?: string;
+  /** Also include the runs with no scope at all — what Results' "New comparison" makes, plus the
+   *  historical ones from the workspace button that was removed on 2026-08-06. */
+  includeUnscoped?: boolean;
+}
+
 export const api = {
+  /**
+   * The Audit trail — read-only aggregates over the runs and imports the rest of this file
+   * creates. Reviewers may call both (see `api/src/lib/roles.ts`).
+   */
+  audit: {
+    /** Every tally on the page. `days` windows the daily series ONLY — every other number is
+     *  all-time. See `AuditSummaryQuerySchema`. */
+    summary: (days?: number) =>
+      request<Envelope<AuditSummaryData>>(`/audit/summary${qs({ days })}`).then((r) => r.data),
+    /** The trail itself, newest first. `kind` narrows to runs or imports alone. */
+    activity: (params: { page: number; limit: number; kind?: "run" | "import" }) =>
+      request<Paginated<AuditEvent>>(`/audit/activity${qs({ ...params })}`),
+  },
   /**
    * Sign-in. The session token never passes through this code: the API returns it as an
    * httpOnly Set-Cookie, so these calls only ever carry the *user*.
    */
   auth: {
-    login: (body: LoginBody) =>
-      request<Envelope<AuthSessionData>>("/auth/login", { method: "POST", body: JSON.stringify(body) }).then(
-        (r) => r.data.user
-      ),
     /**
-     * Sign in via Center — the production path. Returns either the signed-in user or a 2FA
+     * Sign in via Center — the only path. Returns either the signed-in user or a 2FA
      * challenge (`twoFactorRequired`); the caller inspects which and, for a challenge, calls
      * again with the same email+password plus the `code`. The session cookie, when it comes,
      * is set by the API — never seen here.
@@ -190,25 +229,12 @@ export const api = {
         method: "POST",
         body: JSON.stringify(body),
       }).then((r) => r.data),
-    /**
-     * Sign in with an emailed one-time code — Network Intel's own two-factor path, works in every
-     * environment. Returns either the signed-in user or a challenge (`twoFactorRequired`)
-     * meaning a code has been emailed; the caller calls again with the same email+password
-     * plus `code` and the echoed `ref`. The session cookie is set by the API, never seen here.
-     */
-    otpLogin: (body: OtpLoginBody) =>
-      request<Envelope<OtpLoginData>>("/auth/otp/login", {
-        method: "POST",
-        body: JSON.stringify(body),
-      }).then((r) => r.data),
+    // `login` (local password), `otpLogin` (Network Intel's own emailed code) and
+    // `changePassword` were removed on 2026-08-04 with the endpoints behind them. Center owns
+    // the password and the second factor; a password is changed in Center, not here.
     logout: () => request<{ success: true; message: string }>("/auth/logout", { method: "POST" }),
     /** 401s when signed out — that is how the AuthGuard asks "is anyone there?". */
     me: () => request<Envelope<AuthSessionData>>("/auth/me").then((r) => r.data.user),
-    changePassword: (body: ChangePasswordBody) =>
-      request<{ success: true; message: string }>("/auth/change-password", {
-        method: "POST",
-        body: JSON.stringify(body),
-      }),
     /** Admin only. There is no public sign-up; the first admin comes from `npm run create-user`. */
     createUser: (body: CreateUserBody) =>
       request<Envelope<AuthUser>>("/auth/users", { method: "POST", body: JSON.stringify(body) }).then(
@@ -216,15 +242,61 @@ export const api = {
       ),
   },
   comparisons: {
-    /** Every run, newest first — this is "Past runs". A run is its own record; there is no
-     *  separate saved copy to keep in step with it. */
-    list: () => request<Envelope<ComparisonListItem[]>>("/comparisons").then((r) => r.data),
+    /**
+     * Runs, newest first — this is "Past runs".
+     *
+     * `filter` decides WHICH runs, so a run surfaces where its scope lives: one company's runs on
+     * that company's page, one owner's on theirs, and the unscoped ones on the workspace that
+     * started them. Omitted returns every run, which is what this sent before it took an argument.
+     * See `ComparisonsQuerySchema`.
+     */
+    list: (filter?: RunListFilter) => {
+      const sp = new URLSearchParams();
+      // Appended, not set: `filter_by` is repeatable, and `set` would keep only the last axis —
+      // turning an import's "upload or file" into "file", which silently drops the run the import
+      // opened for itself.
+      for (const axis of filter?.axes ?? []) sp.append("filter_by", axis);
+      if (filter?.value !== undefined) sp.set("filter_value", filter.value);
+      // Only ever sent as `true`. `unscoped=false` and an absent `unscoped` mean the same thing to
+      // the server, and sending the word "false" invites a reader to think one of them means
+      // "scoped only", which is not a thing this endpoint offers.
+      if (filter?.includeUnscoped) sp.set("unscoped", "true");
+      const q = sp.toString();
+      return request<Envelope<ComparisonListItem[]>>(`/comparisons${q ? `?${q}` : ""}`).then(
+        (r) => r.data
+      );
+    },
+    /**
+     * One page of SUBJECTS — the run list folded by what each run was about.
+     *
+     * What `RecentRuns` reads, everywhere it appears. `list` above still serves the callers that
+     * want raw runs and are bounded by their own question; this one exists because the Results tab
+     * is bounded by nothing and its rows are subjects rather than runs, so the page boundary has to
+     * fall between subjects. See `ComparisonSubjectsQuerySchema`.
+     *
+     * Takes the same `RunListFilter` as `list`, so a company page asks the same question of both
+     * endpoints and simply gets its answer already grouped — one subject, all of its runs.
+     */
+    subjects: (params: RunListFilter & { q?: string; page: number; limit: number }) => {
+      const sp = new URLSearchParams();
+      // Appended for the same reason as above — the axis is repeatable.
+      for (const axis of params.axes ?? []) sp.append("filter_by", axis);
+      if (params.value !== undefined) sp.set("filter_value", params.value);
+      if (params.includeUnscoped) sp.set("unscoped", "true");
+      // Omitted rather than sent empty: the schema's `min(1)` refuses `q=`, and the caller's box
+      // starts empty.
+      if (params.q?.trim()) sp.set("q", params.q.trim());
+      sp.set("page", String(params.page));
+      sp.set("limit", String(params.limit));
+      return request<Paginated<RunSubject>>(`/comparisons/subjects?${sp.toString()}`);
+    },
     rename: (id: string, name: string) =>
       request<Envelope<never>>(`/comparisons/${id}`, {
         method: "PATCH",
         body: JSON.stringify({ name } satisfies RenameComparisonBody),
       }),
-    remove: (id: string) => request<Envelope<never>>(`/comparisons/${id}`, { method: "DELETE" }),
+    // `remove` is gone (2026-08-07): the server refuses DELETE /comparisons/:id for everyone, so a
+    // client method for it could only ever produce a 403 toast. See the route for why.
     run: (form: FormData) =>
       request<Envelope<RunComparisonData>>("/comparisons/run", { method: "POST", body: form }).then((r) => r.data),
     create: (form: FormData) =>
@@ -243,21 +315,36 @@ export const api = {
       request<Paginated<RunRow>>(`/comparisons/${id}/rows${qs({ ...params })}`),
     trigger: (id: string) =>
       request<Envelope<TriggerCompareData>>(`/comparisons/${id}/compare`, { method: "POST" }).then((r) => r.data),
-    companies: () => request<Envelope<CompaniesData>>(`/comparisons/companies`).then((r) => r.data),
+    /** The company picker's options — a searched, capped slice, plus the total that matched.
+     *  `total` is what an all-companies run reports its size from; never `companies.length`. */
+    companies: (q?: string, limit?: number) =>
+      request<Envelope<CompaniesData>>(`/comparisons/companies${qs({ q, limit })}`).then((r) => r.data),
     /** One run against one or more companies — every friend scored against the union of their
      *  contacts, keeping each friend's single closest match. Not one run per company. */
     compareByCompany: (
       /** Null is every company on file — see `CompareByCompanyBodySchema`. */
       company_names: string[] | null,
       compare_by: CompareBy,
-      sources: string[] | null
+      sources: string[] | null,
+      /** WHICH ROWS — a company, a relationship owner or a past import. Omitted is the legacy
+       *  whole-table / company-list run. Both keys or neither; the server refuses half of one. */
+      scope?: RequestedScope | null
     ) =>
       request<Envelope<TriggerCompareData>>(`/comparisons/compare`, {
         method: "POST",
         // `sources: null` is sent explicitly rather than omitted. Both mean "every source" to the
         // schema, but sending it keeps the request a faithful record of what the dialog showed —
         // and an omitted field is the shape a future default would silently fill in.
-        body: JSON.stringify({ company_names, compare_by, sources } satisfies CompareByCompanyBody),
+        //
+        // The scope is the opposite case and is SPREAD rather than sent as nulls: "no scope" has no
+        // encoding of its own — its absence is the value — so a `filter_by: null` on the wire would
+        // be a third spelling the schema would have to learn to reject.
+        body: JSON.stringify({
+          company_names,
+          compare_by,
+          sources,
+          ...(scope ? { filter_by: scope.filterBy, filter_value: scope.filterValue } : {}),
+        } satisfies CompareByCompanyBody),
       }).then((r) => r.data),
     /**
      * "Have I already run exactly this?" — the new-run dialog's advisory check.
@@ -276,12 +363,19 @@ export const api = {
     duplicateRun: (
       company_names: string[] | null,
       compare_by: CompareBy,
-      sources: string[] | null
+      sources: string[] | null,
+      scope?: RequestedScope | null
     ) => {
       const sp = new URLSearchParams();
       for (const c of company_names ?? []) sp.append("company", c);
       sp.set("compare_by", compare_by);
       for (const s of sources ?? []) sp.append("source", s);
+      // Both or neither, matching the write path — a scoped question has to be answered by scoped
+      // runs, or every scoped run reports the whole-table run beside it as a duplicate of itself.
+      if (scope) {
+        sp.set("filter_by", scope.filterBy);
+        sp.set("filter_value", scope.filterValue);
+      }
       return request<Envelope<DuplicateRunData>>(`/comparisons/duplicate?${sp.toString()}`).then(
         (r) => r.data
       );
@@ -329,16 +423,42 @@ export const api = {
     /** What the threshold control has to work on — how many stored results carry a score. A fact
      *  about the evidence, so it takes no bar of its own. */
     grading: () => request<Envelope<NetworkGradingData>>(`/network/grading`).then((r) => r.data),
-    overview: (uploader?: string, threshold?: number) =>
-      request<Envelope<NetworkOverviewData>>(`/network/overview${qs({ uploader, threshold })}`).then(
+    /**
+     * A roster's tallies, plus one page of the companies it reaches.
+     *
+     * `company`, `sort`, `page` and `limit` govern that list ONLY — every tile on the tab is a
+     * tally over the whole roster and holds still while the list beneath it is searched and paged.
+     * See NetworkOverviewQuerySchema.
+     */
+    overview: (params: {
+      uploader?: string;
+      threshold?: number;
+      company?: string;
+      sort?: CompanySort;
+      page?: number;
+      limit?: number;
+    }) =>
+      request<Envelope<NetworkOverviewData>>(`/network/overview${qs({ ...params })}`).then(
         (r) => r.data
       ),
-    /** Search by free text (`q`) OR by an exact company name (`company`, for the company page). */
+    /**
+     * Search by free text (`q`), by an exact company name (`company`, for the company page), or
+     * BOTH — everyone at that company whose name matches `q`, which is the company page's search.
+     */
     search: (params: { q?: string; company?: string; page: number; limit: number; threshold?: number }) =>
       request<Paginated<NameSearchRow>>(`/network/search${qs({ ...params })}`),
     /** Every uploader with a roster, and their matched / no-match tallies — the Uploaders tab. */
     uploaders: (threshold?: number) =>
       request<Envelope<UploadersData>>(`/network/uploaders${qs({ threshold })}`).then((r) => r.data),
+    /**
+     * The roster filter's options — a searched, capped slice, plus how many matched in total.
+     *
+     * Distinct from `uploaders` above, which is the Uploaders TAB's data (per-roster tallies, graded
+     * by the bar). This one is just names, takes no bar, and exists to be called repeatedly while
+     * somebody types. Conflating the two would have made every keystroke re-run the match tallies.
+     */
+    owners: (q?: string, limit?: number) =>
+      request<Envelope<OwnerOptionsData>>(`/network/owners${qs({ q, limit })}`).then((r) => r.data),
     /** One uploader's matched and no-match names in full — the uploader detail page. */
     uploader: (name: string, threshold?: number) =>
       request<Envelope<UploaderDetailData>>(`/network/uploader${qs({ name, threshold })}`).then(

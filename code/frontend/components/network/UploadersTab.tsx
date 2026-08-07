@@ -9,6 +9,7 @@ import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyState } from "@/components/empty-state";
 import { SectionHeader } from "@/components/page-header";
+import { PAGE_SIZE, Pager } from "@/components/pagination";
 import { ReachLeads, reachBadgeVariant, rosterMatchTitle } from "@/components/network/match-grade";
 import { useNetworkUploaders } from "@/hooks/queries";
 import { withThreshold } from "@/hooks/useThreshold";
@@ -27,14 +28,40 @@ import { cn } from "@/lib/utils";
  * That agreement is why `threshold` (the workspace bar) is threaded to the query rather than only
  * to the links: the Overview reads one roster at the reader's bar, and a tab reading every roster
  * at the matchers' would put two different answers about the same person on two tabs of one page.
+ *
+ * ── The list is paged, and the search still is not ──
+ *
+ * It rendered every owner on file, in one column, forever: fine at nine rosters and a page you
+ * scroll past at two hundred, with no way to say "the second half". It is twenty at a time now,
+ * through the same `Pager` the rest of the app uses.
+ *
+ * The SEARCH stays client-side, which is the one thing that makes paging safe here. The endpoint
+ * hands back every owner in a single payload — a roster count is a small row and there is no `q`
+ * to send it — so the filter runs over the WHOLE list and the page is cut out of what it leaves.
+ * That is the opposite order from the company list (server search, server page) and the same
+ * result: a search never means "search the twenty rows in hand".
  */
 export function UploadersTab({ threshold = null }: { threshold?: number | null }) {
   const { data, isLoading, isFetching } = useNetworkUploaders(threshold ?? undefined);
   const [query, setQuery] = React.useState("");
+  const [page, setPage] = React.useState(1);
 
   const uploaders = data?.uploaders ?? [];
   const q = query.trim().toLowerCase();
   const filtered = q ? uploaders.filter((u) => u.uploader.toLowerCase().includes(q)) : uploaders;
+
+  // A narrower list is a different list, and page 4 of the old one is nowhere in it — the same
+  // re-page every searchable list in the app does. The bar is in here too: it does not add or
+  // remove owners, but it reorders nothing and changes every tally, so holding a deep page across
+  // a drag would be holding a page of numbers the reader never asked to be looking at.
+  React.useEffect(() => setPage(1), [q, threshold]);
+
+  const totalPages = Math.ceil(filtered.length / PAGE_SIZE);
+  // Clamped rather than trusted: the roster list can shrink under a page that is already open —
+  // a poll landing after an owner's friends are deleted — and slicing past the end renders an
+  // empty list under a control claiming there is something on it.
+  const current = Math.min(page, Math.max(1, totalPages));
+  const shown = filtered.slice((current - 1) * PAGE_SIZE, current * PAGE_SIZE);
 
   return (
     <div className="space-y-6">
@@ -73,17 +100,32 @@ export function UploadersTab({ threshold = null }: { threshold?: number | null }
           description="Try a different spelling, or clear the search to see everyone."
         />
       ) : (
-        // Dimmed while a new bar is in flight — see OverviewTab for why the previous answer stays
-        // on screen rather than being replaced by skeletons on every step of a drag.
-        <div
-          className={cn(
-            "overflow-hidden rounded-lg border transition-opacity",
-            isFetching && !isLoading && "opacity-60"
-          )}
-        >
-          {filtered.map((u) => (
-            <UploaderRow key={u.uploader} stats={u} threshold={threshold} />
-          ))}
+        <div className="space-y-3">
+          {/* Dimmed while a new bar is in flight — see OverviewTab for why the previous answer
+              stays on screen rather than being replaced by skeletons on every step of a drag. */}
+          <div
+            className={cn(
+              "overflow-hidden rounded-lg border transition-opacity",
+              isFetching && !isLoading && "opacity-60"
+            )}
+          >
+            {shown.map((u) => (
+              <UploaderRow key={u.uploader} stats={u} threshold={threshold} />
+            ))}
+          </div>
+
+          {/* Counted over what the SEARCH left, because that is what these pages run to — a pager
+              labelled with the unfiltered total would be numbering pages that do not exist while
+              the box has anything in it. */}
+          <Pager
+            page={current}
+            totalPages={totalPages}
+            onPageChange={setPage}
+            label="relationship owners"
+            summary={`Page ${current.toLocaleString()} of ${totalPages.toLocaleString()} · ${filtered.length.toLocaleString()} relationship owner${
+              filtered.length === 1 ? "" : "s"
+            }`}
+          />
         </div>
       )}
     </div>
@@ -113,7 +155,7 @@ function UploaderRow({ stats, threshold }: { stats: UploaderStats; threshold: nu
             itself does not move: leads are matches, and narrowing this number would push them into
             "no match" and restate a match as a non-match. */}
         <Badge
-          variant={stats.matched === 0 ? "outline" : reachBadgeVariant(stats.confirmed)}
+          variant={reachBadgeVariant(stats.confirmed, stats.matched)}
           title={
             stats.matched === 0
               ? "Friends with a connection"

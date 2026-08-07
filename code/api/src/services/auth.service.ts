@@ -1,7 +1,8 @@
+import { randomBytes } from "node:crypto";
 import { AuthSessionModel, UserModel } from "../models";
 import type { AppUser } from "../db.types";
-import { Conflict, TooManyRequests, Unauthorized } from "../lib/errors";
-import { DUMMY_HASH, hashPassword, verifyPassword } from "../lib/password";
+import { Conflict, TooManyRequests } from "../lib/errors";
+import { hashPassword } from "../lib/password";
 import { hashToken, newSessionToken, sessionExpiry, sessionTtlMs, type SessionUser } from "../lib/session";
 
 /**
@@ -82,51 +83,35 @@ export interface LoginResult {
   expiresAt: Date;
 }
 
-/**
- * Prove an email+password pair, and return the user it belongs to — without minting a
- * session. This is the shared, throttled front half of every password-based sign-in: the
- * plain local `login` below ends in a session, the email-OTP path (otp-auth.service.ts)
- * ends in a code instead, but both must first get past exactly this check, the same way.
- *
- * Every failure — unknown email, wrong password, disabled account — raises the same 401 with
- * the same message and after the same amount of work, so the response can't be used to
- * discover which emails have accounts.
+/*
+ * `verifyCredentials` and `login` were deleted on 2026-08-04 with the local password path.
+ * They read app_user.password_hash, which nothing reads any more — Center verifies the
+ * password, and this app only decides whether the person it vouches for is allowed in.
  */
-export async function verifyCredentials(
-  email: string,
-  password: string,
-  meta: { userAgent?: string; ip?: string } = {}
-): Promise<AppUser> {
-  const key = throttleKey(email, meta.ip);
-  checkThrottle(key);
+
+/**
+ * The throttle, as the Center path uses it.
+ *
+ * It used to be private to `verifyCredentials`. When that went, the throttle went with it and
+ * the ONE remaining way in had no rate limit at all — so these three exist to keep it.
+ *
+ * It matters more here than it did on the local path, not less. Center runs its own lockout
+ * (roughly five tries, then fifteen minutes), so an unthrottled proxy in front of it does not
+ * merely fail repeatedly — it spends a real person's Center attempts and locks them out of
+ * Center itself. Failing here first is what keeps a guesser from doing that.
+ */
+export function checkLoginThrottle(email: string, ip: string | undefined): void {
+  checkThrottle(throttleKey(email, ip));
   pruneThrottle();
-
-  const user = await UserModel.findByEmail(email);
-
-  // Hash against a decoy when there is no user, so the timing is the same either way.
-  const hash = user?.password_hash ?? (await DUMMY_HASH);
-  const passwordOk = await verifyPassword(password, hash);
-
-  if (!user || !passwordOk || !user.is_active) {
-    recordFailure(key);
-    throw new Unauthorized("Incorrect email or password");
-  }
-
-  attempts.delete(key); // a success clears the slate
-  return user;
 }
 
-/**
- * Sign in with a password alone. Verifies the credentials and immediately issues a session —
- * the single-factor path, used by the dev-only local /login.
- */
-export async function login(
-  email: string,
-  password: string,
-  meta: { userAgent?: string; ip?: string } = {}
-): Promise<LoginResult> {
-  const user = await verifyCredentials(email, password, meta);
-  return issueSession(user, meta);
+export function recordLoginFailure(email: string, ip: string | undefined): void {
+  recordFailure(throttleKey(email, ip));
+}
+
+/** A completed sign-in clears the slate. */
+export function clearLoginThrottle(email: string, ip: string | undefined): void {
+  attempts.delete(throttleKey(email, ip));
 }
 
 /**
@@ -193,7 +178,6 @@ export async function logout(token: string): Promise<void> {
  */
 export async function createUser(input: {
   email: string;
-  password: string;
   name?: string;
   roles?: string[];
 }): Promise<SessionUser> {
@@ -207,7 +191,11 @@ export async function createUser(input: {
 
   const user = await UserModel.create({
     email,
-    passwordHash: await hashPassword(input.password),
+    // app_user.password_hash is NOT NULL, but nothing reads it any more — Center holds the
+    // credential. Hash 32 random bytes nobody has ever seen rather than accept one from the
+    // caller: a column that must hold *something* should hold something unusable, not a
+    // password someone might reasonably believe still signs them in.
+    passwordHash: await hashPassword(randomBytes(32).toString("base64url")),
     name: input.name ?? null,
     // Defaults to `user`, not `[]`. Since lib/roles.ts default-denies, an account created
     // with no roles would be able to sign in and then be refused every endpoint — a
@@ -218,16 +206,8 @@ export async function createUser(input: {
   return toSessionUser(user);
 }
 
-/**
- * Change a password, then revoke every session the user has — including, deliberately,
- * the one they are changing it from. A password change that leaves the old sessions alive
- * does not achieve the thing people change their password *for*.
+/*
+ * `changePassword` was deleted on 2026-08-04. It rotated app_user.password_hash, which no
+ * longer signs anyone in — so it would have changed a credential that does nothing while
+ * leaving the real one (the Center password) untouched. Passwords are changed in Center.
  */
-export async function changePassword(userId: string, currentPassword: string, newPassword: string): Promise<void> {
-  const user = await UserModel.findById(userId);
-  if (!user || !(await verifyPassword(currentPassword, user.password_hash))) {
-    throw new Unauthorized("Current password is incorrect");
-  }
-  await UserModel.setPassword(userId, await hashPassword(newPassword));
-  await AuthSessionModel.deleteAllForUser(userId);
-}
