@@ -36,4 +36,7 @@ services:
       # DHCP-assigned: if the host's address changes, update it here and recreate the api
       # container. (Set here rather than inherited from code/.env because that file's copy
       # has already gone stale once — it still says .111.)
-      CORS_ORIGIN: "http://localhost:3000,http://192.168.8.103:3000"
+      # 172.20.10.2 added 2026-08-10 — the host moved network and .8.19 went stale, which is the
+      # exact drift this comment predicts. Both are kept: a stale origin allows nobody in (no
+      # device answers to it), so pruning buys nothing and costs a re-edit on the way back.
+      CORS_ORIGIN: "http://localhost:3000,http://192.168.8.19:3000,http://172.20.10.2:3000"

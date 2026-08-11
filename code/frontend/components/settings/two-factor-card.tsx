@@ -2,13 +2,15 @@
 
 import * as React from "react";
 import { QRCodeSVG } from "qrcode.react";
-import { Loader2, ShieldCheck, ShieldOff, Smartphone } from "lucide-react";
-import type { TwoFactorMethod, TwoFactorMethodState } from "@extensions/contract";
+import { HelpCircle, Loader2, Mail, ShieldAlert, ShieldCheck, Smartphone } from "lucide-react";
+import type { TwoFactorKnownMethod, TwoFactorMethod, TwoFactorMethodState } from "@extensions/contract";
 import { api, ApiError } from "@/lib/api/client";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Skeleton } from "@/components/ui/skeleton";
+import { formatRelativeTime } from "@/lib/format";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import {
   Dialog,
@@ -25,22 +27,116 @@ import { toast } from "sonner";
  *
  * Network Intel stores nothing about 2FA — every action proxies Center's own APIs (see
  * api/src/services/two-factor.service.ts). Because that needs a live Center token Network Intel
- * doesn't keep, the card is gated behind a re-auth: confirm the Center password once and a short
- * window opens for viewing and changing the setting. v1 enrols/removes the authenticator (TOTP);
- * an account already on SMS can be turned off here, but SMS enrolment stays in Center.
+ * doesn't keep, CHANGING the setting is gated behind a re-auth: confirm the Center password once
+ * and a short window opens. v1 enrols/removes the authenticator (TOTP) and SMS; an emailed code
+ * is Center's own setting and can only be read here.
+ *
+ * ── Reading is not gated ──────────────────────────────────────────────────────
+ * The card used to say nothing at all until the password was confirmed, so the commonest reason
+ * to open this page — "am I actually protected?" — cost a password prompt, and anyone who
+ * declined left no better informed than they arrived. The state is now shown on arrival, from
+ * GET /2fa/known (what Center demanded at the last sign-in; see api/src/lib/two-factor-state.ts).
+ * The password is still required for every change, which is the part that matters.
  */
 
-/** null = not yet unlocked (password not confirmed this session). */
+/** null = not unlocked yet; the live Center state, once a password confirmation has read it. */
 type MethodState = TwoFactorMethodState | null;
 
+/** How each state presents: the badge, the panel tint, and what it means in plain words. */
+const PRESENTATION: Record<
+  TwoFactorKnownMethod,
+  {
+    label: string;
+    badge: "success" | "warning" | "outline";
+    tone: string;
+    icon: React.ComponentType<{ className?: string }>;
+    headline: string;
+    detail: string;
+  }
+> = {
+  totp: {
+    label: "On",
+    badge: "success",
+    tone: "border-confidence-high/25 bg-confidence-high/10 text-confidence-high",
+    icon: ShieldCheck,
+    headline: "Your account is protected",
+    detail: "Signing in needs a code from your authenticator app as well as your password.",
+  },
+  sms: {
+    label: "On",
+    badge: "success",
+    tone: "border-confidence-high/25 bg-confidence-high/10 text-confidence-high",
+    icon: Smartphone,
+    headline: "Your account is protected",
+    detail: "Signing in needs a code texted to your registered phone as well as your password.",
+  },
+  email: {
+    label: "On",
+    badge: "success",
+    tone: "border-confidence-high/25 bg-confidence-high/10 text-confidence-high",
+    icon: Mail,
+    headline: "Your account is protected",
+    detail:
+      "Signing in needs a code emailed to you. Email codes are a Center setting — switch to an authenticator app below for a factor you can manage here.",
+  },
+  none: {
+    label: "Off",
+    badge: "warning",
+    tone: "border-confidence-medium/25 bg-confidence-medium/10 text-confidence-medium",
+    icon: ShieldAlert,
+    headline: "Your account is not protected",
+    detail: "Your password is the only thing standing between anyone who learns it and your account.",
+  },
+  unknown: {
+    label: "Unknown",
+    badge: "outline",
+    tone: "border-border bg-muted/50 text-muted-foreground",
+    icon: HelpCircle,
+    headline: "We couldn't check your current setting",
+    detail: "Confirm your password to read it from Center, or sign out and back in.",
+  },
+};
+
+/** The name of the active factor, for the badge beside "On". */
+const METHOD_NAME: Partial<Record<TwoFactorKnownMethod, string>> = {
+  totp: "Authenticator app",
+  sms: "SMS",
+  email: "Email code",
+};
+
 export function TwoFactorCard() {
+  /** What the last sign-in demanded. undefined while it is still being fetched. */
+  const [known, setKnown] = React.useState<{ method: TwoFactorKnownMethod; checkedAt: string | null }>();
   const [method, setMethod] = React.useState<MethodState>(null);
   const [reauthOpen, setReauthOpen] = React.useState(false);
   const [setupOpen, setSetupOpen] = React.useState(false);
   const [smsOpen, setSmsOpen] = React.useState(false);
   const [disabling, setDisabling] = React.useState(false);
+  /**
+   * Set when the user asks to turn 2FA on while the card is still locked, so the password prompt
+   * hands straight over to enrolment instead of dropping them back on the card to press a second
+   * button for the thing they already asked for.
+   */
+  const [afterUnlock, setAfterUnlock] = React.useState<"totp" | "sms" | null>(null);
 
   const unlocked = method !== null;
+
+  // The state on arrival. A failure here is not worth a toast — the card falls back to
+  // "unknown", which reads as "confirm your password to check", exactly as it did before.
+  React.useEffect(() => {
+    let cancelled = false;
+    api.auth.twoFactor
+      .known()
+      .then((s) => {
+        if (!cancelled) setKnown(s);
+      })
+      .catch(() => {
+        if (!cancelled) setKnown({ method: "unknown", checkedAt: null });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Closing the re-auth window when the user leaves the page keeps a Center token from lingering
   // in server memory past the moment it is needed. Best-effort — logout also clears it server-side.
@@ -49,6 +145,35 @@ export function TwoFactorCard() {
       void api.auth.twoFactor.end().catch(() => {});
     };
   }, []);
+
+  /**
+   * What to display. The live reading wins once there is one, with one correction: Center's
+   * flag has no value for an emailed code, so a live "none" on an account whose last sign-in
+   * demanded one means "no authenticator or SMS" — not "unprotected". Saying "off" there would
+   * be the one wrong answer that actually costs something.
+   */
+  const shown: TwoFactorKnownMethod =
+    method === null
+      ? known?.method ?? "unknown"
+      : method === "none" && known?.method === "email"
+        ? "email"
+        : method;
+
+  const view = PRESENTATION[shown];
+  const StatusIcon = view.icon;
+  const methodName = METHOD_NAME[shown];
+  const loading = known === undefined && method === null;
+
+  /** Ask for the password first when locked; otherwise go straight to the wizard. */
+  function startSetup(kind: "totp" | "sms") {
+    if (!unlocked) {
+      setAfterUnlock(kind);
+      setReauthOpen(true);
+      return;
+    }
+    if (kind === "totp") setSetupOpen(true);
+    else setSmsOpen(true);
+  }
 
   /** A 401 from any action means the window lapsed, not that the session died: re-lock and re-prompt. */
   const onActionError = React.useCallback((err: unknown) => {
@@ -62,11 +187,24 @@ export function TwoFactorCard() {
     toast.error(err instanceof ApiError ? err.message : "Something went wrong. Please try again.");
   }, []);
 
+  /** One place to record a new state, so the badge and the remembered reading never disagree. */
+  function applyMethod(next: TwoFactorMethodState) {
+    setMethod(next);
+    setKnown((prev) =>
+      // A live "none" does not disprove an emailed code — Center's flag simply has no value for
+      // one. Overwriting here would let merely confirming the password flip a protected account's
+      // card to "not protected", which is the exact misreading this card exists to prevent.
+      next === "none" && prev?.method === "email"
+        ? prev
+        : { method: next, checkedAt: new Date().toISOString() }
+    );
+  }
+
   async function onDisable() {
     setDisabling(true);
     try {
       const res = await api.auth.twoFactor.disable();
-      setMethod(res.method);
+      applyMethod(res.method);
       toast.success("Two-factor authentication turned off.");
     } catch (err) {
       onActionError(err);
@@ -78,53 +216,70 @@ export function TwoFactorCard() {
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Two-factor authentication</CardTitle>
-        <CardDescription>
-          Require a second step when signing in. Protects your account even if your password is
-          known. Managed through your Center account.
-        </CardDescription>
+        <div className="flex items-start justify-between gap-3">
+          <div className="space-y-1">
+            <CardTitle>Two-factor authentication</CardTitle>
+            <CardDescription>
+              Require a second step when signing in. Protects your account even if your password is
+              known. Managed through your Center account.
+            </CardDescription>
+          </div>
+          {loading ? (
+            <Skeleton className="h-5 w-16 shrink-0" />
+          ) : (
+            <Badge variant={view.badge} className="mt-0.5 shrink-0 gap-1 px-2 py-1 text-xs">
+              <StatusIcon className="h-3.5 w-3.5" />
+              {view.label}
+            </Badge>
+          )}
+        </div>
       </CardHeader>
 
-      <CardContent>
-        {!unlocked ? (
-          <p className="text-sm text-muted-foreground">
-            Confirm your password to view or change your two-factor settings.
-          </p>
-        ) : method === "none" ? (
-          <div className="flex items-center gap-2 text-sm">
-            <ShieldOff className="h-4 w-4 text-muted-foreground" />
-            <span className="text-muted-foreground">Two-factor authentication is off.</span>
-          </div>
-        ) : method === "totp" ? (
-          <div className="flex items-center gap-2 text-sm">
-            <ShieldCheck className="h-4 w-4 text-emerald-600 dark:text-emerald-500" />
-            <span>On</span>
-            <Badge variant="secondary">Authenticator app</Badge>
-          </div>
+      <CardContent className="space-y-3">
+        {loading ? (
+          <Skeleton className="h-[4.5rem] w-full rounded-md" />
         ) : (
-          <div className="space-y-2 text-sm">
-            <div className="flex items-center gap-2">
-              <Smartphone className="h-4 w-4 text-emerald-600 dark:text-emerald-500" />
-              <span>On</span>
-              <Badge variant="secondary">SMS</Badge>
+          <div className={`rounded-md border px-3 py-3 ${view.tone}`}>
+            <div className="flex items-start gap-2.5">
+              <StatusIcon className="mt-0.5 h-4 w-4 shrink-0" />
+              <div className="space-y-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-sm font-medium">{view.headline}</span>
+                  {methodName && <Badge variant="secondary">{methodName}</Badge>}
+                </div>
+                <p className="text-xs leading-relaxed opacity-90">{view.detail}</p>
+              </div>
             </div>
-            <p className="text-xs text-muted-foreground">
-              Codes are texted to your registered phone. You can turn this off here.
-            </p>
           </div>
+        )}
+
+        {/*
+          Where the reading came from, so nobody mistakes a remembered value for a live one. Only
+          while locked: once the password is confirmed the card is showing Center's own answer.
+        */}
+        {!loading && !unlocked && known?.checkedAt && (
+          <p className="text-xs text-muted-foreground">
+            Last checked {formatRelativeTime(known.checkedAt)}, when you signed in. Confirm your
+            password to re-check it or make a change.
+          </p>
         )}
       </CardContent>
 
-      <CardFooter className="gap-2">
-        {!unlocked ? (
-          <Button onClick={() => setReauthOpen(true)}>Manage</Button>
-        ) : method === "none" ? (
+      <CardFooter className="flex-wrap gap-2">
+        {shown === "none" || shown === "email" ? (
           <>
-            <Button onClick={() => setSetupOpen(true)}>Set up authenticator app</Button>
-            <Button variant="outline" onClick={() => setSmsOpen(true)}>
+            <Button onClick={() => startSetup("totp")}>
+              {shown === "email" ? "Set up authenticator app" : "Turn on two-factor authentication"}
+            </Button>
+            <Button variant="outline" onClick={() => startSetup("sms")}>
               Set up SMS
             </Button>
           </>
+        ) : !unlocked ? (
+          // On (or unknown) and still locked: changing it needs the password first.
+          <Button variant="outline" onClick={() => setReauthOpen(true)}>
+            {shown === "unknown" ? "Check my setting" : "Manage"}
+          </Button>
         ) : (
           <Button variant="destructive" onClick={onDisable} disabled={disabling}>
             {disabling ? (
@@ -141,10 +296,22 @@ export function TwoFactorCard() {
 
       <ReauthDialog
         open={reauthOpen}
-        onOpenChange={setReauthOpen}
+        onOpenChange={(open) => {
+          setReauthOpen(open);
+          // Abandoning the prompt abandons the intent with it, so a later "Manage" doesn't
+          // reopen a wizard the user backed out of.
+          if (!open) setAfterUnlock(null);
+        }}
         onReady={(m) => {
-          setMethod(m);
+          applyMethod(m);
           setReauthOpen(false);
+          // Carry on with what they actually asked for — but only if the live reading agrees
+          // there is nothing enrolled yet.
+          if (afterUnlock && m === "none") {
+            if (afterUnlock === "totp") setSetupOpen(true);
+            else setSmsOpen(true);
+          }
+          setAfterUnlock(null);
         }}
       />
 
@@ -152,7 +319,7 @@ export function TwoFactorCard() {
         open={setupOpen}
         onOpenChange={setSetupOpen}
         onEnabled={() => {
-          setMethod("totp");
+          applyMethod("totp");
           setSetupOpen(false);
           toast.success("Authenticator app enabled.");
         }}
@@ -163,7 +330,7 @@ export function TwoFactorCard() {
         open={smsOpen}
         onOpenChange={setSmsOpen}
         onEnabled={() => {
-          setMethod("sms");
+          applyMethod("sms");
           setSmsOpen(false);
           toast.success("SMS two-factor authentication enabled.");
         }}
@@ -441,6 +608,21 @@ function TotpSetupDialog({
 }
 
 /**
+ * Drop the national trunk prefix, which is the "0" in 081-234-5678 but not part of the number
+ * once a country code is in front of it: Thailand's +66 81 234 5678 is the SAME line, and
+ * +66 081 234 5678 is not a number at all.
+ *
+ * It matters here because the failure is silent. Center answers a sendcode with a reference
+ * whether or not the number it was handed can receive anything, so a leading 0 does not come
+ * back as "bad number" — it comes back as a perfectly ordinary "enter the code we texted you",
+ * for a text nobody sent. Anyone typing their own mobile number writes the 0.
+ *
+ * (Italy is the one common country that keeps its leading 0 in international form. This is why
+ * the dialog SHOWS the number it is about to text rather than quietly rewriting the field.)
+ */
+const toInternational = (digits: string): string => digits.replace(/^0+/, "");
+
+/**
  * The SMS enrolment wizard: enter a phone number → Center texts a code → verify it. Unlike the
  * authenticator, Center activates SMS only after the code checks out (the API flips the flag).
  */
@@ -474,12 +656,15 @@ function SmsSetupDialog({
     }
   }, [open]);
 
+  /** Exactly what Center will be asked to text — shown before sending, and sent verbatim. */
+  const sending = toInternational(phoneNumber.trim());
+
   async function onSendCode(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError(null);
     setBusy(true);
     try {
-      await api.auth.twoFactor.sendSmsCode({ phoneCountry: phoneCountry.trim(), phoneNumber: phoneNumber.trim() });
+      await api.auth.twoFactor.sendSmsCode({ phoneCountry: phoneCountry.trim(), phoneNumber: sending });
       setStep("code");
       setCode("");
       setBusy(false);
@@ -523,7 +708,7 @@ function SmsSetupDialog({
           <DialogDescription>
             {step === "phone"
               ? "Enter your mobile number. We'll text you a code to confirm it."
-              : `Enter the code we texted to +${phoneCountry} ${phoneNumber}.`}
+              : `Enter the code we texted to +${phoneCountry}${sending}.`}
           </DialogDescription>
         </DialogHeader>
 
@@ -556,6 +741,18 @@ function SmsSetupDialog({
                 />
               </div>
             </div>
+
+            {/*
+              The number as Center will receive it. A wrong one here is otherwise invisible:
+              Center answers with a reference either way, so the only symptom of a bad number is
+              a code that never arrives, on a screen that says it was sent.
+            */}
+            {sending && (
+              <p className="text-xs text-muted-foreground">
+                We&apos;ll text the code to <span className="font-medium text-foreground">+{phoneCountry}{sending}</span>
+                {sending !== phoneNumber.trim() && " — the leading 0 isn't used with a country code"}.
+              </p>
+            )}
 
             {error && (
               <p role="alert" className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">

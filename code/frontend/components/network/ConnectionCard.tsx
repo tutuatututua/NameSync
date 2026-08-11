@@ -2,11 +2,11 @@ import { ArrowRight, UserCheck, UserSearch } from "lucide-react";
 import {
   compareByAxes,
   compareByLabel,
-  hasThai,
   LANGUAGE_LABEL,
   matchReason,
   matchStrength,
   parseCompareBy,
+  resolveScoredPair,
   scoreQualifier,
   type CompareLanguage,
   type ConnectedUploader,
@@ -96,32 +96,31 @@ export function ConnectionCard({
    * The script test is the documented fallback for a bare name with no column beside it (see
    * `isScorable`), and this is exactly that case: `ConnectedUploader` carries one friend string and
    * no marker saying which column it came out of.
+   *
+   * ── THE RULE MOVED TO THE CONTRACT, BECAUSE IT WAS ONLY HALF RIGHT HERE (2026-08-10) ──
+   *
+   * What stood here derived the language from `uploader.friend` ALONE and keyed the contact's column
+   * off the result. That fixes the case it was written for and still pairs Latin against Thai on the
+   * live database, because it trusts the contact's columns to be filed in the language they are named
+   * for — and `comparison_result.person_name_en` holds the THAI spelling on all 993 rows of run 4,
+   * where the external workflow writes the matched contact into both columns without reading either
+   * label. The friend side was script-tested; the contact side was taken on faith; the mismatch it
+   * exists to prevent came straight back through the half that wasn't checked.
+   *
+   * `resolveScoredPair` script-tests BOTH sides and then picks the one language that holds the pair,
+   * preferring the run's own. It is in the contract because the run-results table had the identical
+   * bug with a different (and also incomplete) rule of its own — two readings of "what language is
+   * this pairing in" is how the same defect got fixed twice and stayed alive on both screens.
    */
-  const recordedLanguage: CompareLanguage = uploader.friend
-    ? hasThai(uploader.friend)
-      ? "th"
-      : "en"
-    : language;
+  const pair = resolveScoredPair(
+    language,
+    [uploader.friend, uploader.friendAlt],
+    [contact.person_name_en, contact.person_name_th]
+  );
+  const recordedLanguage: CompareLanguage = pair.language;
   /** True when the run's mode and its own recorded evidence disagree — said on the card, not hidden. */
-  const languageMismatch = recordedLanguage !== language;
-
-  /*
-   * THE SPELLING THIS RUN ACTUALLY SCORED — the language axis picks a column on the contact side
-   * (see `compare-by.ts`), so an `en_*` run held the friend against `person_name_en` and never
-   * looked at the Thai one.
-   *
-   * Keyed off `recordedLanguage` rather than the mode's, so BOTH HALVES OF THE PAIRING ARE ALWAYS IN
-   * ONE SCRIPT. A card showing a Latin name against a Thai one is not a subtle mislabel — it is two
-   * strings that were demonstrably never compared, with a percentage between them.
-   *
-   * The fallback is for the case where that column is empty today: the run matched on the other
-   * spelling, or the contact has since been edited. Then the pairing shows what there is and drops
-   * the language tag rather than labelling a Thai string "English" — the tag is a claim about which
-   * comparison happened, and it must not survive the substitution that makes it false.
-   */
-  const scored = recordedLanguage === "th" ? contact.person_name_th : contact.person_name_en;
-  const other = recordedLanguage === "th" ? contact.person_name_en : contact.person_name_th;
-  const contactName = scored ?? other;
+  const languageMismatch = !pair.agreed;
+  const contactName = pair.contact;
   const reason = matchReason(mode, score, { corroborated: uploader.corroborated });
 
   /**
@@ -174,8 +173,7 @@ export function ConnectionCard({
    * string would otherwise render `narong sinthu (narong sinthu)`, which is noise dressed as a
    * disclosure.
    */
-  const altSpelling =
-    uploader.friendAlt && uploader.friendAlt !== uploader.friend ? uploader.friendAlt : null;
+  const altSpelling = pair.friendAlt;
 
   /**
    * THE CONTACT'S OTHER SPELLING — the same disclosure, on the side that was missing it.
@@ -195,10 +193,11 @@ export function ConnectionCard({
    * asking the reader to pair them up by eye — across a group header, past a `Known by 2 friends`
    * line, over another card — is asking them to do the one piece of work this card exists to do.
    *
-   * Null when the pairing is already showing the fallback (`scored` empty, so `contactName` IS the
-   * other spelling): there is nothing left to disclose and the note below says why.
+   * Null when the pairing is already showing that spelling — there is nothing left to disclose, and
+   * `resolveScoredPair` suppresses it for the same reason `altSpelling` above is suppressed when the
+   * two columns hold one string.
    */
-  const contactAlt = scored && other && other !== scored ? other : null;
+  const contactAlt = pair.contactAlt;
 
   /**
    * WHICH OF THESE TWO IS THE ONE AT THE COMPANY — said in a word, on the face of the card.
@@ -226,7 +225,7 @@ export function ConnectionCard({
    * them. Neither is reachable on a healthy run written by the internal matcher.
    */
   const notes: { text: string; title: string }[] = [];
-  if (languageMismatch) {
+  if (languageMismatch && pair.sameScript) {
     notes.push({
       text: `set to compare ${compareByLabel(mode)}, but recorded ${
         LANGUAGE_LABEL[recordedLanguage]
@@ -236,10 +235,21 @@ export function ConnectionCard({
       } spellings for this pairing — so it did not follow the mode. Nothing on the row records which part of the names it did compare, which is why the score above carries no unit. Treat the number as a resemblance between the two names shown, and check the pairing before acting on it.`,
     });
   }
-  if (!scored && contactName) {
+  /*
+   * NO LANGUAGE HOLDS BOTH HALVES — the case the friend-only rule could not even detect.
+   *
+   * We hold this friend only in one script and this contact only in the other, so there is no pair of
+   * strings a matcher could have compared. Both names are still shown, because the reader needs both
+   * to act, but the card must not let the percentage above them stand as a measurement of the pair.
+   * Distinct from the note above: that one is a pairing in the wrong language, this one is not a
+   * pairing at all.
+   */
+  if (!pair.sameScript) {
     notes.push({
-      text: "compared on the contact's other spelling",
-      title: `This contact has no ${LANGUAGE_LABEL[recordedLanguage]} name on file today, so the pairing shows the spelling that survives rather than the one the run scored.`,
+      text: "the two names are in different scripts — what this score measured is unconfirmed",
+      title: `We hold this friend in ${LANGUAGE_LABEL[pair.friendLang]} and this contact in ${
+        LANGUAGE_LABEL[pair.contactLang]
+      }, and no spelling of both exists in one language — so these two strings cannot be what was scored. Both are shown because you need both to ask for an introduction; treat the number as unexplained and check the pairing before acting on it.`,
     });
   }
 
@@ -275,13 +285,13 @@ export function ConnectionCard({
               label="friend"
               hint={`Someone ${uploader.name} knows — the name this run held against the contact. Ask them for the introduction.`}
             >
-              {uploader.friend ? (
+              {pair.friend ? (
                 <span className="inline-flex min-w-0 flex-wrap items-baseline gap-x-1.5">
                   <MarkedName
-                    name={uploader.friend}
+                    name={pair.friend}
                     type={type}
-                    lang={recordedLanguage === "th" ? "th" : undefined}
-                    alt={uploader.friendAlt}
+                    lang={pair.friendLang === "th" ? "th" : undefined}
+                    alt={pair.friendAlt}
                     className="font-medium"
                   />
                   {/* The same person's other spelling, ON THE CARD rather than only in the title.
@@ -292,7 +302,7 @@ export function ConnectionCard({
                       over it, because no part of it was compared. */}
                   {altSpelling && (
                     <span
-                      lang={recordedLanguage === "th" ? undefined : "th"}
+                      lang={pair.friendLang === "th" ? undefined : "th"}
                       className="text-muted-foreground"
                       title={`Also on file as ${altSpelling}. This spelling was not the one scored.`}
                     >
@@ -316,10 +326,13 @@ export function ConnectionCard({
             <Side label="contact" hint={contactHint}>
               {contactName ? (
                 <span className="inline-flex min-w-0 flex-wrap items-baseline gap-x-1.5">
+                  {/* The tag follows the string, not the run: `contactLang` is what
+                      `resolveScoredPair` read out of the characters, so it is right even on the rows
+                      where the column it came from is named for the other language. */}
                   <MarkedName
                     name={contactName}
                     type={type}
-                    lang={scored && recordedLanguage === "th" ? "th" : undefined}
+                    lang={pair.contactLang === "th" ? "th" : undefined}
                     className="font-medium"
                   />
                   {/* Rendered exactly like the friend's — same parentheses, same muted grey, same
@@ -328,7 +341,7 @@ export function ConnectionCard({
                       quieter treatment on this side would be the asymmetry all over again. */}
                   {contactAlt && (
                     <span
-                      lang={recordedLanguage === "th" ? undefined : "th"}
+                      lang={pair.contactLang === "th" ? undefined : "th"}
                       className="text-muted-foreground"
                       title={`Also on file as ${contactAlt}. This spelling was not the one scored.`}
                     >

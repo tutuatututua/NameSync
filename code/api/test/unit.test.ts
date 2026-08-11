@@ -429,37 +429,52 @@ describe("FileParserService", () => {
   });
 
   // ── the columns an import cannot do without ────────────────────────────────
-  // Two of them. A company file must name a company; and any file must name somebody in ENGLISH,
-  // because an import's run is `en_full` and compares one language only. The preview counts the
-  // second so the screen can bar the button before the upload; comparisons.route.ts refuses the
-  // same request for the same reason.
+  // Two of them. A company file must name a company; and any file must name somebody in THE LANGUAGE
+  // THE IMPORTER CHOSE TO COMPARE, since a run compares one language only. The preview counts BOTH
+  // languages so the screen can bar the button before the upload and say which fix applies;
+  // comparisons.route.ts refuses the same request for the same reason.
+  //
+  // Both counts, not just `en`, since 2026-08-10: the import screen picks the mode again, so the
+  // requirement follows it — and a refusal that can say "0 English but 512 Thai" names its own fix,
+  // where "0 English" alone reads as an unreadable file.
 
-  it("counts the rows an import's run could score, from the cells and not the headers", async () => {
+  it("counts the rows an import's run could score, in each language, from the cells and not the headers", async () => {
     // One column called `name`, no language in the header — routed by script. This file has no
-    // English *column* and no English names in it either, so its import would score nothing and is
-    // refused. Counted off the mapping rather than the cells, a file like this could not be told
-    // apart from one whose English column simply was not recognised.
+    // English *column* and no English names in it either, so an `en_*` run would score nothing. The
+    // Thai count is what makes the refusal actionable rather than terminal: switching the language
+    // imports the same file. Counted off the mapping rather than the cells, a file like this could
+    // not be told apart from one whose English column simply was not recognised.
     const th = await text("th.csv", "name,owner\nสมชาย ใจดี,Alex\nอนงค์ ดีใจ,Alex\n");
-    expect((await FileParserService.previewFacebookFile(th, "th.csv")).scorableRows).toEqual({ en: 0 });
+    expect((await FileParserService.previewFacebookFile(th, "th.csv")).scorableRows).toEqual({
+      en: 0,
+      th: 2,
+    });
     fs.unlinkSync(th);
 
-    // Mixed: each row lands in the column its script indicates, so only one of the two is scorable
-    // by the import's run. The other is stored in full and is reachable by a Thai comparison
-    // started from the Network page — the count is about the run, never about what is kept.
+    // Mixed: each row lands in the column its script indicates, so each language can score exactly
+    // one of the two. Whichever mode is picked, the other row is stored in full and is reachable by
+    // a later run — the count is about the run, never about what is kept.
     const mixed = await text("mixed.csv", "name,owner\nSomchai Jaidee,Alex\nอนงค์ ดีใจ,Alex\n");
-    expect((await FileParserService.previewFacebookFile(mixed, "mixed.csv")).scorableRows).toEqual({ en: 1 });
+    expect((await FileParserService.previewFacebookFile(mixed, "mixed.csv")).scorableRows).toEqual({
+      en: 1,
+      th: 1,
+    });
     fs.unlinkSync(mixed);
 
-    // A bilingual row counts once: it has an English name, whatever else it has.
+    // A bilingual row counts once IN EACH: it is scorable whichever language the run picks.
     const both = await text("both.csv", "eng_name,thai_name,owner\nSomchai,สมชาย,Alex\n");
-    expect((await FileParserService.previewFacebookFile(both, "both.csv")).scorableRows).toEqual({ en: 1 });
+    expect((await FileParserService.previewFacebookFile(both, "both.csv")).scorableRows).toEqual({
+      en: 1,
+      th: 1,
+    });
     fs.unlinkSync(both);
 
-    // A nameless row is not in the count: it will not be imported at all, so requiring a language
+    // A nameless row is in neither count: it will not be imported at all, so requiring a language
     // of it would bar a file over a row that was never going to be part of the run.
     const nameless = await text("nameless.csv", "name,owner\nSomchai,Alex\n,Alex\n");
     expect((await FileParserService.previewFacebookFile(nameless, "nameless.csv")).scorableRows).toEqual({
       en: 1,
+      th: 0,
     });
     fs.unlinkSync(nameless);
   });

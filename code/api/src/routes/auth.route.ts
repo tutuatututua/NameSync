@@ -8,6 +8,7 @@ import {
   CenterLoginBodySchema,
   CenterLoginDataSchema,
   CreateUserBodySchema,
+  TwoFactorKnownStatusDataSchema,
   TwoFactorReauthBodySchema,
   TwoFactorReauthDataSchema,
   TwoFactorStatusDataSchema,
@@ -17,11 +18,13 @@ import {
   TwoFactorSmsSendBodySchema,
   TwoFactorSmsSendDataSchema,
   type AuthUser,
+  type TwoFactorMethodState,
 } from "@extensions/contract";
 import { Forbidden, Unauthorized } from "../lib/errors";
 import { ok } from "../lib/http";
 import { bearerToken, clearSessionCookie, hashToken, SESSION_COOKIE, setSessionCookie } from "../lib/session";
 import { readCookie } from "../lib/cookies";
+import { getKnownTwoFactorState, rememberTwoFactorState } from "../lib/two-factor-state";
 import { createUser, logout } from "../services/auth.service";
 import { signInWithCenter } from "../services/center-auth.service";
 import {
@@ -75,6 +78,16 @@ const windowKeyOf = (req: FastifyRequest): string => {
   const token = tokenOf(req);
   return token ? hashToken(token) : `user:${req.user?.sub ?? "anon"}`;
 };
+
+/**
+ * Every 2FA call below already knows the account's real method — it just came back from Center.
+ * Filing it away here is what keeps GET /2fa/known accurate after a change, so the card doesn't
+ * go on claiming "off" to someone who turned it on a moment ago. See lib/two-factor-state.ts.
+ */
+function remember<T extends { method: TwoFactorMethodState }>(req: FastifyRequest, result: T): T {
+  if (req.user) rememberTwoFactorState(req.user.sub, result.method);
+  return result;
+}
 
 export default async function authRoutes(fastify: FastifyInstance): Promise<void> {
   const app = fastify.withTypeProvider<ZodTypeProvider>();
@@ -169,7 +182,7 @@ export default async function authRoutes(fastify: FastifyInstance): Promise<void
         meta: { userAgent: req.headers["user-agent"], ip: ipOf(req) },
       });
       if (result.kind === "twoFactor") return ok(result.challenge);
-      return ok({ method: result.method });
+      return ok(remember(req, { method: result.method }));
     }
   );
 
@@ -179,7 +192,25 @@ export default async function authRoutes(fastify: FastifyInstance): Promise<void
     { schema: { response: { 200: apiSuccess(TwoFactorStatusDataSchema) } } },
     async (req) => {
       if (!req.user) throw new Unauthorized("Not signed in");
-      return ok({ method: await getStatus(windowKeyOf(req)) });
+      return ok(remember(req, { method: await getStatus(windowKeyOf(req)) }));
+    }
+  );
+
+  // What the settings page shows BEFORE any password confirmation: the factor Center demanded
+  // at the user's last sign-in, kept in memory since (lib/two-factor-state.ts). No window, no
+  // Center call, no password — a read of something already known.
+  //
+  // Deliberately separate from /2fa/status rather than a fallback inside it: that one means
+  // "what does Center say right now", and quietly answering it from a cache when the window
+  // has lapsed would turn a stale reading into one the caller believes is live.
+  app.get(
+    "/2fa/known",
+    { schema: { response: { 200: apiSuccess(TwoFactorKnownStatusDataSchema) } } },
+    async (req) => {
+      if (!req.user) throw new Unauthorized("Not signed in");
+      const state = getKnownTwoFactorState(req.user.sub);
+      if (!state) return ok({ method: "unknown" as const, checkedAt: null });
+      return ok({ method: state.method, checkedAt: new Date(state.checkedAt).toISOString() });
     }
   );
 
@@ -199,7 +230,10 @@ export default async function authRoutes(fastify: FastifyInstance): Promise<void
     { schema: { body: TwoFactorEnableBodySchema, response: { 200: apiSuccess(TwoFactorEnableDataSchema) } } },
     async (req) => {
       if (!req.user) throw new Unauthorized("Not signed in");
-      return ok(await enableTotp(windowKeyOf(req), req.body.code));
+      // Only a successful enrolment says anything about the account: `enabled:false` is a wrong
+      // code, and its `method:"none"` describes the failed attempt, not the account's state.
+      const result = await enableTotp(windowKeyOf(req), req.body.code);
+      return ok(result.enabled ? remember(req, result) : result);
     }
   );
 
@@ -223,7 +257,9 @@ export default async function authRoutes(fastify: FastifyInstance): Promise<void
     { schema: { body: TwoFactorEnableBodySchema, response: { 200: apiSuccess(TwoFactorEnableDataSchema) } } },
     async (req) => {
       if (!req.user) throw new Unauthorized("Not signed in");
-      return ok(await enableSms(windowKeyOf(req), req.body.code));
+      // As with the authenticator: a rejected code leaves the account exactly as it was.
+      const result = await enableSms(windowKeyOf(req), req.body.code);
+      return ok(result.enabled ? remember(req, result) : result);
     }
   );
 
@@ -233,7 +269,7 @@ export default async function authRoutes(fastify: FastifyInstance): Promise<void
     { schema: { response: { 200: apiSuccess(TwoFactorStatusDataSchema) } } },
     async (req) => {
       if (!req.user) throw new Unauthorized("Not signed in");
-      return ok(await disableTotp(windowKeyOf(req)));
+      return ok(remember(req, await disableTotp(windowKeyOf(req))));
     }
   );
 

@@ -12,9 +12,9 @@ import {
 } from "lucide-react";
 import {
   compareByAxes,
-  hasThai,
   LANGUAGE_LABEL,
   type CompareLanguage,
+  resolveScoredPair,
   rowVerdict,
   runRowBucket,
   scoreQualifier,
@@ -734,40 +734,44 @@ function Row({
   // The person to REACH is always the company contact; the person to ASK is always the friend's
   // owner. Which side of the row each comes from is the only thing that flips.
   const companyName = isFriendRow ? row.matchedContext : row.context;
-  const friendName = isFriendRow ? row.name : row.matchedName;
   const owner = row.relationshipOwner;
 
   /**
-   * The friend's OTHER spelling, and what language the one on the row is actually written in.
+   * THE PAIRING, IN ONE SCRIPT — four locals and three different language guesses ago.
    *
-   * Two different questions with two different best answers, and the split is the direction of the
-   * run — which is why this is not one expression:
+   * What stood here picked each side's spelling off the run's language axis INDEPENDENTLY and then
+   * declared each side's language from the column it had just picked. Both halves of that are wrong
+   * on the live database and the second one is what made it visible:
    *
-   *   · FRIENDS IMPORT. A column fact, and therefore exact. The server resolves `name` as
-   *     `coalesce(friend.<run language>, friend.<other language>)` and sends the other column as
-   *     `nameAlt`, so the two are equal exactly when the run's own column was empty and the row
-   *     fell back to the spelling it did not compare. No guessing required.
+   *   · The columns are not reliably in the language they are named for. `comparison_result`
+   *     .person_name_en holds the THAI spelling on all 993 rows of run 4 — an external workflow
+   *     writes the contact it matched into both columns — so an `en` run read `person_name_en`,
+   *     got Thai, and rendered it with no `lang` at all.
+   *   · With the sides resolved independently there was nothing to stop them disagreeing, and they
+   *     did: `watchara ciaxoensuk → วัชระ เจริญสุข`, `full name 100%` between them. Two strings that
+   *     were demonstrably never compared, under a percentage and an underline claiming they were.
    *
-   *   · COMPANY IMPORT. There is no column to consult: the friend side is `matchedName`, frozen
-   *     text off a `comparison_result` row, with no language marker beside it. This used to assume
-   *     it was in the run's language "by construction" — true of the internal matcher, which
-   *     writes the spelling it scored, and an assumption about an external workflow that we cannot
-   *     check and it never agreed to. So the characters answer instead, which is exactly the
-   *     "bare name in hand" fallback `isScorable` documents.
+   * `resolveScoredPair` answers both at once: it re-files every name by SCRIPT (the rule the writers
+   * already apply, see `nameSpellings`) and then picks the one language that holds BOTH sides,
+   * preferring the run's own and falling back to the other. Rows 1–6 of run 4 resolve to the Thai
+   * pair, which is the one the matcher can actually have looked at.
    *
-   * It matters because it becomes a `lang` attribute: tagging a Latin string `th` hands the browser
-   * the wrong font stack and asserts a comparison that never happened.
+   * The mode is still what the run ASKED FOR; these names are what HAPPENED. Where they conflict
+   * `pair.agreed` goes false and the score below stops naming a unit — see `Score.qualifier`.
+   *
+   * One call for both directions, where the old code had a branch per side: a friend is a friend
+   * whichever file was uploaded, so the only thing `kind` decides is which column supplies which
+   * half. `row.name` / `row.nameAlt` are handed over as loose strings rather than as a typed pair
+   * because that is what they are — the server coalesces `name` to the run's language and the two
+   * are equal when that column was empty, which the script test resolves without needing to know.
    */
-  const friendAlt = isFriendRow ? row.nameAlt : null;
-  const friendLang: CompareLanguage = isFriendRow
-    ? row.nameAlt !== row.name
-      ? language
-      : language === "th"
-        ? "en"
-        : "th"
-    : hasThai(friendName)
-      ? "th"
-      : "en";
+  const pair = resolveScoredPair(
+    language,
+    isFriendRow ? [row.name, row.nameAlt] : [row.matchedName, row.matchedNameTh],
+    isFriendRow ? [row.matchedName, row.matchedNameTh] : [row.name, row.nameTh]
+  );
+  const friendName = pair.friend;
+  const contactName = pair.contact;
 
   /**
    * What each side IS, for the role label's tooltip.
@@ -785,46 +789,31 @@ function Row({
     : "From the file you uploaded — the person at the company.";
 
   /**
-   * THE CONTACT, IN THE SPELLING THIS RUN ACTUALLY COMPARED.
+   * WHY THE RUN'S MODE IS NOT WHAT LABELS THIS ROW.
    *
-   * The contact side arrives as two raw columns — `name` is contractually their English spelling
-   * and `nameTh` their Thai one — and this table used to lead with English unconditionally. On a
-   * `th_*` run that put the wrong string in the largest type on the row: run 4 compares Thai
-   * surnames, so `ณัฐยา นครทรัพย์` is what was held against the friend `รัชดา นครทรัพย์`, and the
-   * row led with `nattaya nakornthap` — a spelling the matcher never looked at, with `MarkedName`
-   * dutifully underlining a surname token inside it that was never scored. The evidence for the
-   * match was on the second line, in grey.
+   * The uncompared spelling of each side stays in the `title` rather than on the row — one line of
+   * height on every row is a real cost for something the run's finding does not rest on, and a hover
+   * still answers "what else is this person called?". `pair.friendAlt` / `pair.contactAlt` are
+   * already null where that spelling is the one being shown, so neither side can repeat itself.
    *
-   * The language axis picks the column (see `compare-by.ts`), which is the same rule
-   * `ConnectionCard` already applies to the same fact on the company page. The friend side needs no
-   * such choice: the server resolves `RunRow.name` to the run's language already, and on a company
-   * import `matchedName` is the friend spelling the run recorded — so ONE language governs both
-   * halves of the pairing, which is the whole point. A Thai run puts `ณัฐยา นครทรัพย์` against
-   * `รัชดา นครทรัพย์` and the shared surname is visible as the identity it is; mixing the sides
-   * would show a Thai name matched to a Latin one and leave the reader to take the score on faith.
-   *
-   * ── The other spelling goes in the title, not on the row ──
-   *
-   * It rendered as a second line for one build and that was a half-measure: on a Thai run the row
-   * still carried `nattaya nakornthap`, a string the matcher never looked at, wedged between the
-   * contact and the owner to ask about. `MarkedName.alt` is where the friend side has always put
-   * its uncompared spelling — one line of height on every row is a real cost for something the
-   * run's finding does not rest on, and a hover still answers "what else is this person called?".
-   *
-   * `otherSpelling` is therefore a FALLBACK first: when the run's own language has no spelling on
-   * file we lead with what there is rather than an empty row, and `contactLang` follows the string
-   * that actually survived — so a Thai name is never rendered under an `en` tag or vice versa.
+   * What the row can no longer do is state what the score MEASURED when its own names contradict the
+   * mode. `qualifier` is the run's (`full name`, `given name`, `surname`) and it is only as good as
+   * the mode it came from: on a run whose recorded names are Thai and whose `compare_by` says
+   * English, the type axis is as unverified as the language axis was — `narong sinthu` against
+   * `narong sinthu` scores 100% as a full name, a given name or a surname alike. So the unit is
+   * dropped on those rows and `Score` says the measurement was not recorded, which is the case its
+   * nullable `qualifier` was built for.
    */
-  const contactEn = isFriendRow ? row.matchedName : row.name;
-  const contactTh = isFriendRow ? row.matchedNameTh : row.nameTh;
-  const scoredSpelling = language === "th" ? contactTh : contactEn;
-  const otherSpelling = language === "th" ? contactEn : contactTh;
-  const contactName = scoredSpelling ?? otherSpelling;
-  // The secondary line is only ever the spelling we did NOT lead with, and only when it exists and
-  // differs — leading with the fallback must not then repeat it underneath itself.
-  const contactAlt = scoredSpelling ? otherSpelling : null;
-  /** Which language the name on the front of the row is in — it is not always the run's. */
-  const contactLang = scoredSpelling ? language : language === "th" ? "en" : "th";
+  const rowQualifier = pair.agreed ? qualifier : null;
+
+  /**
+   * The pairing's two names are in different scripts and no single language holds both.
+   *
+   * Kept and SAID, not hidden: we hold a name for each of these two people and the reader needs
+   * both, but nothing here supports the claim that they were measured against each other. See
+   * preference 3 in `resolveScoredPair`.
+   */
+  const crossScript = !pair.sameScript;
 
   // Which of the five states this row is in. Still needed to decide what the row can SHOW — is
   // there a counterpart, is there a measurement — but no longer to decide how any of it LOOKS: a
@@ -882,8 +871,8 @@ function Row({
               <MarkedName
                 name={friendName}
                 type={type}
-                lang={friendLang === "th" ? "th" : undefined}
-                alt={friendAlt}
+                lang={pair.friendLang === "th" ? "th" : undefined}
+                alt={pair.friendAlt}
                 className="font-display text-base font-semibold leading-snug"
               />
             </Side>
@@ -897,8 +886,8 @@ function Row({
               <MarkedName
                 name={contactName}
                 type={type}
-                lang={contactLang === "th" ? "th" : undefined}
-                alt={contactAlt}
+                lang={pair.contactLang === "th" ? "th" : undefined}
+                alt={pair.contactAlt}
                 className="font-display text-base font-semibold leading-snug"
               />
             </Side>
@@ -921,25 +910,24 @@ function Row({
           // The role label stays, so a single-name row and the left half of a paired one are read
           // the same way rather than looking like two different kinds of thing.
           //
-          // For a friend, `name` is already the right string in both cases: the spelling this run
-          // COMPARED when it had one, and otherwise the other spelling — which is the entire
-          // content of an unscored row ("we hold this person, just not in the language this run
-          // needed"). The uncompared spelling stays in the title rather than on the row: putting it
-          // on the row adds height to EVERY row for something the run's finding does not depend on.
+          // The row's own half of the pair is the whole of it — the spelling this run COMPARED when
+          // it had one, and otherwise whatever spelling we hold, which is the entire content of an
+          // unscored row ("we hold this person, just not in the language this run needed"). The
+          // uncompared spelling stays in the title rather than on the row: putting it on the row
+          // adds height to EVERY row for something the run's finding does not depend on.
           <p className="flex flex-wrap items-baseline gap-x-2">
             <Side
               label={isFriendRow ? "friend" : "contact"}
               hint={isFriendRow ? friendHint : contactHint}
             >
               <MarkedName
-                name={isFriendRow ? row.name : contactName}
+                name={isFriendRow ? friendName : contactName}
                 type={type}
-                // The row's OWN side, so the language test is the one belonging to that side —
-                // `friendLang` for a friend row, `contactLang` for a contact row. They are not
-                // interchangeable: on a company import `friendLang` describes `matchedName`, which
-                // is not the string being rendered here.
-                lang={(isFriendRow ? friendLang : contactLang) === "th" ? "th" : undefined}
-                alt={isFriendRow ? row.nameAlt : contactAlt}
+                // The row's OWN side, so the language is the one belonging to that side. They are
+                // not interchangeable: on a company import `friendLang` describes the friend this
+                // contact matched, which is not the string being rendered here.
+                lang={(isFriendRow ? pair.friendLang : pair.contactLang) === "th" ? "th" : undefined}
+                alt={isFriendRow ? pair.friendAlt : pair.contactAlt}
                 className="font-display text-base font-medium leading-snug"
               />
             </Side>
@@ -963,6 +951,34 @@ function Row({
             product having ONE way to render provenance is worth more than this row having the
             loudest one. */}
         <Provenance owner={owner} uploadedBy={row.uploaderName} />
+
+        {/*
+          WHERE THIS ROW'S NAMES AND ITS RUN'S MODE DISAGREE — on the row, because the row is the
+          only thing that knows.
+
+          The mode chip in the panel header states what the run was CONFIGURED to compare, once, for
+          all 20 rows. It cannot say that a particular row's stored names contradict it, and that is
+          a per-row fact: a workflow may honour `compare_by` on some rows and not others, and on this
+          database `comparison_result.person_name_en` holds the Thai spelling for every row of run 4.
+
+          `text-confidence-medium` — the app's one amber, the token `Callout`'s warning tone uses, and
+          the same one `ConnectionCard` puts on the same caveat. The wording is deliberately close to
+          that card's: a reader who meets this pairing on both screens should not have to work out
+          whether the two notices mean the same thing.
+
+          Only on rows making a claim (`paired`). A single-name row has no pairing for a language to
+          be wrong about, which is why `resolveScoredPair` reports `sameScript` true when a side is
+          missing rather than leaving that judgement to each caller.
+        */}
+        {paired && !pair.agreed && (
+          <p className="text-xs text-confidence-medium">
+            {crossScript
+              ? "the two names above are in different scripts — no spelling of both exists in one language, so what this score measured is unconfirmed"
+              : `set to compare ${LANGUAGE_LABEL[language]}, but recorded ${
+                  LANGUAGE_LABEL[pair.language]
+                } names — what this score measured is unconfirmed`}
+          </p>
+        )}
 
         {/* What is left of the old provenance line: facts about the RECORD, not about the people —
             how old it is, and whatever the file carried alongside the name.
@@ -1012,14 +1028,16 @@ function Row({
           gutter on every row of the run.
         */}
         {graded ? (
-          <Score value={row.similarity} qualifier={qualifier} />
+          // `rowQualifier`, not `qualifier` — the run's unit, dropped on the rows whose own recorded
+          // names disprove the mode it came from. See the note above it.
+          <Score value={row.similarity} qualifier={rowQualifier} />
         ) : bucket === "matched" || bucket === "unmatched" ? (
           // Decided, but with no number recorded — an external workflow that posts verdicts and no
           // `similarity`. The verdict is exactly what this column no longer says, so what is left to
           // state is the absence of the measurement: a muted dash, with the reason on hover. NOT a
           // 0%, which would colour a missing measurement bright red and read as a confident finding
           // of "nothing in common".
-          <Score value={null} qualifier={qualifier} />
+          <Score value={null} qualifier={rowQualifier} />
         ) : (
           // The three buckets that are STATES rather than verdicts, and are therefore untouched by
           // the decision to stop rendering verdicts: a row still being worked on, a row that broke,

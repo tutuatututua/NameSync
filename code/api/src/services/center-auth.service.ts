@@ -1,5 +1,6 @@
-import type { TwoFactorChallenge } from "@extensions/contract";
+import type { TwoFactorChallenge, TwoFactorKnownMethod } from "@extensions/contract";
 import { Forbidden, Unauthorized } from "../lib/errors";
+import { rememberTwoFactorState } from "../lib/two-factor-state";
 import {
   centerLogin,
   centerMe,
@@ -43,6 +44,25 @@ export interface CenterSignInInput {
   /** The OTP reference echoed back from an email/sms challenge. */
   ref?: string;
   meta?: { userAgent?: string; ip?: string };
+}
+
+/**
+ * Which second factor this sign-in went through — read off the login itself, not from Center.
+ *
+ * This costs nothing and needs no extra call, because the login IS the measurement: Center
+ * demands a factor whenever the account has one, so a login that completed without a `code`
+ * completed on the password alone, and one that carried a code named its method on the way in.
+ * That is exactly what the settings page wants to display (lib/two-factor-state.ts).
+ *
+ * A missing `method` alongside a code means the client didn't echo the challenge back; the code
+ * was then sent to Center as a `totp` (see `toCredentials`) and Center accepted it, so that is
+ * what it was.
+ */
+function factorUsedAtLogin(input: CenterSignInInput): Exclude<TwoFactorKnownMethod, "unknown"> {
+  if (!input.code) return "none";
+  if (input.method === "email") return "email";
+  if (input.method === "sms") return "sms";
+  return "totp";
 }
 
 /** Turn the request into the credentials Center wants, routing `code` to the right field. */
@@ -108,6 +128,9 @@ export async function signInWithCenter(input: CenterSignInInput): Promise<Center
 
   // Center accepted them AND they are authorised here — the slate is clean.
   clearLoginThrottle(input.email, ip);
+  // Remember which factor Center just demanded, so /settings can show it straight away instead
+  // of making the user confirm their password merely to read it back.
+  rememberTwoFactorState(user.id, factorUsedAtLogin(input));
   return { kind: "session", session: await issueSession(user, input.meta) };
 }
 

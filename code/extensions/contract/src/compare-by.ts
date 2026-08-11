@@ -225,6 +225,171 @@ export function isScorable(name: string | null | undefined, language: CompareLan
   return language === 'th' ? hasThai(name) : hasLatin(name);
 }
 
+// ── One pairing, one script ─────────────────────────────────────────────────
+
+/** A person's two spellings, the way both name tables hold them: one column per language. */
+export interface NameSpellings {
+  en: string | null;
+  th: string | null;
+}
+
+/**
+ * File loose name strings into the two language columns BY SCRIPT, first one wins per column.
+ *
+ * ── WHY THE COLUMN IS NOT TAKEN AS THE ANSWER ──
+ *
+ * Because it is wrong in the live database, on every row of a run. `comparison_result.person_name_en`
+ * holds the THAI spelling for all 993 rows of run 4 — the external workflow writes the contact name
+ * it matched into both columns without looking at either label — so a reader that trusts
+ * `person_name_en` to be English renders `วัชระ เจริญสุข` under an `en` tag beside the Latin friend
+ * name it was supposedly compared with.
+ *
+ * `routeScoredName` in comparison-result.model.ts already applies exactly this rule on the way IN,
+ * to the FRIEND half of the same row, and `routeNames` in file-parser.service.ts applies it at
+ * import. Neither covers the contact half of a row an external matcher wrote, and neither can
+ * retroactively fix the rows already stored. So the reader applies it too, and the three stay in
+ * step because they are the same rule: Thai characters anywhere mean the Thai column.
+ *
+ * Both columns holding ONE Thai string therefore reads as "we have a Thai spelling and no English
+ * one", which is the truth of that row.
+ */
+export function nameSpellings(...names: (string | null | undefined)[]): NameSpellings {
+  const out: NameSpellings = { en: null, th: null };
+  for (const name of names) {
+    if (!name) continue;
+    const column = hasThai(name) ? 'th' : 'en';
+    out[column] ??= name;
+  }
+  return out;
+}
+
+/** A pairing resolved to a single language — see `resolveScoredPair`. */
+export interface ScoredPair {
+  /** The language the PAIRING reads in. `friendLang` when there is a friend name, else the
+   *  contact's — what a caller labelling the whole row should use. */
+  language: CompareLanguage;
+  /** The two sides. Either may be null when we hold no spelling for that person at all. */
+  friend: string | null;
+  contact: string | null;
+  /**
+   * The language each side is ACTUALLY written in — for the `lang` attribute, which is a claim about
+   * the string and must be right per side even in the case where the two cannot be reconciled.
+   *
+   * Equal whenever `sameScript`, which is the case worth designing for; they differ only on the rows
+   * described under preference 3 below.
+   */
+  friendLang: CompareLanguage;
+  contactLang: CompareLanguage;
+  /** The same people's OTHER spelling, for the muted line and the title. Null when there is none,
+   *  or when it is the same string — a name rendered as its own alternative is noise. */
+  friendAlt: string | null;
+  contactAlt: string | null;
+  /**
+   * Both halves are in one script, so they are two names that COULD have been compared.
+   *
+   * True when either side is absent: a row with one name has no pairing to be inconsistent about,
+   * and a caveat on it would be describing a comparison nobody claimed.
+   */
+  sameScript: boolean;
+  /**
+   * `sameScript`, AND in the language the run was configured for. The row is fully backed.
+   *
+   * When false the caller must stop stating what the score measured — see `Score`'s `qualifier`,
+   * which is nullable for precisely this row. A run whose own recorded names disprove its language
+   * axis has said nothing trustworthy about its type axis either: `narong sinthu` against `narong
+   * sinthu` scores 100% as a full name, a given name or a surname, and nothing stored tells the
+   * three apart.
+   */
+  agreed: boolean;
+}
+
+/**
+ * THE TWO NAMES A ROW IS A CLAIM ABOUT, IN ONE SCRIPT — resolved from the evidence, not the mode.
+ *
+ * A pairing showing a Latin name against a Thai one with a percentage between them is not a subtle
+ * mislabel. It is two strings that were demonstrably never compared, presented as the run's finding.
+ * That is what this exists to make impossible, and it is a bug that has been fixed twice on two
+ * screens with two different rules, which is why the rule now lives here:
+ *
+ *   · `ConnectionCard` script-tested the FRIEND side and keyed both halves off it. Right idea, and
+ *     it still pairs Latin against Thai on the rows above, because it trusts the contact's columns
+ *     to be filed correctly and on this database they are not.
+ *   · `RunRows` picked each side's column independently off the run's language axis and declared
+ *     each side's language FROM THE COLUMN IT PICKED, so the two halves could disagree freely.
+ *
+ * The mode is what we ASKED FOR; the stored names are what HAPPENED. Where they conflict the
+ * evidence wins — the same precedence `runRowBucketSql` gives a stored verdict over an inference
+ * about script.
+ *
+ * ── The order of preference ──
+ *
+ *   1. The configured language, when BOTH sides have a name in it. The normal case, and the only
+ *      one that can honestly keep the score's unit.
+ *   2. The other language, when both sides have a name in THAT. This is the substitution: the run
+ *      says English, only the Thai spellings exist on both sides, so the Thai pair is the one the
+ *      matcher can actually have looked at. `agreed` goes false and the caller drops the unit.
+ *   3. NEITHER language holds the pair. Two shapes land here and they want opposite things, which is
+ *      why this is not simply "give up":
+ *
+ *        · One side has no name at all — a `pending`, `unscored` or bare-verdict row. There is no
+ *          pairing to keep in one script; the side that HAS a name renders in its own language and
+ *          `sameScript` stays true, because nothing inconsistent is being claimed.
+ *        · Both sides have a name and they are in different scripts, with no overlap — we hold the
+ *          friend only in Latin and the contact only in Thai. Both names are still shown, each
+ *          tagged with the script it is genuinely in, and `sameScript` goes FALSE so the caller can
+ *          say so. Blanking the contact would be the safer-looking choice and the wrong one: the row
+ *          exists to answer "who do I reach, and who do I ask", and we do hold that person's name.
+ *          What must not survive is the unqualified claim that the two were measured against each
+ *          other.
+ *
+ * Takes loose strings rather than `NameSpellings` on purpose: every caller holds names whose column
+ * of origin is either unknown (frozen text off a result row) or untrustworthy (see `nameSpellings`),
+ * and accepting a typed pair would invite passing the columns through unexamined.
+ */
+export function resolveScoredPair(
+  configured: CompareLanguage,
+  friendNames: readonly (string | null | undefined)[],
+  contactNames: readonly (string | null | undefined)[]
+): ScoredPair {
+  const friend = nameSpellings(...friendNames);
+  const contact = nameSpellings(...contactNames);
+  const other: CompareLanguage = configured === 'th' ? 'en' : 'th';
+
+  const pairedIn = (l: CompareLanguage) => !!friend[l] && !!contact[l];
+  /** The one language both sides can be read in — null when no single language holds the pair. */
+  const shared: CompareLanguage | null = pairedIn(configured)
+    ? configured
+    : pairedIn(other)
+      ? other
+      : null;
+
+  /** Per side, once there is no shared language: whatever that side holds, the run's own first. */
+  const pick = (s: NameSpellings): CompareLanguage =>
+    shared ?? (s[configured] ? configured : s[other] ? other : configured);
+
+  const friendLang = pick(friend);
+  const contactLang = pick(contact);
+
+  const alt = (s: NameSpellings, l: CompareLanguage): string | null => {
+    const o = l === 'th' ? s.en : s.th;
+    return o && o !== s[l] ? o : null;
+  };
+
+  return {
+    // The friend leads the row wherever it has a name, so it names the row's language too.
+    language: friend[friendLang] ? friendLang : contactLang,
+    friend: friend[friendLang],
+    contact: contact[contactLang],
+    friendLang,
+    contactLang,
+    friendAlt: alt(friend, friendLang),
+    contactAlt: alt(contact, contactLang),
+    // One name is not a pairing, so it cannot be a mismatched one — see the interface.
+    sameScript: !friend[friendLang] || !contact[contactLang] || friendLang === contactLang,
+    agreed: friendLang === contactLang && friendLang === configured,
+  };
+}
+
 // ── How strong is the claim? ────────────────────────────────────────────────
 
 /**

@@ -75,7 +75,17 @@ export function RowFormDialog({ table, row, open, onOpenChange, onSubmit, isPend
       if (!isEdit && raw === "") continue;
       payload[c.name] = raw === "" ? null : raw;
     }
-    await onSubmit(payload);
+    // Close only on success. A rejected save already raises a toast carrying the server's
+    // message ("upload_id" is 25, but no row with that id exists in "upload"), and leaving
+    // the dialog open is what makes that message useful — the typed values are still there
+    // to correct. Swallowing the rejection here is deliberate: without the catch it escapes
+    // as an unhandled promise rejection, since the toast is raised by the mutation, not by
+    // this await.
+    try {
+      await onSubmit(payload);
+    } catch {
+      return;
+    }
     onOpenChange(false);
   }
 

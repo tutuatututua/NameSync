@@ -13,10 +13,15 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import {
+  compareByAxes,
+  DEFAULT_COMPARE_BY,
+  LANGUAGE_LABEL,
   precheckBlocks,
   sourceLabel,
+  TYPE_LABEL,
   type ColumnMapping,
   type ColumnOverrides,
+  type CompareBy,
   type ImportPrecheck,
   type UploadPreview,
 } from "@extensions/contract";
@@ -35,6 +40,7 @@ import {
 } from "@/components/ui/select";
 import { LoadingButton } from "@/components/loading-button";
 import { Callout } from "@/components/callout";
+import { CompareModeControl } from "@/components/compare-mode";
 import { TypePicker } from "@/components/upload/TypePicker";
 import { useAuth } from "@/components/auth-provider";
 import { ApiError } from "@/lib/api/client";
@@ -139,6 +145,29 @@ export function ImportReview({ source, file, onCancel, onComplete }: Props) {
    *  see the picker below. `facebook` is the starting value because it is what the drop card the
    *  user just used is called. */
   const [type, setType] = React.useState<string>(isCompany ? "" : "facebook");
+  /**
+   * HOW THIS IMPORT'S RUN WILL COMPARE — a choice again, on both sides of an import.
+   *
+   * It was a picker until 2026-08-05, then a sentence, and it is a picker again because the sentence
+   * was not merely a narrower option — it was a wall. The mode decides which name column the import
+   * gate REQUIRES, so a Thai-only file could not be imported at all while this was pinned to English,
+   * and the way out the copy named ("start a Thai run from the Network page") needed rows that this
+   * screen had just refused to store.
+   *
+   * ── WHY THE 2026-08-05 ARGUMENT DOES NOT COME BACK WITH IT ──
+   *
+   * That removal was aimed at a real habit: people re-uploaded a file they had already imported in
+   * order to ask a different question of it, writing a second complete row set to change one column.
+   * The fix for that is `POST /compare` existing, which it now does and did not then — the copy below
+   * still points at it, so the cheap way to ask again is named on the screen. What the removal added
+   * on top of that was a restriction on what could be imported in the first place, and that part was
+   * never the point.
+   *
+   * `DEFAULT_COMPARE_BY` as the starting value, so an importer who touches nothing gets exactly the
+   * run this screen has been producing.
+   */
+  const [compareBy, setCompareBy] = React.useState<CompareBy>(DEFAULT_COMPARE_BY);
+  const { language: compareLanguage, type: compareType } = compareByAxes(compareBy);
   // The session arrives a beat after first render (AuthGuard resolves it), so the initial value
   // above can be empty on the first frame. Fill it in when it lands — but never over a value the
   // user has already typed.
@@ -259,27 +288,29 @@ export function ImportReview({ source, file, onCancel, onComplete }: Props) {
    * A company file must name a company: every comparison is selected by company, so a contact filed
    * under nothing is data that goes in and can never come out.
    *
-   * And any file must name somebody in ENGLISH, because an import's run is `en_full` — one
-   * language, and this is the one. It used to be whichever language the box below was set to, and
-   * the check offered two fixes: map the missing column, or switch the mode. With the mode gone
-   * there is one fix, and it is the one that was almost always right anyway — a file that tripped
-   * this gate was usually a file whose name column had not been recognised, and switching language
-   * was the workaround that started a run over a mapping nobody had checked.
+   * And any file must name somebody in THE LANGUAGE THE RUN WILL COMPARE — one language per run,
+   * and the picker above says which. The check offers two fixes because there genuinely are two: map
+   * the missing column, or switch the language. It named only the first between 2026-08-05 and
+   * 2026-08-10, correctly, because the language was not a choice then — and that is precisely what
+   * made a Thai-only file unimportable rather than merely uncompared-for-now.
    *
-   * ── THIS IS NOT A CEILING ON THAI ──
+   * ── THIS IS NOT A CEILING ON EITHER LANGUAGE ──
    *
-   * Thai names in this file are stored, in full, exactly as before: the import gate has never
+   * Names in BOTH languages are stored, in full, whatever the mode: the import gate has never
    * filtered by language and must never learn to (see `runLanguage` in comparisons.route.ts). What
-   * changes is only which question the run this import opens asks. A Thai comparison is a run you
-   * start from the Network page over the rows this import is about to write.
+   * the mode changes is only which question the run this import opens asks — the other language stays
+   * on file and stays comparable by a later run.
    *
    * Both mirror gates in comparisons.route.ts, computed from counts the server sent, so the button
    * is disabled exactly when the request would be refused. Neither is a guess made on screen.
    */
-  const scorable = data?.scorableRows?.en ?? 0;
+  const scorable = data?.scorableRows?.[compareLanguage] ?? 0;
+  /** The count for the language the run is NOT using — the whole of what makes the refusal
+   *  actionable. "0 English, 512 Thai" names its own fix; "0 English" alone does not. */
+  const scorableOther = data?.scorableRows?.[compareLanguage === "th" ? "en" : "th"] ?? 0;
   /** No row this run could score: the comparison would come back empty, and an empty comparison
-   *  reads as "nobody knows these people" rather than "this file had no English names". */
-  const noEnglishNames = !!data && data.totalRows > 0 && scorable === 0;
+   *  reads as "nobody knows these people" rather than "this file had no names in that language". */
+  const noScorableNames = !!data && data.totalRows > 0 && scorable === 0;
   /** A company file where no row names a company — an unmapped column and an empty one both land
    *  here, because from the data's point of view they are the same thing. */
   const noCompany = !!data && isCompany && data.totalRows > 0 && data.companylessRows >= data.totalRows;
@@ -307,7 +338,7 @@ export function ImportReview({ source, file, onCancel, onComplete }: Props) {
     !!data &&
     data.totalRows > 0 &&
     !nothingToImport &&
-    !noEnglishNames &&
+    !noScorableNames &&
     !noCompany &&
     (!ownerNeeded || !!owner.trim()) &&
     !!uploader.trim() &&
@@ -324,6 +355,15 @@ export function ImportReview({ source, file, onCancel, onComplete }: Props) {
     if (owner.trim()) form.append("uploadPersonName", owner.trim());
     form.append("uploaderName", uploader.trim());
     if (type) form.append("sourceType", type);
+    /**
+     * The mode this screen showed, sent unconditionally.
+     *
+     * Not `if (compareBy !== DEFAULT_COMPARE_BY)`: the server defaults an absent field to the same
+     * value, so the conditional would behave identically today and would silently stop matching the
+     * screen the day either default moves. The gate above and the run below have to be graded on the
+     * same value the reader was looking at, which means sending it.
+     */
+    form.append("compareBy", compareBy);
     // The same choices the preview above was drawn from, byte for byte — this is what makes the
     // screen a promise rather than a demonstration.
     if (Object.keys(overrides).length > 0) form.append("columnOverrides", JSON.stringify(overrides));
@@ -595,96 +635,127 @@ export function ImportReview({ source, file, onCancel, onComplete }: Props) {
             </div>
 
             {/*
-              WHAT THIS IMPORT'S RUN WILL DO — stated, not configured.
+              WHAT THIS IMPORT'S RUN WILL DO — configured again, on both sides of an import.
 
-              The mode picker stood here until 2026-08-05 and is gone. It was on this screen because
-              the import is the path that reaches the external matcher, which was true and was not
-              the whole story: what people were doing with it was re-uploading a file they had
-              already imported in order to ask a different question of it. That wrote a second
-              complete row set and put a second paid job through the workflow to change one column
-              on the run above it.
+              ── THE PICKER LEFT ON 2026-08-05 AND CAME BACK ON 2026-08-10 ──
 
-              ── NOTHING IN HERE IS A CONTROL ANY MORE ──
+              It was removed because people were re-uploading a file they had already imported in
+              order to ask a different question of it: that wrote a second complete row set and put a
+              second paid job through the workflow to change one column on the run above it. The box
+              became two sentences — what the import WILL do, and where to go to ask something else.
 
-              "Whose friends" (the compare-source picker, company imports only) went the same way
-              on the same day, and for a reason worth keeping written down: it was the one control
-              here that WAS about this file — and it still did not belong, because what it selects
-              is a property of the RUN. Narrowing to LinkedIn changes the answer and nothing else,
-              so a reader who wanted a different answer had to upload their contacts again to ask
-              for it. A re-askable question on a screen whose act is permanent teaches people to
-              re-import, which is precisely the habit this whole screen was feeding.
+              What that missed is that this control is not only a run setting on this screen. It also
+              decides which name column the import GATE requires (see `noScorableNames`), so pinning
+              it to English pinned which files could be imported at all: a Thai-only friends list was
+              refused outright, and the "go to Network → Results" advice needed rows the same screen
+              had just declined to store. A door was closed on the file, not just on the question.
 
-              Both questions now live on the compare dialog, where they compose: "BlueBrick's
-              contacts, against LinkedIn friends, by Thai surname" is one run over rows already
-              stored. So this box is two sentences — what the import WILL do, and what to do
-              instead if that is not the question you have.
+              So the picker is back and the pointer to the compare dialog STAYS — it is what keeps
+              the original argument answered. Asking a different question of data already on file is
+              one click on a run, and the copy below says so; nobody has to re-upload to re-ask.
+
+              "Whose friends" (the compare-source picker, company imports only) did NOT come back, and
+              the difference is worth stating: it narrows which friends ALREADY ON FILE a run covers,
+              which is a fact about the database rather than about the file in hand, and no import can
+              be blocked by it. That one really was only a run setting, and it lives on the dialog.
             */}
             <div className="space-y-3 rounded-lg border bg-muted/30 p-4">
               <p className="text-sm font-medium">How this import is compared</p>
 
               {/*
-                The mode, as a fact rather than a control — and with the way to change it named,
-                because a sentence that only closes a door is worse than the control it replaced.
-
-                It says "English, whole names" in the same words `compareByLabel` would, but written
-                out rather than imported: a chip here would look like the thing that used to be
-                clickable, and the one thing this line has to do is not read as a disabled picker.
+                The shared control, not a second copy of one — `CompareModeControl` is the same
+                component the compare dialog uses, so the two screens cannot drift into describing one
+                stored value differently. It carries its own explanation of what the chosen cell does,
+                including the part a label cannot say: that the other language's names are stored and
+                simply not part of THIS run.
               */}
+              <CompareModeControl
+                idPrefix="import-compare"
+                value={compareBy}
+                onChange={setCompareBy}
+                disabled={busy}
+              />
+
+              {/* What the choice means for this particular import, in the terms of the file on
+                  screen — the control above explains the mode, this says what it does here. The
+                  company side names its denominator because that is the half a reader misreads: an
+                  import of 40 contacts is scored against every friend on file, not against 40. */}
               <p className="text-xs text-muted-foreground">
-                Every import is compared on{" "}
-                <span className="font-medium text-foreground">English whole names</span>
+                This import is compared on{" "}
+                <span className="font-medium text-foreground">
+                  {LANGUAGE_LABEL[compareLanguage]} {TYPE_LABEL[compareType].toLowerCase()}
+                </span>
                 {isCompany ? (
                   <>
                     , against{" "}
                     <span className="font-medium text-foreground">every friend on file</span>
                   </>
                 ) : null}
-                . Thai names in this file are still stored.
+                .{" "}
+                {compareLanguage === "th" ? "English" : "Thai"} names in this file are still stored.
               </p>
               {/*
-                WHERE TO GO INSTEAD — named, and named concretely, because this box now removes two
-                choices and a screen that only says "you can't do that here" is worse than the
-                controls it replaced. The wording differs by side because the questions do: a
-                company import's reader wants to narrow WHO their contacts are held against, a
-                friends import's reader wants a different language or name part.
+                THIS IS THE FIRST QUESTION, NOT THE ONLY ONE — kept from the build where the picker
+                above did not exist, because it is what answers the objection that removed it. Somebody
+                who wants a different answer LATER must not learn to re-upload the file to get it, and
+                the only defence against that habit is naming the cheap path on the screen where the
+                expensive one is.
+
+                It names ONE place, and that place has moved twice — first off the Network header's
+                "Find connections", then off the Uploads table's own Compare button, both removed on
+                2026-08-06. Worth re-checking against the app whenever a control moves: copy that
+                names a button is only as good as the button.
               */}
-              {/* Names ONE place, and it has moved twice in a day — first off the Network header's
-                  "Find connections", then off the Uploads table's own Compare button, both removed
-                  on 2026-08-06. Runs are started from Network → Results now, which is the screen
-                  whose subject is runs. Worth re-checking against the app whenever a control moves:
-                  copy that names a button is only as good as the button. */}
               <p className="text-xs text-muted-foreground">
-                To ask something else of this data once it is in —{" "}
+                Asking something else of this data later costs no re-upload —{" "}
                 {isCompany ? "one roster instead of all of them, another language, " : "another language, "}
                 or just the surname — go to{" "}
                 <span className="font-medium text-foreground">Network → Results</span> once this
-                import&apos;s run appears and press Compare on it. Nothing needs re-uploading.
+                import&apos;s run appears and press Compare on it.
               </p>
 
               {/*
-                THE FILE HAS NOTHING THIS RUN COULD SCORE — said here, where the fix is.
+                THE FILE HAS NOTHING THIS RUN COULD SCORE — said here, where both fixes are.
 
-                The import is barred (see `noEnglishNames`) and the server refuses the same request
+                The import is barred (see `noScorableNames`) and the server refuses the same request
                 for the same reason, but being told by a 400 after the upload is the wrong place to
-                learn it: the fix is the column picker at the top of this screen.
+                learn it.
 
-                It used to name two ways out and lead with the wrong one — "switch the language" was
-                a click, so it was the one people took, and it started a run over a mapping nobody
-                had checked. There is one way out now and it is the one that fixes the file.
+                TWO WAYS OUT, and which one leads is decided by the data rather than by taste. While
+                the mode was fixed there was only one (map the column) and it was right to lead with
+                it. Now that the language is a choice, `scorableOther` says which case this is: a file
+                holding 512 Thai names and no English ones wants the language switched — that is not a
+                workaround, it is the correct reading of the file — while a file with none of either
+                has an unmapped column and switching would only move the refusal.
               */}
-              {noEnglishNames && (
-                <Callout tone="danger" title="No English names in this file">
+              {noScorableNames && (
+                <Callout
+                  tone="danger"
+                  title={`No ${LANGUAGE_LABEL[compareLanguage]} names in this file`}
+                >
                   <p>
-                    Imports are compared on <span className="font-medium">English</span> names, and
+                    This import is set to compare{" "}
+                    <span className="font-medium">{LANGUAGE_LABEL[compareLanguage]}</span> names, and
                     not one of the {data.totalRows.toLocaleString()} row
-                    {data.totalRows === 1 ? "" : "s"} has one — so this import&apos;s comparison would
-                    score nothing at all.
+                    {data.totalRows === 1 ? "" : "s"} has one — so its comparison would score nothing
+                    at all.
                   </p>
-                  <p>
-                    Pick the English name column in the table above. If the file genuinely has none,
-                    it can still be imported once a column is mapped — but the names in it will only
-                    be matchable by a Thai comparison run from the Network page.
-                  </p>
+                  {scorableOther > 0 ? (
+                    <p>
+                      {scorableOther.toLocaleString()} of them do have a{" "}
+                      <span className="font-medium">
+                        {LANGUAGE_LABEL[compareLanguage === "th" ? "en" : "th"]}
+                      </span>{" "}
+                      name. Switch the language above to compare those instead — or, if this file was
+                      meant to have {LANGUAGE_LABEL[compareLanguage]} names, pick that column in the
+                      table above.
+                    </p>
+                  ) : (
+                    <p>
+                      No row has a name in either language, so no column has been recognised as the
+                      names — pick it in the table above.
+                    </p>
+                  )}
                 </Callout>
               )}
               {/*
@@ -709,12 +780,12 @@ export function ImportReview({ source, file, onCancel, onComplete }: Props) {
               {/* Why the button is dead, beside the button. Both reasons are explained in full
                   further up — this is the pointer for a long file where the callout has scrolled
                   away, and it says which of them applies rather than "something is wrong". */}
-              {(noCompany || noEnglishNames || nothingToImport) && (
+              {(noCompany || noScorableNames || nothingToImport) && (
                 <p className="text-xs text-destructive">
                   {noCompany
                     ? "Pick the company column above to import."
-                    : noEnglishNames
-                      ? "Nothing here can be compared in English — see above."
+                    : noScorableNames
+                      ? `Nothing here can be compared in ${LANGUAGE_LABEL[compareLanguage]} — see above.`
                       : "Every row is already on file — see above."}
                 </p>
               )}
