@@ -716,22 +716,29 @@ const previewRow = (
 };
 
 /**
- * How many importable rows carry an ENGLISH name — the count an import's run turns into a
+ * How many importable rows carry a name in each language — the count an import's run turns into a
  * requirement. See `ScorableRowsSchema` for why it is counted here rather than read off the
  * mapping: an unlabelled column is routed by script, so this is a question about cells.
  *
- * Nameless rows are excluded by construction — a row with no name in either language has none in
- * this one — which is the same set the `usable` gate in comparisons.route.ts drops.
+ * Nameless rows are excluded by construction — a row with no name in either language is counted in
+ * neither — which is the same set the `usable` gate in comparisons.route.ts drops.
  *
- * It counted Thai too until 2026-08-05, for an import screen that could choose a Thai run. It
- * cannot: every import is `en_full`, so the Thai count had no reader and no rule behind it. Thai
- * names are still imported and still comparable — by a run started from the Network page, over rows
- * this import has already stored.
+ * Thai was dropped on 2026-08-05, when every import was pinned to `en_full` and the number had no
+ * reader. It is back with the mode picker (2026-08-10), because the count is what the gate REFUSES
+ * on: with only `en` available the refusal could not distinguish "this file has no names we can read"
+ * from "this file's names are all Thai", and the second one has an obvious fix that the first does
+ * not. Both sides of an import are counted the same way, since either can be the file being read.
  */
 const scorableRows = (
-  mapped: { person_name_en?: string | null; friend_name_en?: string | null }[]
-): { en: number } => ({
+  mapped: {
+    person_name_en?: string | null;
+    person_name_th?: string | null;
+    friend_name_en?: string | null;
+    friend_name_th?: string | null;
+  }[]
+): { en: number; th: number } => ({
   en: mapped.filter((r) => r.person_name_en ?? r.friend_name_en).length,
+  th: mapped.filter((r) => r.person_name_th ?? r.friend_name_th).length,
 });
 
 /**

@@ -1,7 +1,7 @@
 import { DBModel } from "@extensions/sqldb";
 import { sql, type SqlBool } from "kysely";
 import type { DbFilter, DbRow, PaginatedResult, TableQueryBody } from "@extensions/contract";
-import { BadRequest, NotFound } from "../lib/errors";
+import { BadRequest, Conflict, NotFound } from "../lib/errors";
 import {
   columnRef,
   getColumn,
@@ -90,6 +90,61 @@ function coerceOperand(col: RegistryColumn, raw: unknown): unknown {
 function coerceKey(pk: RegistryColumn, id: string): string {
   if (pk.type === "number" && !/^\d+$/.test(id)) throw new NotFound("Row not found");
   return id;
+}
+
+/**
+ * Turn a Postgres integrity violation into the 4xx it actually is.
+ *
+ * The registry checks what it can see — types, required, read-only — but it doesn't know
+ * which rows exist, so a foreign key aimed at a missing parent only fails at the INSERT.
+ * Left alone that reaches the error handler as an unmapped 500, and app.ts deliberately
+ * replaces 500 bodies with a bare "Internal Server Error" — so the person at the grid is
+ * told nothing about which cell is wrong. Same reasoning as coerceKey() above: answer the
+ * client's mistake as a client error, and name the column they have to fix.
+ *
+ * `detail` is the only place Postgres puts the offending column and value, and it is not
+ * guaranteed to be present, so every branch falls back to the constraint name.
+ */
+function translateDbError(err: unknown): unknown {
+  const e = err as { code?: string; detail?: string; table?: string; column?: string; constraint?: string };
+  const at = e?.constraint ? ` (${e.constraint})` : "";
+
+  switch (e?.code) {
+    case "23503": {
+      // Insert/update pointing at a parent that isn't there.
+      const missing = /Key \((.+?)\)=\((.+?)\) is not present in table "(.+?)"/.exec(e.detail ?? "");
+      if (missing) {
+        const [, column, value, parent] = missing;
+        return new BadRequest(`"${column}" is ${value}, but no row with that id exists in "${parent}"`);
+      }
+      // Delete blocked because children still point here — the row is fine, the order is wrong.
+      const referenced = /Key \((.+?)\)=\((.+?)\) is still referenced from table "(.+?)"/.exec(e.detail ?? "");
+      if (referenced) {
+        const [, , value, child] = referenced;
+        return new Conflict(`Row ${value} is still referenced by "${child}" — delete those rows first`);
+      }
+      return new BadRequest(`That value doesn't match any row in the table it points at${at}`);
+    }
+    case "23505": {
+      const dup = /Key \((.+?)\)=\((.+?)\) already exists/.exec(e.detail ?? "");
+      return new Conflict(dup ? `"${dup[1]}" ${dup[2]} already exists` : `That value already exists${at}`);
+    }
+    case "23502":
+      return new BadRequest(e.column ? `"${e.column}" cannot be empty` : `A required value is missing${at}`);
+    case "23514":
+      return new BadRequest(`That value isn't allowed by the table's rules${at}`);
+    default:
+      return err; // Not an integrity problem — let it stay a 500 and get logged.
+  }
+}
+
+/** Every write goes through here so the three CRUD paths report violations the same way. */
+async function write<T>(run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (err) {
+    throw translateDbError(err);
+  }
 }
 
 /**
@@ -242,11 +297,9 @@ export class TableEditorModel extends DBModel {
     const table = getTable(tableName);
     const data = buildValues(table, values, true);
     const db = await this.getKyselyDB();
-    const row = await (db as any)
-      .insertInto(table.name)
-      .values(data)
-      .returningAll()
-      .executeTakeFirstOrThrow();
+    const row = await write(() =>
+      (db as any).insertInto(table.name).values(data).returningAll().executeTakeFirstOrThrow()
+    );
     return row as DbRow;
   }
 
@@ -255,12 +308,14 @@ export class TableEditorModel extends DBModel {
     const pk = getPrimaryKey(table);
     const data = buildValues(table, values, false);
     const db = await this.getKyselyDB();
-    const row = await (db as any)
-      .updateTable(table.name)
-      .set(data)
-      .where(pk.name, "=", coerceKey(pk, id))
-      .returningAll()
-      .executeTakeFirst();
+    const row = await write(() =>
+      (db as any)
+        .updateTable(table.name)
+        .set(data)
+        .where(pk.name, "=", coerceKey(pk, id))
+        .returningAll()
+        .executeTakeFirst()
+    );
     if (!row) throw new NotFound("Row not found");
     return row as DbRow;
   }
@@ -269,10 +324,9 @@ export class TableEditorModel extends DBModel {
     const table = getTable(tableName);
     const pk = getPrimaryKey(table);
     const db = await this.getKyselyDB();
-    const result = await (db as any)
-      .deleteFrom(table.name)
-      .where(pk.name, "=", coerceKey(pk, id))
-      .executeTakeFirst();
+    const result = await write<{ numDeletedRows?: bigint } | undefined>(() =>
+      (db as any).deleteFrom(table.name).where(pk.name, "=", coerceKey(pk, id)).executeTakeFirst()
+    );
     const deleted = Number(result?.numDeletedRows ?? 0);
     if (deleted === 0) throw new NotFound("Row not found");
     return deleted;

@@ -119,38 +119,46 @@ export type CreateComparisonBody = z.infer<typeof CreateComparisonBodySchema>;
  *     the preview is only believable if the import reads the file the same way.
  */
 /**
- * ── NO RUN SETTINGS HERE ANY MORE, AND SENDING ONE CHANGES NOTHING (2026-08-05) ──
+ * ── `compareBy` IS BACK, AND `compareSources` IS STILL GONE (2026-08-10) ──
  *
- * `compareBy` and `compareSources` both stood on this schema and both are gone. What is left is
- * exclusively facts about the FILE — who is importing, whose relationships these are, where the
- * data came from, how to read its columns — which is the whole of what an import screen can
- * honestly ask about.
+ * Both were removed on 2026-08-05, on the argument that a re-askable question does not belong on a
+ * screen whose act is irreversible: people were re-uploading a file they had already imported in
+ * order to ask a different question of it, which wrote a second complete row set and put a second
+ * paid job through the workflow to change one column on the run above it.
  *
- * Removed rather than pinned to a constant, and `z.object` strips what it does not name, so a
- * caller still sending either is IGNORED rather than refused. That is the right shape for fields
- * that used to be honoured: a 400 would break a scripted importer over a value that no longer
- * decides anything, while ignoring it produces exactly the run the server would have made anyway.
- * The two settings resolve to their documented defaults — `en_full`, and every source.
+ * That argument was right about the SYMPTOM and wrong about the cause, and the cost of the cure was
+ * only visible once the picker was gone. An import does not merely *default* to `en_full`; the gate
+ * it feeds REFUSES the import outright when no row carries an English name (see `ScorableRowsSchema`
+ * and `runLanguage` in comparisons.route.ts). So a Thai-only friends list could not be imported at
+ * all without first mapping a column that does not exist in the file, and the advice on screen —
+ * "go to Network → Results and press Compare" — pointed at a run that could only be started from
+ * rows the same screen had just refused to store. Removing the choice removed a workaround and left
+ * a dead end in its place.
  *
- * ── THE CHOICES DID NOT DISAPPEAR, THEY MOVED ──
+ * So the mode is a field again, and it is genuinely a per-import choice: it decides both the run this
+ * import opens AND which column the gate requires. `compareSources` is NOT back and does not have
+ * the same problem — it narrows WHICH FRIENDS ALREADY ON FILE a run covers, which is a question about
+ * the database rather than about the file in hand, and a friends import's own run necessarily covers
+ * the rows it just wrote.
  *
- * `POST /comparisons/compare` takes a mode, a source list AND a scope (`filter_by` /
- * `filter_value`), so "compare that file again by Thai surname" and "match these contacts against
- * LinkedIn only" are both runs you ask for over rows already on file. That is what the import path
- * was being used as a proxy for, badly: it wrote a duplicate row set in order to change one column
- * on the run above it.
+ * Optional, defaulting to `en_full` at the route rather than here, so a caller that sends nothing
+ * gets exactly the run this path made while the field did not exist. An UNRECOGNISED value is a 400,
+ * which is the one place the mode vocabulary is enforced — `comparison.compare_by` deliberately has
+ * no CHECK behind it, and the external workflow has already been caught writing a bare `full` into
+ * it (see `parseCompareBy`, which resolves such rows to the default on the way back out).
  *
- * The deeper reason they never belonged here is that they have different LIFETIMES. `sourceType`
- * above is written onto every row and is permanent; these two belong to one comparison and are
- * meant to be asked again with a different answer. Putting a re-askable question on the screen
- * whose act is irreversible made re-asking it look like re-importing — which is exactly what people
- * started doing.
+ * ── WHAT IS STILL TRUE ABOUT LIFETIMES ──
+ *
+ * `sourceType` above is written onto every row and is permanent; the mode belongs to one comparison.
+ * That distinction is why `POST /comparisons/compare` still exists and is still the way to ask a
+ * DIFFERENT question of data already stored — this field is the first question, not the only one.
  */
 export const ImportFieldsSchema = z.object({
   name: z.string().trim().optional(),
   uploadPersonName: z.string().trim().optional(),
   uploaderName: z.string().trim().optional(),
   sourceType: z.string().trim().max(100).optional(),
+  compareBy: CompareBySchema.optional(),
   columnOverrides: ColumnOverridesFieldSchema,
 });
 export type ImportFields = z.infer<typeof ImportFieldsSchema>;

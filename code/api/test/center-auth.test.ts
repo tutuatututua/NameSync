@@ -4,6 +4,7 @@ import { DBModel } from "@extensions/sqldb";
 import { buildApp } from "../src/app";
 import { UserModel } from "../src/models";
 import { resetThrottle } from "../src/services/auth.service";
+import { resetTwoFactorStates } from "../src/lib/two-factor-state";
 
 /**
  * Center sign-in (POST /api/auth/center/login).
@@ -90,6 +91,9 @@ afterAll(async () => {
 
 beforeEach(() => {
   sendcodeCalls = 0;
+  // In-memory and per-process, like the throttle: without this, one test's sign-in would answer
+  // the next test's "what do we know about this user".
+  resetTwoFactorStates();
   // The Center path is throttled now (5 failures per email+IP per 15 min). It is in-memory and
   // per-process, so without this the wrong-password tests would poison whatever ran after them.
   resetThrottle();
@@ -192,5 +196,88 @@ describe("Center sign-in", () => {
     expect((await post({ email: HAPPY, password: GOOD_PASSWORD })).statusCode).toBe(200);
     // The slate is clean: four more failures do not tip it over from the earlier four.
     for (let i = 0; i < 4; i++) expect((await post({ email: HAPPY, password: "nope" })).statusCode).toBe(401);
+  });
+});
+
+/**
+ * GET /api/auth/2fa/known — "am I protected?", answered without a password prompt.
+ *
+ * The reading is taken from the sign-in itself: Center demands a second factor exactly when the
+ * account has one, so which endpoint the login had to go through IS the state. No Center call is
+ * added for it, which is what these tests pin — that, and the fact that the answer arrives with
+ * no re-auth window open, since the whole point is to let someone CHECK without re-authenticating.
+ */
+describe("2FA state, readable without a password prompt", () => {
+  /** Sign in and return the session cookie. */
+  async function signIn(payload: Record<string, unknown>): Promise<string> {
+    const res = await post(payload);
+    expect(res.statusCode, res.body).toBe(200);
+    const cookie = sessionCookie(res.headers["set-cookie"]);
+    expect(cookie).toBeTruthy();
+    return cookie as string;
+  }
+
+  const known = (cookie: string) =>
+    secured.inject({
+      method: "GET",
+      url: "/api/auth/2fa/known",
+      headers: { cookie: `networkintel_session=${encodeURIComponent(cookie)}` },
+    });
+
+  it("reports 'none' after a sign-in Center accepted on the password alone", async () => {
+    const cookie = await signIn({ email: HAPPY, password: GOOD_PASSWORD });
+
+    const res = await known(cookie);
+    expect(res.statusCode, res.body).toBe(200);
+    expect(res.json().data.method).toBe("none");
+    // Dated, so the page can say how fresh the reading is rather than implying it is live.
+    expect(Number.isNaN(Date.parse(res.json().data.checkedAt))).toBe(false);
+  });
+
+  it("reports the factor an authenticator account signed in with", async () => {
+    const cookie = await signIn({
+      email: TOTP_USER,
+      password: GOOD_PASSWORD,
+      code: "123456",
+      method: "totp",
+    });
+    expect((await known(cookie)).json().data.method).toBe("totp");
+  });
+
+  it("reports an emailed code as protection, which the Center flag alone would call 'none'", async () => {
+    // Center keeps email 2FA outside `flag_totp`, so status-totp answers "N" for this account.
+    // Reading the state off the login instead is what keeps the page from telling someone who
+    // just typed an emailed code that their account has no second factor.
+    const cookie = await signIn({
+      email: EMAIL_USER,
+      password: GOOD_PASSWORD,
+      code: "123456",
+      method: "email",
+      ref: "REF123",
+    });
+    expect((await known(cookie)).json().data.method).toBe("email");
+  });
+
+  it("says 'unknown' rather than guessing when this process never saw the sign-in", async () => {
+    const cookie = await signIn({ email: HAPPY, password: GOOD_PASSWORD });
+    resetTwoFactorStates(); // as an API restart would leave it
+
+    const res = await known(cookie);
+    expect(res.statusCode).toBe(200);
+    expect(res.json().data).toEqual({ method: "unknown", checkedAt: null });
+  });
+
+  it("costs no extra Center call — the sign-in already answered it", async () => {
+    const calls = () => (global.fetch as unknown as { mock: { calls: unknown[] } }).mock.calls.length;
+    const cookie = await signIn({ email: HAPPY, password: GOOD_PASSWORD });
+
+    const before = calls();
+    expect((await known(cookie)).statusCode).toBe(200);
+    expect(calls()).toBe(before);
+  });
+
+  it("401s when signed out — it is a read of the caller's own account, not a public fact", async () => {
+    const res = await secured.inject({ method: "GET", url: "/api/auth/2fa/known" });
+    expect(res.statusCode).toBe(401);
   });
 });

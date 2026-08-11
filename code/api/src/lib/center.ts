@@ -1,3 +1,5 @@
+import { appendFileSync } from "node:fs";
+import { join } from "node:path";
 import { env } from "../config/env";
 import { BadRequest, ServiceUnavailable, Unauthorized } from "./errors";
 
@@ -75,12 +77,30 @@ async function centerPost(path: string, body: unknown): Promise<CenterResponse> 
   return { status: res.status, ok: res.ok, data };
 }
 
+/**
+ * The IAM2 group id as a body fragment — the key is PRESENT only when one is configured.
+ *
+ * The distinction is not cosmetic. Center clients differ on this field: some require it, others
+ * refuse a call that carries an unexpected one, and an empty string is not "absent" to either of
+ * them — it is a group id that matches nothing. The login body has always spelled the rule this
+ * way (an unset value is omitted), but sendcode/verifycode used to send
+ * `groupIam2ID: env.CENTER_GROUP_IAM2_ID` unconditionally. With `CENTER_GROUP_IAM2_ID` unset —
+ * as it is on this deployment — that meant every code request reached Center carrying
+ * `groupIam2ID: ""` while every login carried nothing, so the two disagreed about the caller's
+ * identity on the exact calls whose job is to dispatch a message.
+ *
+ * One helper now, used by all of them, so they cannot drift apart again.
+ */
+const groupFragment = (): { groupIam2ID?: string } =>
+  env.CENTER_GROUP_IAM2_ID ? { groupIam2ID: env.CENTER_GROUP_IAM2_ID } : {};
+
 /** The login request body Center expects, with the optional bits filled in only when present. */
 function loginBody(creds: CenterCredentials): Record<string, unknown> {
   const body: Record<string, unknown> = {
     username: creds.username,
     password: creds.password,
     devicePlatform: "web",
+    ...groupFragment(),
   };
   // The second-factor fields are sent ONLY when they carry a real value — never as empty
   // strings. Center reads an empty `otp` together with an empty `otpRef` as "an email code was
@@ -91,9 +111,6 @@ function loginBody(creds: CenterCredentials): Record<string, unknown> {
   if (creds.totp) body.totp = creds.totp;
   if (creds.otp) body.otp = creds.otp;
   if (creds.otpRef) body.otpRef = creds.otpRef;
-  // Only when configured — some Center clients require the group id, others reject a login that
-  // carries an unexpected one, so an unset value is omitted rather than sent as null.
-  if (env.CENTER_GROUP_IAM2_ID) body.groupIam2ID = env.CENTER_GROUP_IAM2_ID;
   return body;
 }
 
@@ -153,7 +170,7 @@ export async function centerSendEmailOtp(username: string): Promise<void> {
     phoneCountry: "",
     isVerifyAccount: false,
     isEmail: true,
-    groupIam2ID: env.CENTER_GROUP_IAM2_ID,
+    ...groupFragment(),
   });
 }
 
@@ -171,7 +188,7 @@ export async function centerSendSmsOtp(username: string): Promise<void> {
     phoneCountry: "",
     isVerifyAccount: false,
     isEmail: false,
-    groupIam2ID: env.CENTER_GROUP_IAM2_ID,
+    ...groupFragment(),
   });
 }
 
@@ -249,11 +266,41 @@ export async function centerMe(token: string): Promise<CenterProfile> {
 export type CenterTotpFlag = "Y" | "M" | "N";
 const ISSUER = "center";
 
+/**
+ * TEMPORARY (2026-08-10): print what Center actually answered, for the SMS enrolment that
+ * accepts a request and then texts nothing.
+ *
+ * The whole difficulty of that bug is that the app is blind to it: this module reads `refID` out
+ * of the response and drops the rest on the floor, so a Center that says "accepted, but the
+ * gateway is not enabled for this group" and one that genuinely sent a text are the same event
+ * from the outside. Every layer above then reports success, correctly, about nothing.
+ *
+ * Opt-in per call via `trace`, so only the SMS calls are noisy and nothing else changes. Remove
+ * this and the `trace` arguments once the SMS path is settled — see _check-center-sms.ts.
+ */
+function traceCenter(label: string, status: number, body: string): void {
+  const line = `[center:${label}] status=${status} body=${body || "(empty)"}`;
+  console.warn(line);
+  // Also to the api-data volume, because stdout has not been surviving. Recreating the container
+  // (`docker compose up -d`) discards its logs with the old container id, and this stack is
+  // recreated often enough that a traced attempt was being swept away before anyone read it.
+  // The volume outlives the container, so the evidence does too.
+  try {
+    appendFileSync(TRACE_FILE, `${new Date().toISOString()} ${line}\n`);
+  } catch {
+    // Best-effort by design: a diagnostic that could fail the call it is diagnosing would be
+    // worse than no diagnostic. An unwritable path just means stdout is all there is.
+  }
+}
+
+/** Volume-backed, so `docker compose up -d` cannot take the evidence with it. */
+const TRACE_FILE = join(process.env.UPLOAD_DIR ?? "/data/uploads", "..", "center-trace.log");
+
 /** A Center call carrying the user's JWT. 5xx and unreachable both become a 503, like the rest. */
 async function centerAuthed(
   path: string,
   token: string,
-  init: { method: "GET" | "POST"; body?: unknown }
+  init: { method: "GET" | "POST"; body?: unknown; trace?: string }
 ): Promise<Record<string, unknown>> {
   let res: Response;
   try {
@@ -266,6 +313,11 @@ async function centerAuthed(
   } catch {
     throw new ServiceUnavailable("Center is temporarily unavailable. Please try again.");
   }
+  // Read the body BEFORE the status checks, so a traced call reports what Center said even on
+  // the paths that throw — those are the outcomes worth seeing most, and they used to discard it.
+  const text = await res.text().catch(() => "");
+  if (init.trace) traceCenter(init.trace, res.status, text);
+
   if (res.status >= 500) {
     throw new ServiceUnavailable("Center is temporarily unavailable. Please try again.");
   }
@@ -274,7 +326,13 @@ async function centerAuthed(
   if (res.status === 401 || res.status === 403) {
     throw new Unauthorized("Your verification has expired. Please confirm your password again.");
   }
-  return (await res.json().catch(() => ({}))) as Record<string, unknown>;
+  try {
+    return JSON.parse(text) as Record<string, unknown>;
+  } catch {
+    // Same fallback as the `res.json().catch(() => ({}))` this replaced: a non-JSON body is an
+    // empty object, and the caller's own "did I get what I need" check reports it.
+    return {};
+  }
 }
 
 /** The account's current 2FA method: which factor Center will demand at the next login. */
@@ -368,15 +426,38 @@ export async function centerSendSmsEnrollCode(
       phoneCountry: phone.phoneCountry,
       isVerifyAccount: true,
       username: account.id,
-      // isEmail marks the delivery channel: Center's account-creation flow (AccountCreate.tsx)
-      // sends `false` + a phoneNumber to TEXT the code, and `true` to email it. We want the
-      // code texted to the number being registered, so `false`. (Center's own 2FA settings page
-      // sends `true` here — a latent quirk, since it also passes a phoneNumber; we follow the
-      // account-creation flow's clearer semantics instead. Confirm against your Center.)
-      isEmail: false,
-      groupIam2ID: env.CENTER_GROUP_IAM2_ID,
+      /**
+       * `true`, matching Center's own 2FA settings page — changed 2026-08-10 on evidence.
+       *
+       * This used to send `false`, reasoning from the account-creation flow where isEmail marks
+       * the delivery channel (`false` + a phoneNumber = text it, `true` = email it). That reading
+       * is clean, consistent with the login sends, and does not work: a traced enrolment answered
+       *
+       *   201 {"email":"…","phoneNumber":"945715588","phoneCountry":"66",
+       *        "refID":"3dppz5","status":""}
+       *
+       * and no text arrived. Center echoed the request back, minted a reference, and reported an
+       * EMPTY `status` — the field its other endpoints set to "ok"/"success". So it accepted the
+       * request and did not report sending anything.
+       *
+       * Center's own settings page sends `true` here even while passing a phoneNumber, which was
+       * dismissed as a quirk. On this evidence it is not a quirk: `isEmail` evidently does not
+       * select the channel on an `isVerifyAccount: true` call the way it does elsewhere.
+       *
+       * If a text now arrives, this comment is the reason. If one still does not, `isEmail` is
+       * not the variable and the gap is inside Center's gateway — see _send-test-sms.ts.
+       */
+      isEmail: true,
+      ...groupFragment(),
     },
+    trace: "sms-enroll-send",
   });
+  // TEMPORARY, with the trace above: the request as Center received it. The response alone does
+  // not say which number was dialled, and "the number I typed" has been the open question.
+  console.warn(
+    `[center:sms-enroll-send] sent to +${phone.phoneCountry}${phone.phoneNumber} ` +
+      `as email=${account.username} username=${account.id} isEmail=true`
+  );
   const ref = typeof data.refID === "string" ? data.refID : "";
   if (!ref) {
     // Center reports a refused number as free text in `text` — surface it; it's actionable
@@ -405,8 +486,9 @@ export async function centerVerifySmsEnrollCode(
       code: input.code,
       email: account.username,
       phoneNumber: input.phoneNumber,
-      groupIam2ID: env.CENTER_GROUP_IAM2_ID,
+      ...groupFragment(),
     },
+    trace: "sms-enroll-verify",
   });
   const status = String(data.status ?? "").toLowerCase();
   return status === "ok" || status === "success";

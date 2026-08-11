@@ -427,20 +427,24 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
       }
       const fields = parsed.data;
       /**
-       * EVERY IMPORT COMPARES ENGLISH WHOLE NAMES. There is no field for this any more.
+       * HOW THIS IMPORT'S RUN COMPARES — the importer's choice again since 2026-08-10.
        *
-       * The import screen carried a "How to compare" picker until 2026-08-05 and sent the answer
-       * here. It is gone, and the mode is a constant on this path — a `compareBy` field still
-       * arriving from an old client is dropped by `ImportFieldsSchema` and changes nothing, which
-       * is the point rather than an accident (see the note on that schema).
+       * It was a constant (`en_full`) from 2026-08-05, when the import screen's picker was removed to
+       * stop people re-uploading a file in order to ask a different question of it. The removal cured
+       * that and introduced something worse, because this value does not only pick a mode — the gate
+       * below REFUSES the import when no row carries a name in the run's language. Pinned to English,
+       * a Thai-only file could not be imported at all, and the advice the screen offered instead
+       * ("start a Thai run from the Network page") needed rows this screen had just declined to store.
        *
-       * The choice did not vanish, it moved to where it belongs. `POST /compare` takes a mode AND a
-       * scope, so "compare that import again by Thai surname" is a run over rows already stored.
-       * What it replaces was a re-upload of the same file to change one column on the run above it
-       * — which wrote a second complete row set and put a second paid job through the workflow to
-       * ask a question that never needed new data.
+       * Defaulted here rather than in `ImportFieldsSchema`, so a caller that sends nothing gets
+       * exactly the run this path produced while the field did not exist. An unrecognised value never
+       * reaches this line — `ImportFieldsSchema` is where the vocabulary is enforced, and it is the
+       * only place that can be, since `comparison.compare_by` has no CHECK behind it.
+       *
+       * `POST /compare` is unaffected and is still how a DIFFERENT question is asked of rows already
+       * stored. This is the first question; that one is every question after it.
        */
-      const compareBy: CompareBy = DEFAULT_COMPARE_BY;
+      const compareBy: CompareBy = fields.compareBy ?? DEFAULT_COMPARE_BY;
 
       /**
        * The typed relationship owner — an OVERRIDE, and optional.
@@ -566,36 +570,42 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
       const columnOverrides = fields.columnOverrides;
 
       /**
-       * The language this import's run compares in — English, always, since the run is `en_full`.
+       * The language this import's run compares in — whichever the importer picked, `en` by default.
        *
        * ── THIS IS A CHECK ON THE FILE, NEVER A FILTER ON ITS ROWS ──
        *
        * Read the gate comments in `prepareFriends` below before touching this. A run's mode decides
        * what is SCORED, not what is STORED, and dropping rows here would empty the "Not compared"
-       * bucket and break the import-in-Thai-compare-in-English-later workflow — which is now the
-       * ONLY way a Thai comparison happens at all, and therefore more load-bearing than when this
-       * was written, not less. Nothing below drops a single row: the question asked is only whether
-       * the file, as a whole, has ANY row this run could score. None at all means the run can only
-       * ever come back empty — and an empty run does not read as "this file had no English names",
-       * it reads as "nobody at this company knows these people", which is a finding the data never
-       * supported.
+       * bucket and break the import-in-one-language-compare-in-the-other-later workflow. Nothing
+       * below drops a single row: the question asked is only whether the file, as a whole, has ANY
+       * row this run could score. None at all means the run can only ever come back empty — and an
+       * empty run does not read as "this file had no names in that language", it reads as "nobody at
+       * this company knows these people", which is a finding the data never supported.
        *
-       * ── THERE USED TO BE TWO WAYS OUT AND NOW THERE IS ONE ──
+       * ── THERE ARE TWO WAYS OUT AGAIN ──
        *
-       * The refusal used to offer "switch How to compare to the other language" alongside "map the
-       * English column". The first is gone with the picker, so the message names only the second —
-       * which is the real fix in almost every case anyway: a file the mode gate caught was usually a
-       * file whose name column had not been recognised, and switching language was the workaround
-       * that got a run started over a mapping nobody had checked.
+       * The refusal offered "switch the language" alongside "map the missing column" until the picker
+       * was removed on 2026-08-05, and named only the second while the mode was a constant. With the
+       * picker back (2026-08-10) both are real fixes again, and which one is right is visible from the
+       * counts: a file with 0 English and 512 Thai names wants the language switched, a file with 0 of
+       * both wants its name column mapped. The screen has both numbers (`ScorableRowsSchema`) and says
+       * which case it is in; this message names the language it needed and leaves the choice there.
        *
-       * Refusing before anything is written keeps that fix available. Storing the rows and opening a
+       * Refusing before anything is written keeps both fixes available. Storing the rows and opening a
        * doomed run would not.
        */
       const runLanguage = compareByAxes(compareBy).language;
       const languageName = LANGUAGE_LABEL[runLanguage];
 
-      /** "…somebody has an English name" — the same question for both sides of the import. */
-      const scorable = (rows: { en: string | null }[]): number => rows.filter((r) => r.en).length;
+      /**
+       * "…somebody has a name in the run's language" — the same question for both sides of the import.
+       *
+       * Takes the two spellings and picks by `runLanguage` rather than taking a pre-selected column,
+       * which is what let this read `friend_name_en` unconditionally while claiming to be about the
+       * run's language: the two agreed only because the mode could not be anything else.
+       */
+      const scorable = (rows: { en: string | null; th: string | null }[]): number =>
+        rows.filter((r) => (runLanguage === "th" ? r.th : r.en)).length;
 
       let companyAdded = 0;
       let companyDuplicates = 0;
@@ -817,9 +827,9 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
          * could score, and a file with even one such row imports in full, exactly as before, with
          * the rest landing in the run's "Not compared" bucket where they belong.
          */
-        if (scorable(usable.map((r) => ({ en: r.friend_name_en }))) === 0) {
+        if (scorable(usable.map((r) => ({ en: r.friend_name_en, th: r.friend_name_th }))) === 0) {
           throw new BadRequest(
-            `This run compares ${languageName} names, and no friend in this file has one — the comparison would score nothing. Pick the ${languageName} name column on the preview screen.`
+            `This run compares ${languageName} names, and no friend in this file has one — the comparison would score nothing. Pick the ${languageName} name column on the preview screen, or switch the comparison language.`
           );
         }
         // Nothing has been written yet on EITHER path — this runs before the company block, which
@@ -884,9 +894,9 @@ export default async function comparisonsRoutes(fastify: FastifyInstance): Promi
           }
           // The run this import opens compares one language; the contacts have to supply it. See
           // the note beside `runLanguage` — a check on the file, never a filter on its rows.
-          if (scorable(usable.map((r) => ({ en: r.person_name_en }))) === 0) {
+          if (scorable(usable.map((r) => ({ en: r.person_name_en, th: r.person_name_th }))) === 0) {
             throw new BadRequest(
-              `This run compares ${languageName} names, and no contact in this file has one — the comparison would score nothing. Pick the ${languageName} name column on the preview screen.`
+              `This run compares ${languageName} names, and no contact in this file has one — the comparison would score nothing. Pick the ${languageName} name column on the preview screen, or switch the comparison language.`
             );
           }
           // Immediately before the first write on this path. The friends file, if there is one, has

@@ -19,6 +19,7 @@ vi.hoisted(() => {
   process.env.EXTERNAL_MATCHER = "1";
 });
 
+import { DEFAULT_COMPARE_BY } from "@extensions/contract";
 import { buildApp } from "../src/app";
 import { startMockWebhook, type MockServer } from "./mockWebhook";
 import { MOCK_PORT } from "./setup";
@@ -371,9 +372,10 @@ describe("external matcher — an import starts a run", () => {
      *
      * This used to be told with two different comparison modes — import, compare English full
      * names; re-import the same file, compare Thai given names — because the mode lived on the
-     * import screen. It does not any more (2026-08-05): an import is always `en_full`, and asking a
-     * different question is a run started from the Network page over rows already on file, with
-     * nothing re-uploaded.
+     * import screen. The mode is a per-import choice again (2026-08-10), but re-uploading to change
+     * it is still the wrong way to ask: neither import below names one, so both take the `en_full`
+     * default, and asking a different question of rows already on file is a run started from the
+     * Network page with nothing re-uploaded.
      *
      * So the surviving reason to import the same people twice is that somebody ELSE holds them,
      * which is the fact the product exists to know. The mechanics under test are unchanged and are
@@ -1091,26 +1093,31 @@ describe("external matcher — watching the rows", () => {
  * exercises a different query entirely and would not catch a mistake here.
  */
 describe("compare_by on an import-driven run", () => {
-  it("sends en_full whatever the caller asked for, and names the scope beside it", async () => {
+  /** One friends import, with whatever mode the caller sent (or none). */
+  const importFriends = async (csv: string, compareBy?: string) => {
     const form = (await import("form-data")).default;
     const f = new form();
     f.append("name", "Friends");
     f.append("uploadPersonName", "Alex");
-    // A CALLER THAT PREDATES THE CHANGE. `compareBy` is no longer a field on this endpoint, and
-    // this is the assertion that it is IGNORED rather than honoured or refused: a scripted importer
-    // still sending the old field must get the run the server would have made anyway — not a 400
-    // over a value that no longer decides anything, and not a Thai run nobody can ask for here.
-    f.append("compareBy", "th_surname");
-    f.append("facebookFile", Buffer.from("name\nSomchai Jaidee\n", "utf8"), {
+    if (compareBy !== undefined) f.append("compareBy", compareBy);
+    f.append("facebookFile", Buffer.from(csv, "utf8"), {
       filename: "friends.csv",
       contentType: "text/csv",
     });
-    const res = await app.inject({
-      method: "POST",
-      url: "/api/comparisons/run",
-      payload: f,
-      headers: f.getHeaders(),
-    });
+    return app.inject({ method: "POST", url: "/api/comparisons/run", payload: f, headers: f.getHeaders() });
+  };
+
+  /**
+   * HONOURED, NOT IGNORED — the reverse of what this test asserted between 2026-08-05 and
+   * 2026-08-10, and the reversal is the point rather than a loosening.
+   *
+   * While the field was dropped, the mode also decided which FILES could be imported: the gate
+   * requires a name in the run's language, so `en_full` refused a Thai-only friends list outright and
+   * the advice on screen ("start a Thai run from the Network page") needed rows the same request had
+   * just declined to write. A Thai file is imported with a Thai mode now, in one request.
+   */
+  it("honours the mode the importer chose, and names the scope beside it", async () => {
+    const res = await importFriends("name\nสมชาย ใจดี\n", "th_surname");
     expect(res.statusCode, res.body).toBe(200);
     const { comparisonId, sessionId } = res.json().data;
 
@@ -1118,8 +1125,8 @@ describe("compare_by on an import-driven run", () => {
     // The two axes, separately — so a workflow branching on "did they ask for surnames?" reads a
     // value that says `surname` rather than substring-splitting `th_surname`. The combined
     // `X-Compare-By` is retired: the doc's instruction was always to read these two and ignore it.
-    expect(hit.headers["x-compare-type"]).toBe("full");
-    expect(hit.headers["x-compare-language"]).toBe("en");
+    expect(hit.headers["x-compare-type"]).toBe("surname");
+    expect(hit.headers["x-compare-language"]).toBe("th");
     expect(hit.headers["x-compare-by"]).toBeUndefined();
 
     // And the SCOPE: an import names the rows it just wrote, filed under this upload.
@@ -1130,7 +1137,50 @@ describe("compare_by on an import-driven run", () => {
     const progress = (
       await app.inject({ method: "GET", url: `/api/comparisons/${comparisonId}/progress` })
     ).json().data;
-    expect(progress.compareBy).toBe("en_full");
+    expect(progress.compareBy).toBe("th_surname");
+  });
+
+  /** A caller that sends nothing must get exactly the run this path made while the field did not
+   *  exist — which is what makes restoring the field a safe change for a scripted importer. */
+  it("defaults to en_full when the caller names no mode", async () => {
+    mock.state.facebook.length = 0;
+    const res = await importFriends("name\nSomchai Jaidee\n");
+    expect(res.statusCode, res.body).toBe(200);
+    expect(mock.state.facebook[0].headers["x-compare-type"]).toBe("full");
+    expect(mock.state.facebook[0].headers["x-compare-language"]).toBe("en");
+
+    const progress = (
+      await app.inject({
+        method: "GET",
+        url: `/api/comparisons/${res.json().data.comparisonId}/progress`,
+      })
+    ).json().data;
+    expect(progress.compareBy).toBe(DEFAULT_COMPARE_BY);
+  });
+
+  /**
+   * THE VOCABULARY IS ENFORCED AT THE BOUNDARY, because `comparison.compare_by` has no CHECK behind
+   * it and `parseCompareBy` silently resolves anything it does not recognise to the default on the
+   * way back OUT. A nonsense mode accepted here becomes a run that claims to be `en_full` for the
+   * rest of its life — which is exactly the state the live database's external-matcher rows are in.
+   */
+  it("refuses a mode outside the vocabulary rather than defaulting it", async () => {
+    const res = await importFriends("name\nSomchai Jaidee\n", "sideways_middle");
+    expect(res.statusCode, res.body).toBe(400);
+  });
+
+  /**
+   * THE GATE FOLLOWS THE MODE — the other half of making this a real choice.
+   *
+   * A Latin-only file under a Thai run would score nothing, and an empty run reads as "nobody knows
+   * these people" rather than "this file had no Thai names". Refused before anything is written, so
+   * the fix (switch the language, or map the column) is still available.
+   */
+  it("refuses a file with no name in the chosen language", async () => {
+    const res = await importFriends("name\nSomchai Jaidee\n", "th_full");
+    expect(res.statusCode).toBe(400);
+    // Names the language it needed, so the message carries its own fix — see `runLanguage`.
+    expect(res.json().message).toMatch(/Thai/);
   });
 
   it("buckets a row the run could not score as `unscored`, and filters to it", async () => {

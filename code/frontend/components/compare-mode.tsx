@@ -20,18 +20,23 @@ import { cn } from "@/lib/utils";
 /**
  * How a run should compare — two controls over one stored value.
  *
- * ── ONE CALLER, SINCE 2026-08-05 ──
+ * ── TWO CALLERS: `NewComparisonDialog` AND `ImportReview` ──
  *
- * `NewComparisonDialog`. The import screen carried a second copy until the mode stopped being a
- * per-import choice (every import is `en_full`), and what looked like the loss of a control was the
- * removal of a workaround: people were re-uploading a file they had already imported so that the
- * import path would open a run with a different mode on it, which wrote a second complete row set
- * to change one column. The dialog can now be pointed at a company, a relationship owner or a past
- * import directly, so the choice is available over data already on file and costs nothing to make.
+ * The import screen's copy was removed on 2026-08-05, when the mode stopped being a per-import
+ * choice, and restored on 2026-08-10. The removal was aimed at a real workaround — people were
+ * re-uploading a file they had already imported so the import path would open a run with a different
+ * mode on it, writing a second complete row set to change one column — and the dialog answers that
+ * properly, since it can be pointed at a company, an owner or a past import over data already stored.
  *
- * It stays a shared component rather than folding into its one caller: `CompareModeBadge` below is
- * the read-only twin and has several, and keeping the picker beside the badge is what stops the
- * control and the chip from drifting into describing the same value differently.
+ * What the removal also did, unintentionally, was decide which FILES could be imported: the import
+ * gate requires a name in the run's language, so a mode fixed at `en_full` refused a Thai-only file
+ * outright. That is why the picker is back on that screen and why the pointer to this dialog stayed
+ * there beside it — the choice is available at import time, and asking a different question later
+ * still costs nothing.
+ *
+ * Being shared is now load-bearing rather than tidy: two screens configure one column, and a second
+ * implementation of these two selects is how they would drift into offering different vocabularies
+ * for it. `CompareModeBadge` below is the read-only twin, for the same reason.
  *
  * Two selects rather than one six-item list, because the axes are independent and a flat list of
  * "English · surname", "Thai · full name" … asks the reader to reconstruct the grid in their head

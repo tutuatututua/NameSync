@@ -96,6 +96,16 @@ describe("mayAccess — reviewer", () => {
   it("allows managing only their own account", () => {
     expect(mayAccess(REVIEWER, "GET", "/api/auth/me")).toBe(true);
     expect(mayAccess(REVIEWER, "POST", "/api/auth/logout")).toBe(true);
+    // Their own two-factor settings, including the unlocked read the settings page opens with.
+    // A reviewer who cannot see whether their own account is protected is a reviewer told to
+    // secure an account they are not allowed to inspect.
+    expect(mayAccess(REVIEWER, "GET", "/api/auth/2fa/known")).toBe(true);
+    expect(mayAccess(REVIEWER, "GET", "/api/auth/2fa/status")).toBe(true);
+    expect(mayAccess(REVIEWER, "POST", "/api/auth/2fa/reauth")).toBe(true);
+    expect(mayAccess(REVIEWER, "POST", "/api/auth/2fa/disable")).toBe(true);
+    // The alternation is exact — a new sibling is denied until someone adds it on purpose.
+    expect(mayAccess(REVIEWER, "GET", "/api/auth/2fa")).toBe(false);
+    expect(mayAccess(REVIEWER, "GET", "/api/auth/2fa/known/all")).toBe(false);
     // Creating accounts is an admin power and stays one.
     expect(mayAccess(REVIEWER, "POST", "/api/auth/users")).toBe(false);
   });

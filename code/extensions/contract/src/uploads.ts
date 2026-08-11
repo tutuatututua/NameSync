@@ -203,25 +203,31 @@ export const ColumnOverridesFieldSchema = z
   });
 
 /**
- * How many importable rows carry an ENGLISH name — the fact an import's run turns into a
+ * How many importable rows carry a name IN EACH LANGUAGE — the fact an import's run turns into a
  * requirement.
  *
- * A run compares one language and one language only (see `COMPARE_BY_VALUES`), and an import's run
- * is always `en_full` since 2026-08-05. So a file with no English names is a file whose run cannot
- * return anything — not a run that finds nothing, which is a different and much more misleading
- * outcome, because it reads as "nobody at this company knows these people".
+ * A run compares one language and one language only (see `COMPARE_BY_VALUES`), so a file with no name
+ * in the run's language is a file whose run cannot return anything — not a run that finds nothing,
+ * which is a different and much more misleading outcome, because it reads as "nobody at this company
+ * knows these people".
  *
- * ── IT USED TO CARRY BOTH LANGUAGES, AND THE SECOND ONE HAD NOBODY LEFT TO TELL ──
+ * ── ONE COUNT, THEN TWO, THEN ONE, AND NOW TWO AGAIN ──
  *
- * `th` sat beside `en` while the import screen carried a mode picker: the count answered "would the
- * Thai run you just selected score anything", and the screen offered switching language as one of
- * the two ways out of a refusal. With the picker gone there is no Thai import to be about. Keeping
- * the number would have left a field on the wire that no reader consults and no rule enforces, which
- * is the shape that quietly acquires a wrong consumer later.
+ * `th` was dropped on 2026-08-05 when the import screen lost its mode picker: with every import
+ * pinned to `en_full` there was no Thai import for the number to be about, and a field no reader
+ * consults is the shape that quietly acquires a wrong consumer later. That was sound at the time and
+ * it is why the field is documented rather than simply restored.
  *
- * A Thai comparison is still entirely available — it is a run you ask for from the Network page,
- * over rows already stored, and the import gate deliberately never filtered by language, so every
- * Thai name in this file is on file for it to find. See `runLanguage` in comparisons.route.ts.
+ * What made it wrong was the gate on the other end. This count does not merely inform, it REFUSES —
+ * so pinning the language pinned which files could be imported at all, and a Thai-only friends list
+ * became unimportable rather than merely unmatched-until-later. The picker is back (see
+ * `ImportFieldsSchema`) and the requirement follows the mode the importer chose, which needs both
+ * numbers on screen: the refusal has to be able to say "this file has 0 English names but 512 Thai
+ * ones", because that sentence contains its own fix.
+ *
+ * The rule this pairs with is unchanged and load-bearing: the gate is a check on the FILE, never a
+ * filter on its rows. Every name in both languages is stored whatever the mode, so a run in the other
+ * language remains available later from the Network page. See `runLanguage` in comparisons.route.ts.
  *
  * Counted server-side over the WHOLE file rather than derived on screen from the mapping, because
  * the mapping is not the answer. An unlabelled name column is routed to a language by script
@@ -233,6 +239,9 @@ export const ColumnOverridesFieldSchema = z
  */
 export const ScorableRowsSchema = z.object({
   en: z.number(),
+  /** Defaulted, so a payload from a server predating its return reads as "no Thai names counted"
+   *  rather than failing the whole preview. */
+  th: z.number().default(0),
 });
 export type ScorableRows = z.infer<typeof ScorableRowsSchema>;
 
@@ -385,7 +394,7 @@ export const UploadPreviewSchema = z.object({
    * is the safe one HERE only because the screen treats "0" as "say so, and let the server decide"
    * rather than as grounds to block on its own.
    */
-  scorableRows: ScorableRowsSchema.default({ en: 0 }),
+  scorableRows: ScorableRowsSchema.default({ en: 0, th: 0 }),
   /**
    * How many importable rows name no company — COMPANY imports only, always zero for friends.
    *

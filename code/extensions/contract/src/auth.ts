@@ -153,6 +153,33 @@ export const TwoFactorStatusDataSchema = z.object({ method: TwoFactorMethodState
 export type TwoFactorStatusData = z.infer<typeof TwoFactorStatusDataSchema>;
 
 /**
+ * What the settings page can show WITHOUT a password confirmation (GET /2fa/known).
+ *
+ * Reading the live flag needs a Center token, which only the re-auth window holds — so
+ * "is my 2FA on?" used to cost a password prompt, and a user who only wanted to CHECK had to
+ * re-authenticate to find out. This is the answer to that question: what Center demanded at
+ * the user's last sign-in, kept server-side (api/src/lib/two-factor-state.ts) and refreshed by
+ * every 2FA action. Nothing here unlocks a change; it is a read of a remembered fact.
+ *
+ * Two values the managed state (`TwoFactorMethodState`) doesn't have:
+ *   unknown — nobody has signed in on this API process yet, so there is nothing to report.
+ *             The page falls back to its old "confirm your password to check" wording.
+ *   email   — Center emails the code. It is a real second factor and the login demands it, but
+ *             it lives outside `flag_totp`, so /2fa/status reports it as "none". Saying "off"
+ *             to someone who is demonstrably protected is the one answer worth avoiding.
+ */
+export const TwoFactorKnownMethodSchema = z.enum(['unknown', 'none', 'totp', 'sms', 'email']);
+export type TwoFactorKnownMethod = z.infer<typeof TwoFactorKnownMethodSchema>;
+
+/** `{ method, checkedAt }` — the remembered state, and when it was last confirmed. */
+export const TwoFactorKnownStatusDataSchema = z.object({
+  method: TwoFactorKnownMethodSchema,
+  /** ISO timestamp of the reading. Null only when `method` is `unknown`. */
+  checkedAt: z.string().nullable(),
+});
+export type TwoFactorKnownStatusData = z.infer<typeof TwoFactorKnownStatusDataSchema>;
+
+/**
  * Reauth answers with either a 2FA challenge or the opened window's status (`{ method }`).
  *
  * ORDER MATTERS — the challenge MUST come first. `TwoFactorStatusDataSchema` is `{ method }`,

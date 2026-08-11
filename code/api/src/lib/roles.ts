@@ -45,7 +45,7 @@ const REVIEWER_ALLOWED: Allowed[] = [
 
   // Managing their own two-factor authentication. Like logout, these act on the reviewer's
   // own account (proxying Center), not on any data, so the read-only boundary doesn't apply.
-  { method: "GET", path: /^\/api\/auth\/2fa\/status$/ },
+  { method: "GET", path: /^\/api\/auth\/2fa\/(status|known)$/ },
   { method: "POST", path: /^\/api\/auth\/2fa\/(reauth|totp\/setup|totp\/enable|sms\/send-code|sms\/enable|disable|end)$/ },
 
   // The Network workspace — the whole point of the role. All six are reads.

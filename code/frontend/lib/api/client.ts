@@ -11,6 +11,7 @@ import type {
   TwoFactorReauthBody,
   TwoFactorReauthData,
   TwoFactorStatusData,
+  TwoFactorKnownStatusData,
   TwoFactorSetupData,
   TwoFactorEnableBody,
   TwoFactorEnableData,
@@ -266,6 +267,14 @@ export const api = {
         }).then((r) => r.data),
       status: () =>
         request<Envelope<TwoFactorStatusData>>("/auth/2fa/status").then((r) => r.data),
+      /**
+       * The state to SHOW — readable without the window, so the settings page can say "on" or
+       * "off" on arrival instead of demanding a password to answer a one-word question. It is
+       * what Center demanded at the last sign-in, refreshed by every action; `unknown` when the
+       * API has never seen this user sign in.
+       */
+      known: () =>
+        request<Envelope<TwoFactorKnownStatusData>>("/auth/2fa/known").then((r) => r.data),
       setupTotp: () =>
         request<Envelope<TwoFactorSetupData>>("/auth/2fa/totp/setup", { method: "POST" }).then((r) => r.data),
       enableTotp: (body: TwoFactorEnableBody) =>

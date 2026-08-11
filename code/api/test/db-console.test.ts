@@ -220,6 +220,46 @@ describe("table registry", () => {
     expect(res.statusCode).toBe(400);
     expect(res.json().message).toMatch(/must be one of/i);
   });
+
+  // The registry can't know which rows exist, so a foreign key aimed at a missing parent
+  // only fails inside Postgres. That is still the client's mistake, and a bare 500
+  // "Internal Server Error" would leave the grid with nothing to show the person.
+  it("reports a foreign key pointing at a missing row as a 400 naming the column", async () => {
+    const res = await post("/api/db/tables/company_contact/rows", {
+      values: { upload_id: 999999, company_name: "Acme" },
+    });
+    expect(res.statusCode, res.body).toBe(400);
+    expect(res.json().message).toMatch(/upload_id/);
+    expect(res.json().message).toMatch(/999999/);
+    expect(res.json().message).not.toMatch(/internal server error/i);
+  });
+
+  it("reports an update onto a missing parent the same way", async () => {
+    const upload = await seedUpload();
+    const row = await insertRow("company_contact", { upload_id: upload.id, company_name: "Acme" });
+
+    const res = await app.inject({
+      method: "PATCH",
+      url: `/api/db/tables/company_contact/rows/${row.id}`,
+      payload: { values: { upload_id: 999999 } },
+    });
+    expect(res.statusCode, res.body).toBe(400);
+    expect(res.json().message).toMatch(/upload_id/);
+  });
+
+  // The mirror case does NOT error: every FK into these tables is ON DELETE CASCADE, so
+  // deleting one `upload` row from the grid silently takes its contacts with it. Worth
+  // pinning down — the console reports "Row deleted: 1" while removing rather more than one.
+  it("cascades a parent delete to its children instead of refusing it", async () => {
+    const upload = await seedUpload();
+    await insertRow("company_contact", { upload_id: upload.id, company_name: "Acme" });
+
+    const res = await app.inject({ method: "DELETE", url: `/api/db/tables/upload/rows/${upload.id}` });
+    expect(res.statusCode, res.body).toBe(200);
+
+    const left = await queryRows("company_contact");
+    expect(left.json().data).toHaveLength(0);
+  });
 });
 
 // ── row CRUD ─────────────────────────────────────────────────────────────────
