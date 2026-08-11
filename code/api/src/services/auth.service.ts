@@ -29,7 +29,7 @@ export const toSessionUser = (u: AppUser): SessionUser => ({
 // reason to put a shared limiter at the edge in a serious deployment — but a per-process
 // cap is still the difference between thousands of guesses a minute and five.
 const MAX_ATTEMPTS = 5;
-const WINDOW_MS = 15 * 60 * 1000;
+const WINDOW_MS = 6 * 1000;
 
 const attempts = new Map<string, { count: number; resetAt: number }>();
 

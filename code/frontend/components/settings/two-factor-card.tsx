@@ -35,10 +35,18 @@ type MethodState = TwoFactorMethodState | null;
 
 export function TwoFactorCard() {
   const [method, setMethod] = React.useState<MethodState>(null);
-  const [reauthOpen, setReauthOpen] = React.useState(false);
   const [setupOpen, setSetupOpen] = React.useState(false);
   const [smsOpen, setSmsOpen] = React.useState(false);
   const [disabling, setDisabling] = React.useState(false);
+
+  // The password confirmation is shown INLINE on the card (no separate "Manage" step). These
+  // drive it. `challenge` is set when the account already has 2FA and Center wants the current
+  // code first — the form then swaps the password field for a code field.
+  const [password, setPassword] = React.useState("");
+  const [challenge, setChallenge] = React.useState<{ method: TwoFactorMethod; ref: string | null } | null>(null);
+  const [code, setCode] = React.useState("");
+  const [reauthError, setReauthError] = React.useState<string | null>(null);
+  const [reauthBusy, setReauthBusy] = React.useState(false);
 
   const unlocked = method !== null;
 
@@ -50,17 +58,57 @@ export function TwoFactorCard() {
     };
   }, []);
 
-  /** A 401 from any action means the window lapsed, not that the session died: re-lock and re-prompt. */
-  const onActionError = React.useCallback((err: unknown) => {
-    if (err instanceof ApiError && err.status === 401) {
-      setMethod(null);
-      setSetupOpen(false);
-      toast.error(err.message || "Please confirm your password again.");
-      setReauthOpen(true);
-      return;
-    }
-    toast.error(err instanceof ApiError ? err.message : "Something went wrong. Please try again.");
+  /** Drop back to the (inline) password prompt with a clean slate. */
+  const relock = React.useCallback((message?: string) => {
+    setMethod(null);
+    setSetupOpen(false);
+    setSmsOpen(false);
+    setPassword("");
+    setChallenge(null);
+    setCode("");
+    setReauthError(null);
+    setReauthBusy(false);
+    if (message) toast.error(message);
   }, []);
+
+  /** A 401 from any action means the window lapsed, not that the session died: re-lock and re-prompt. */
+  const onActionError = React.useCallback(
+    (err: unknown) => {
+      if (err instanceof ApiError && err.status === 401) {
+        relock(err.message || "Please confirm your password again.");
+        return;
+      }
+      toast.error(err instanceof ApiError ? err.message : "Something went wrong. Please try again.");
+    },
+    [relock]
+  );
+
+  /** Confirm the password (and current code, if challenged) to open the management window. */
+  async function onReauth(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setReauthError(null);
+    setReauthBusy(true);
+    try {
+      const result = await api.auth.twoFactor.reauth({
+        password,
+        code: challenge ? code : undefined,
+        method: challenge?.method,
+        ref: challenge?.ref ?? undefined,
+      });
+      if ("twoFactorRequired" in result) {
+        // Account already protected — swap to the code field, then re-submit.
+        setChallenge({ method: result.method, ref: result.ref });
+        setCode("");
+        setReauthBusy(false);
+        return;
+      }
+      setMethod(result.method); // unlocked → the card now shows status + controls
+    } catch (err) {
+      setReauthError(err instanceof ApiError ? err.message : "Couldn't confirm your password. Please try again.");
+      setCode("");
+      setReauthBusy(false);
+    }
+  }
 
   async function onDisable() {
     setDisabling(true);
@@ -75,6 +123,13 @@ export function TwoFactorCard() {
     }
   }
 
+  const codeHint =
+    challenge?.method === "totp"
+      ? "Enter the current code from your authenticator app."
+      : challenge?.method === "sms"
+        ? "Enter the code we texted you."
+        : "Enter the code we emailed you.";
+
   return (
     <Card>
       <CardHeader>
@@ -85,68 +140,109 @@ export function TwoFactorCard() {
         </CardDescription>
       </CardHeader>
 
-      <CardContent>
-        {!unlocked ? (
-          <p className="text-sm text-muted-foreground">
-            Confirm your password to view or change your two-factor settings.
-          </p>
-        ) : method === "none" ? (
-          <div className="flex items-center gap-2 text-sm">
-            <ShieldOff className="h-4 w-4 text-muted-foreground" />
-            <span className="text-muted-foreground">Two-factor authentication is off.</span>
-          </div>
-        ) : method === "totp" ? (
-          <div className="flex items-center gap-2 text-sm">
-            <ShieldCheck className="h-4 w-4 text-emerald-600 dark:text-emerald-500" />
-            <span>On</span>
-            <Badge variant="secondary">Authenticator app</Badge>
-          </div>
-        ) : (
-          <div className="space-y-2 text-sm">
-            <div className="flex items-center gap-2">
-              <Smartphone className="h-4 w-4 text-emerald-600 dark:text-emerald-500" />
-              <span>On</span>
-              <Badge variant="secondary">SMS</Badge>
-            </div>
-            <p className="text-xs text-muted-foreground">
-              Codes are texted to your registered phone. You can turn this off here.
-            </p>
-          </div>
-        )}
-      </CardContent>
+      {!unlocked ? (
+        // Locked: the password confirmation lives right here on the card — no "Manage" click.
+        <CardContent>
+          <form onSubmit={onReauth} className="space-y-4" noValidate>
+            {!challenge ? (
+              <div className="space-y-1.5">
+                <Label htmlFor="tfa-password">Confirm your password to view or change 2FA</Label>
+                <Input
+                  id="tfa-password"
+                  type="password"
+                  autoComplete="current-password"
+                  required
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  className="max-w-sm"
+                />
+              </div>
+            ) : (
+              <div className="space-y-1.5">
+                <Label htmlFor="tfa-reauth-code">{codeHint}</Label>
+                <Input
+                  id="tfa-reauth-code"
+                  inputMode="numeric"
+                  autoComplete="one-time-code"
+                  autoFocus
+                  required
+                  value={code}
+                  onChange={(e) => setCode(e.target.value)}
+                  placeholder="123456"
+                  className="max-w-sm"
+                />
+              </div>
+            )}
 
-      <CardFooter className="gap-2">
-        {!unlocked ? (
-          <Button onClick={() => setReauthOpen(true)}>Manage</Button>
-        ) : method === "none" ? (
-          <>
-            <Button onClick={() => setSetupOpen(true)}>Set up authenticator app</Button>
-            <Button variant="outline" onClick={() => setSmsOpen(true)}>
-              Set up SMS
+            {reauthError && (
+              <p role="alert" className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+                {reauthError}
+              </p>
+            )}
+
+            <Button type="submit" disabled={reauthBusy}>
+              {reauthBusy ? (
+                <>
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Confirming…
+                </>
+              ) : (
+                "Confirm"
+              )}
             </Button>
-          </>
-        ) : (
-          <Button variant="destructive" onClick={onDisable} disabled={disabling}>
-            {disabling ? (
+          </form>
+        </CardContent>
+      ) : (
+        <>
+          <CardContent>
+            {method === "none" ? (
+              <div className="flex items-center gap-2 text-sm">
+                <ShieldOff className="h-4 w-4 text-muted-foreground" />
+                <span className="text-muted-foreground">Two-factor authentication is off.</span>
+              </div>
+            ) : method === "totp" ? (
+              <div className="flex items-center gap-2 text-sm">
+                <ShieldCheck className="h-4 w-4 text-emerald-600 dark:text-emerald-500" />
+                <span>On</span>
+                <Badge variant="secondary">Authenticator app</Badge>
+              </div>
+            ) : (
+              <div className="space-y-2 text-sm">
+                <div className="flex items-center gap-2">
+                  <Smartphone className="h-4 w-4 text-emerald-600 dark:text-emerald-500" />
+                  <span>On</span>
+                  <Badge variant="secondary">SMS</Badge>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Codes are texted to your registered phone. You can turn this off here.
+                </p>
+              </div>
+            )}
+          </CardContent>
+
+          <CardFooter className="gap-2">
+            {method === "none" ? (
               <>
-                <Loader2 className="h-4 w-4 animate-spin" />
-                Turning off…
+                <Button onClick={() => setSetupOpen(true)}>Set up authenticator app</Button>
+                <Button variant="outline" onClick={() => setSmsOpen(true)}>
+                  Set up SMS
+                </Button>
               </>
             ) : (
-              "Turn off"
+              <Button variant="destructive" onClick={onDisable} disabled={disabling}>
+                {disabling ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Turning off…
+                  </>
+                ) : (
+                  "Turn off"
+                )}
+              </Button>
             )}
-          </Button>
-        )}
-      </CardFooter>
-
-      <ReauthDialog
-        open={reauthOpen}
-        onOpenChange={setReauthOpen}
-        onReady={(m) => {
-          setMethod(m);
-          setReauthOpen(false);
-        }}
-      />
+          </CardFooter>
+        </>
+      )}
 
       <TotpSetupDialog
         open={setupOpen}
@@ -170,134 +266,6 @@ export function TwoFactorCard() {
         onActionError={onActionError}
       />
     </Card>
-  );
-}
-
-/**
- * Confirm the Center password to open the management window. If the account already has 2FA on,
- * Center answers with a challenge and we ask for the current code before the window opens.
- */
-function ReauthDialog({
-  open,
-  onOpenChange,
-  onReady,
-}: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  onReady: (method: TwoFactorMethodState) => void;
-}) {
-  const [password, setPassword] = React.useState("");
-  const [challenge, setChallenge] = React.useState<{ method: TwoFactorMethod; ref: string | null } | null>(null);
-  const [code, setCode] = React.useState("");
-  const [error, setError] = React.useState<string | null>(null);
-  const [submitting, setSubmitting] = React.useState(false);
-
-  // Reset every field whenever the dialog is (re)opened, so a previous attempt never leaks in.
-  React.useEffect(() => {
-    if (open) {
-      setPassword("");
-      setChallenge(null);
-      setCode("");
-      setError(null);
-      setSubmitting(false);
-    }
-  }, [open]);
-
-  async function onSubmit(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setError(null);
-    setSubmitting(true);
-    try {
-      const result = await api.auth.twoFactor.reauth({
-        password,
-        code: challenge ? code : undefined,
-        method: challenge?.method,
-        ref: challenge?.ref ?? undefined,
-      });
-      if ("twoFactorRequired" in result) {
-        // Account already protected — collect the current second factor, then re-submit.
-        setChallenge({ method: result.method, ref: result.ref });
-        setCode("");
-        setSubmitting(false);
-        return;
-      }
-      onReady(result.method);
-    } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Couldn't confirm your password. Please try again.");
-      setCode("");
-      setSubmitting(false);
-    }
-  }
-
-  const hint = challenge
-    ? challenge.method === "totp"
-      ? "Enter the current code from your authenticator app."
-      : challenge.method === "sms"
-        ? "Enter the code we texted you."
-        : "Enter the code we emailed you."
-    : null;
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>Confirm your password</DialogTitle>
-          <DialogDescription>
-            {hint ?? "For your security, confirm your Center password to manage two-factor authentication."}
-          </DialogDescription>
-        </DialogHeader>
-
-        <form onSubmit={onSubmit} className="space-y-4" noValidate>
-          {!challenge ? (
-            <div className="space-y-1.5">
-              <Label htmlFor="reauth-password">Password</Label>
-              <Input
-                id="reauth-password"
-                type="password"
-                autoComplete="current-password"
-                autoFocus
-                required
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-              />
-            </div>
-          ) : (
-            <div className="space-y-1.5">
-              <Label htmlFor="reauth-code">Verification code</Label>
-              <Input
-                id="reauth-code"
-                inputMode="numeric"
-                autoComplete="one-time-code"
-                autoFocus
-                required
-                value={code}
-                onChange={(e) => setCode(e.target.value)}
-                placeholder="123456"
-              />
-            </div>
-          )}
-
-          {error && (
-            <p role="alert" className="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-              {error}
-            </p>
-          )}
-
-          <DialogFooter>
-            <Button type="submit" disabled={submitting}>
-              {submitting ? (
-                <>
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  Confirming…
-                </>
-              ) : (
-                "Confirm"
-              )}
-            </Button>
-          </DialogFooter>
-        </form>
-      </DialogContent>
-    </Dialog>
   );
 }
 
